@@ -22,7 +22,7 @@ const getArchivedOrderHistoryItems = async (req, res) => {
     const rows = await runSelect(
       req.tenantDb,
       'order_history_items',
-      { ...req.query, is_archived: true },
+      { ...req.query, eq__is_archived: true },
     );
     return jsonOk(res, rows);
   } catch (error) {
