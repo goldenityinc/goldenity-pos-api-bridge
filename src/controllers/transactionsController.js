@@ -8,6 +8,24 @@ const toNumber = (value) => {
   return Number.isFinite(numberValue) ? numberValue : NaN;
 };
 
+const ensureKasBonHistoryTable = async (client) => {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS kas_bon_payment_history (
+      id BIGSERIAL PRIMARY KEY,
+      sales_record_id BIGINT NOT NULL,
+      paid_amount NUMERIC(14,2) NOT NULL,
+      previous_balance NUMERIC(14,2) NOT NULL,
+      remaining_balance NUMERIC(14,2) NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS idx_kas_bon_payment_history_sales_record_id
+    ON kas_bon_payment_history (sales_record_id);
+  `);
+};
+
 const createTransaction = async (req, res) => {
   try {
     const payload = { ...req.body };
@@ -99,6 +117,18 @@ const settleKasBon = async (req, res) => {
     const nextBalance = Number(nextBalanceRaw.toFixed(2));
     const isLunas = nextBalance <= 0;
     const normalizedBalance = isLunas ? 0 : nextBalance;
+
+    await ensureKasBonHistoryTable(client);
+
+    await client.query(
+      `INSERT INTO kas_bon_payment_history (
+         sales_record_id,
+         paid_amount,
+         previous_balance,
+         remaining_balance
+       ) VALUES ($1, $2, $3, $4)`,
+      [id, paidAmount, currentBalance, normalizedBalance],
+    );
 
     const updateClauses = ['remaining_balance = $1'];
     const values = [normalizedBalance, id];

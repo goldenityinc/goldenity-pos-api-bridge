@@ -17,6 +17,19 @@ const getOrderHistoryItems = async (req, res) => {
   }
 };
 
+const getArchivedOrderHistoryItems = async (req, res) => {
+  try {
+    const rows = await runSelect(
+      req.tenantDb,
+      'order_history_items',
+      { ...req.query, is_archived: true },
+    );
+    return jsonOk(res, rows);
+  } catch (error) {
+    return jsonError(res, 500, error.message || 'Internal server error', error.message);
+  }
+};
+
 const createOrderHistoryItems = async (req, res) => {
   try {
     const payload = parseBodyArray(req.body) || parseBodyObject(req.body);
@@ -67,6 +80,7 @@ const archiveOrderHistoryItems = async (req, res) => {
 
 module.exports = {
   getOrderHistoryItems,
+  getArchivedOrderHistoryItems,
   createOrderHistoryItems,
   archiveOrderHistoryItems,
 };

@@ -15,6 +15,7 @@ router.use('/categories', categoriesRoutes);
 router.use('/transactions', transactionsRoutes);
 router.use('/sync', syncRoutes);
 router.use('/order_history/items', orderHistoryItemsRoutes);
+router.use('/shopping-list', orderHistoryItemsRoutes);
 router.use('/records', recordsRoutes);
 router.use('/storage', storageRoutes);
 
