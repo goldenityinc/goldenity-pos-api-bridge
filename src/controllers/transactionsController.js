@@ -103,11 +103,6 @@ const settleKasBon = async (req, res) => {
     const updateClauses = ['remaining_balance = $1'];
     const values = [normalizedBalance, id];
 
-    if (isLunas && columns.has('status')) {
-      updateClauses.push('status = $3');
-      values.push('LUNAS');
-    }
-
     if (isLunas && columns.has('payment_status')) {
       const paramPosition = values.length + 1;
       updateClauses.push(`payment_status = $${paramPosition}`);
