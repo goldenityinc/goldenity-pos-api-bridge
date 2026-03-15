@@ -1,17 +1,17 @@
 const express = require('express');
 const {
   getOrderHistoryItems,
-  getArchivedOrderHistoryItems,
   createOrderHistoryItems,
-  archiveOrderHistoryItems,
+  completeOrderHistoryItem,
 } = require('../controllers/orderHistoryItemsController');
 
 const router = express.Router();
 
+// GET  /             — semua item; filter via ?eq__is_completed=true|false
+// POST /             — buat item baru
+// PUT  /:id/complete — tandai item sebagai Sudah Selesai
 router.get('/', getOrderHistoryItems);
-router.get('/archive', getArchivedOrderHistoryItems);
-router.get('/archived', getArchivedOrderHistoryItems);
 router.post('/', createOrderHistoryItems);
-router.put('/archive', archiveOrderHistoryItems);
+router.put('/:id/complete', completeOrderHistoryItem);
 
 module.exports = router;

@@ -54,10 +54,12 @@ const settleKasBon = async (req, res) => {
 
     await client.query('BEGIN');
 
+    // Use current_schemas(false) so the lookup works regardless of whether the
+    // tenant's tables live in the 'public' schema or a custom search_path schema.
     const columnsResult = await client.query(
       `SELECT column_name
        FROM information_schema.columns
-       WHERE table_schema = 'public'
+       WHERE table_schema = ANY(current_schemas(false))
          AND table_name = 'sales_records'`,
     );
     const columns = new Set(columnsResult.rows.map((row) => row.column_name));

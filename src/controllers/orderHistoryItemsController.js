@@ -1,29 +1,19 @@
 const { jsonOk, jsonError } = require('../utils/http');
 const {
-  normalizeArray,
-  parseQueryValue,
   parseBodyArray,
   parseBodyObject,
   buildInsertQuery,
   runSelect,
 } = require('../utils/sqlHelpers');
 
+// GET /order_history/items
+// Query params yang didukung:
+//   ?eq__is_completed=true   → hanya item Sudah Selesai
+//   ?eq__is_completed=false  → hanya item Belum Selesai
+//   ?limit=N, ?orderBy=col, ?ascending=true/false, ?select=col1,col2
 const getOrderHistoryItems = async (req, res) => {
   try {
     const rows = await runSelect(req.tenantDb, 'order_history_items', req.query);
-    return jsonOk(res, rows);
-  } catch (error) {
-    return jsonError(res, 500, error.message || 'Internal server error', error.message);
-  }
-};
-
-const getArchivedOrderHistoryItems = async (req, res) => {
-  try {
-    const rows = await runSelect(
-      req.tenantDb,
-      'order_history_items',
-      { ...req.query, eq__is_archived: true },
-    );
     return jsonOk(res, rows);
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
@@ -41,38 +31,19 @@ const createOrderHistoryItems = async (req, res) => {
   }
 };
 
-const archiveOrderHistoryItems = async (req, res) => {
+// PUT /order_history/items/:id/complete
+// Tandai satu item sebagai Sudah Selesai (is_completed = true).
+const completeOrderHistoryItem = async (req, res) => {
   try {
-    const { archiveAll = false, productIds = [], manualItemIds = [] } = req.body || {};
-
-    if (archiveAll) {
-      const result = await req.tenantDb.query(
-        'UPDATE order_history_items SET is_archived = true WHERE is_archived = false RETURNING *',
-      );
-      return jsonOk(res, result.rows, 'Archived');
+    const { id } = req.params;
+    const result = await req.tenantDb.query(
+      'UPDATE order_history_items SET is_completed = true WHERE id = $1 RETURNING *',
+      [id],
+    );
+    if ((result.rowCount || 0) === 0) {
+      return jsonError(res, 404, 'Item tidak ditemukan');
     }
-
-    const archived = [];
-    const productIdList = normalizeArray(productIds).map(parseQueryValue);
-    const manualIdList = normalizeArray(manualItemIds).map(parseQueryValue);
-
-    if (productIdList.length > 0) {
-      const result = await req.tenantDb.query(
-        'UPDATE order_history_items SET is_archived = true WHERE product_id = ANY($1) AND is_archived = false RETURNING *',
-        [productIdList],
-      );
-      archived.push(...result.rows);
-    }
-
-    if (manualIdList.length > 0) {
-      const result = await req.tenantDb.query(
-        'UPDATE order_history_items SET is_archived = true WHERE manual_item_id = ANY($1) AND is_archived = false RETURNING *',
-        [manualIdList],
-      );
-      archived.push(...result.rows);
-    }
-
-    return jsonOk(res, archived, 'Archived');
+    return jsonOk(res, result.rows[0] || null, 'Status diperbarui menjadi Selesai');
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
   }
@@ -80,7 +51,6 @@ const archiveOrderHistoryItems = async (req, res) => {
 
 module.exports = {
   getOrderHistoryItems,
-  getArchivedOrderHistoryItems,
   createOrderHistoryItems,
-  archiveOrderHistoryItems,
+  completeOrderHistoryItem,
 };
