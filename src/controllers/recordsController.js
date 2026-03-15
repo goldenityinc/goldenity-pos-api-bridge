@@ -44,12 +44,75 @@ const runWithCustomersTableRetry = async (tenantDb, table, operation) => {
   }
 };
 
+const ensureSelectedColumn = (selectValue, columnName) => {
+  if (!selectValue || selectValue === '*') {
+    return selectValue;
+  }
+
+  const columns = selectValue
+    .toString()
+    .split(',')
+    .map((column) => column.trim())
+    .filter(Boolean);
+
+  const hasColumn = columns.some((column) => column.toLowerCase() === columnName.toLowerCase());
+  if (hasColumn) {
+    return columns.join(',');
+  }
+
+  return `${columns.join(',')},${columnName}`;
+};
+
+const resolvePrimaryKeyColumn = async (tenantDb, table) => {
+  const result = await tenantDb.query(
+    `SELECT kcu.column_name
+     FROM information_schema.table_constraints tc
+     JOIN information_schema.key_column_usage kcu
+       ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+      AND tc.table_name = kcu.table_name
+    WHERE tc.constraint_type = 'PRIMARY KEY'
+      AND tc.table_schema = ANY(current_schemas(false))
+      AND tc.table_name = $1
+    ORDER BY kcu.ordinal_position
+    LIMIT 1`,
+    [table],
+  );
+
+  return result.rows[0]?.column_name || 'id';
+};
+
 const listRecords = async (req, res) => {
   try {
+    const table = req.params.table;
+
+    if (table === 'sales_records') {
+      const primaryKeyColumn = await resolvePrimaryKeyColumn(req.tenantDb, table);
+      const query = {
+        ...req.query,
+        select: ensureSelectedColumn(req.query?.select, primaryKeyColumn),
+      };
+
+      const rows = await runWithCustomersTableRetry(
+        req.tenantDb,
+        table,
+        () => runSelect(req.tenantDb, table, query),
+      );
+
+      const normalizedRows = Array.isArray(rows)
+        ? rows.map((row) => ({
+          ...row,
+          id: row?.id ?? row?.[primaryKeyColumn] ?? null,
+        }))
+        : rows;
+
+      return jsonOk(res, normalizedRows);
+    }
+
     const rows = await runWithCustomersTableRetry(
       req.tenantDb,
-      req.params.table,
-      () => runSelect(req.tenantDb, req.params.table, req.query),
+      table,
+      () => runSelect(req.tenantDb, table, req.query),
     );
     return jsonOk(res, rows);
   } catch (error) {

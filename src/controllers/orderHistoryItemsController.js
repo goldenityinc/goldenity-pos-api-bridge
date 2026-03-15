@@ -6,6 +6,25 @@ const {
   runSelect,
 } = require('../utils/sqlHelpers');
 
+const ensureSelectedColumn = (selectValue, columnName) => {
+  if (!selectValue || selectValue === '*') {
+    return selectValue;
+  }
+
+  const columns = selectValue
+    .toString()
+    .split(',')
+    .map((column) => column.trim())
+    .filter(Boolean);
+
+  const hasColumn = columns.some((column) => column.toLowerCase() === columnName.toLowerCase());
+  if (hasColumn) {
+    return columns.join(',');
+  }
+
+  return `${columns.join(',')},${columnName}`;
+};
+
 // GET /order_history/items
 // Query params yang didukung:
 //   ?eq__is_completed=true   → hanya item Sudah Selesai
@@ -13,7 +32,11 @@ const {
 //   ?limit=N, ?orderBy=col, ?ascending=true/false, ?select=col1,col2
 const getOrderHistoryItems = async (req, res) => {
   try {
-    const rows = await runSelect(req.tenantDb, 'order_history_items', req.query);
+    const query = {
+      ...req.query,
+      select: ensureSelectedColumn(req.query?.select, 'id'),
+    };
+    const rows = await runSelect(req.tenantDb, 'order_history_items', query);
     return jsonOk(res, rows);
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
