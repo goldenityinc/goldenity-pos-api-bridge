@@ -9,7 +9,12 @@ const { tenantResolver } = require('./src/middlewares/tenantResolver');
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-app.use(cors());
+const corsOptions = {
+  origin: '*',
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 
 app.use(publicRoutes);

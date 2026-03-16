@@ -8,6 +8,8 @@
     "dev": "node index.js",
     "railway:fix-tenant": "node scripts/railway_cleanup_and_provision.js",
     "migrate:kasbon": "node scripts/migrate_kasbon_remaining_balance.js",
+    "prisma:generate": "prisma generate",
+    "reset:db:tpp": "node scripts/reset-db.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -15,11 +17,15 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@prisma/client": "^6.5.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "prisma": "^6.5.0"
   }
 }
