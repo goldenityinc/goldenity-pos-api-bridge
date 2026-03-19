@@ -9,6 +9,93 @@ const {
   runSelect,
 } = require('../utils/sqlHelpers');
 
+const createHttpError = (statusCode, message) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+};
+
+const parseMoneyValue = (value) => {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  const normalized = value
+    .toString()
+    .replaceAll('.', '')
+    .replaceAll(',', '')
+    .trim();
+
+  if (!normalized) {
+    return null;
+  }
+
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const extractSellingPrice = (payload = {}) => parseMoneyValue(
+  payload.price ?? payload.selling_price ?? payload.harga_jual,
+);
+
+const extractPurchasePrice = (payload = {}) => parseMoneyValue(
+  payload.purchase_price ?? payload.cost_price ?? payload.harga_modal,
+);
+
+const assertSellingPriceFloor = ({ sellingPrice, purchasePrice }) => {
+  if (sellingPrice === null || purchasePrice === null) {
+    return;
+  }
+
+  if (sellingPrice < purchasePrice) {
+    throw createHttpError(400, 'Gagal: Harga jual di bawah harga modal.');
+  }
+};
+
+const validateProductCreateOrUpsertPayload = (table, payload) => {
+  if (table !== 'products') {
+    return;
+  }
+
+  const rows = Array.isArray(payload) ? payload : [payload];
+  for (const row of rows) {
+    assertSellingPriceFloor({
+      sellingPrice: extractSellingPrice(row),
+      purchasePrice: extractPurchasePrice(row),
+    });
+  }
+};
+
+const validateProductUpdatePayload = async ({
+  tenantDb,
+  table,
+  idField,
+  idValue,
+  payload,
+}) => {
+  if (table !== 'products') {
+    return;
+  }
+
+  const existing = await runSelect(tenantDb, table, {
+    [`eq__${idField}`]: idValue,
+    maybeSingle: true,
+  });
+
+  if (!existing) {
+    throw createHttpError(404, 'Record tidak ditemukan');
+  }
+
+  const sellingPrice = extractSellingPrice(payload) ?? extractSellingPrice(existing);
+  const purchasePrice = extractPurchasePrice(payload) ?? extractPurchasePrice(existing);
+
+  assertSellingPriceFloor({ sellingPrice, purchasePrice });
+};
+
 const ensureCustomersTable = async (tenantDb, table) => {
   if (table !== 'customers') return;
   await tenantDb.query(`
@@ -128,13 +215,19 @@ const createRecords = async (req, res) => {
       async () => {
         const arrayPayload = parseBodyArray(req.body);
         const payload = arrayPayload || parseBodyObject(req.body);
+        validateProductCreateOrUpsertPayload(req.params.table, payload);
         const { sql, values } = buildInsertQuery(req.params.table, payload);
         return req.tenantDb.query(sql, values);
       },
     );
     return jsonOk(res, result.rows, 'Created', 201);
   } catch (error) {
-    return jsonError(res, 500, error.message || 'Internal server error', error.message);
+    return jsonError(
+      res,
+      error.statusCode || 500,
+      error.message || 'Internal server error',
+      error.message,
+    );
   }
 };
 
@@ -145,6 +238,7 @@ const upsertRecords = async (req, res) => {
       req.params.table,
       async () => {
         const payload = parseBodyArray(req.body) || parseBodyObject(req.body);
+        validateProductCreateOrUpsertPayload(req.params.table, payload);
         const onConflict = req.body?.onConflict;
         const { sql, values } = buildUpsertQuery(req.params.table, payload, onConflict);
         return req.tenantDb.query(sql, values);
@@ -152,7 +246,12 @@ const upsertRecords = async (req, res) => {
     );
     return jsonOk(res, result.rows, 'Upserted');
   } catch (error) {
-    return jsonError(res, 500, error.message || 'Internal server error', error.message);
+    return jsonError(
+      res,
+      error.statusCode || 500,
+      error.message || 'Internal server error',
+      error.message,
+    );
   }
 };
 
@@ -164,6 +263,13 @@ const updateRecordById = async (req, res) => {
       async () => {
         const idField = req.query.idField || 'id';
         const payload = parseBodyObject(req.body);
+        await validateProductUpdatePayload({
+          tenantDb: req.tenantDb,
+          table: req.params.table,
+          idField,
+          idValue: req.params.id,
+          payload,
+        });
         const { sql, values } = buildUpdateQuery(req.params.table, payload, idField, req.params.id);
         return req.tenantDb.query(sql, values);
       },
@@ -174,7 +280,12 @@ const updateRecordById = async (req, res) => {
     }
     return jsonOk(res, result.rows[0] || null, 'Updated');
   } catch (error) {
-    return jsonError(res, 500, error.message || 'Internal server error', error.message);
+    return jsonError(
+      res,
+      error.statusCode || 500,
+      error.message || 'Internal server error',
+      error.message,
+    );
   }
 };
 
