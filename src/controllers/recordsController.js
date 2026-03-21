@@ -70,6 +70,50 @@ const validateProductCreateOrUpsertPayload = (table, payload) => {
   }
 };
 
+const normalizeProductPayload = (payload = {}) => {
+  const next = { ...payload };
+
+  if (next.imageUrl !== undefined && next.image_url === undefined) {
+    next.image_url = next.imageUrl;
+  }
+
+  delete next.imageUrl;
+  return next;
+};
+
+const normalizeCustomerPayload = (payload = {}, { isCreate = false } = {}) => {
+  const next = { ...payload };
+
+  delete next.total_spent;
+  delete next.totalSpent;
+
+  // total_spent harus dikelola dari transaksi, bukan input manual create/update.
+  if (isCreate) {
+    next.total_spent = 0;
+  }
+  return next;
+};
+
+const normalizePayloadForTable = (table, payload, options = {}) => {
+  if (Array.isArray(payload)) {
+    return payload.map((row) => normalizePayloadForTable(table, row, options));
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    return payload;
+  }
+
+  if (table === 'products') {
+    return normalizeProductPayload(payload);
+  }
+
+  if (table === 'customers') {
+    return normalizeCustomerPayload(payload, options);
+  }
+
+  return payload;
+};
+
 const validateProductUpdatePayload = async ({
   tenantDb,
   table,
@@ -103,9 +147,23 @@ const ensureCustomersTable = async (tenantDb, table) => {
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
       phone TEXT,
+      total_spent DOUBLE PRECISION DEFAULT 0,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+  `);
+
+  await tenantDb.query(`
+    ALTER TABLE customers
+    ADD COLUMN IF NOT EXISTS total_spent DOUBLE PRECISION DEFAULT 0;
+  `);
+};
+
+const ensureProductsTableColumns = async (tenantDb, table) => {
+  if (table !== 'products') return;
+  await tenantDb.query(`
+    ALTER TABLE products
+    ADD COLUMN IF NOT EXISTS image_url TEXT;
   `);
 };
 
@@ -117,6 +175,7 @@ const isUndefinedCustomersTableError = (error, table) => {
 
 const runWithCustomersTableRetry = async (tenantDb, table, operation) => {
   await ensureCustomersTable(tenantDb, table);
+  await ensureProductsTableColumns(tenantDb, table);
 
   try {
     return await operation();
@@ -127,6 +186,7 @@ const runWithCustomersTableRetry = async (tenantDb, table, operation) => {
 
     // Handle first-run race/legacy schema: create table then retry once.
     await ensureCustomersTable(tenantDb, table);
+    await ensureProductsTableColumns(tenantDb, table);
     return operation();
   }
 };
@@ -214,7 +274,11 @@ const createRecords = async (req, res) => {
       req.params.table,
       async () => {
         const arrayPayload = parseBodyArray(req.body);
-        const payload = arrayPayload || parseBodyObject(req.body);
+        const payload = normalizePayloadForTable(
+          req.params.table,
+          arrayPayload || parseBodyObject(req.body),
+          { isCreate: true },
+        );
         validateProductCreateOrUpsertPayload(req.params.table, payload);
         const { sql, values } = buildInsertQuery(req.params.table, payload);
         return req.tenantDb.query(sql, values);
@@ -237,7 +301,11 @@ const upsertRecords = async (req, res) => {
       req.tenantDb,
       req.params.table,
       async () => {
-        const payload = parseBodyArray(req.body) || parseBodyObject(req.body);
+        const payload = normalizePayloadForTable(
+          req.params.table,
+          parseBodyArray(req.body) || parseBodyObject(req.body),
+          { isCreate: true },
+        );
         validateProductCreateOrUpsertPayload(req.params.table, payload);
         const onConflict = req.body?.onConflict;
         const { sql, values } = buildUpsertQuery(req.params.table, payload, onConflict);
@@ -262,7 +330,11 @@ const updateRecordById = async (req, res) => {
       req.params.table,
       async () => {
         const idField = req.query.idField || 'id';
-        const payload = parseBodyObject(req.body);
+        const payload = normalizePayloadForTable(
+          req.params.table,
+          parseBodyObject(req.body),
+          { isCreate: false },
+        );
         await validateProductUpdatePayload({
           tenantDb: req.tenantDb,
           table: req.params.table,
