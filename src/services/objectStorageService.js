@@ -3,6 +3,7 @@ const {
   PutObjectCommand,
   DeleteObjectCommand,
 } = require('@aws-sdk/client-s3');
+const { toProxyUrl } = require('./imageUrlTransform');
 
 function joinUrl(base, path) {
   return `${base.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
@@ -161,15 +162,9 @@ function buildObjectKey(bucket, fileName) {
 }
 
 function buildPublicUrl(config, key) {
-  if (config.publicBaseUrl) {
-    return joinUrl(config.publicBaseUrl, key);
-  }
-
-  if (config.endpoint) {
-    return joinUrl(config.endpoint, `${config.bucket}/${key}`);
-  }
-
-  return `https://${config.bucket}.s3.${config.region}.amazonaws.com/${key}`;
+  // Return proxy URL for private buckets: /images/[key]
+  // This allows frontend to access private bucket files through image proxy endpoint
+  return toProxyUrl(key);
 }
 
 async function uploadBase64Object({ bucket, fileName, base64, contentType }) {
@@ -226,7 +221,19 @@ async function deleteObject({ bucket, fileName }) {
   };
 }
 
+function getObjectStorageClient() {
+  try {
+    const config = getStorageConfig();
+    return createS3Client(config);
+  } catch (error) {
+    console.error('Failed to create S3 client:', error.message);
+    return null;
+  }
+}
+
 module.exports = {
   uploadBase64Object,
   deleteObject,
+  getObjectStorageClient,
+  getStorageConfig,
 };
