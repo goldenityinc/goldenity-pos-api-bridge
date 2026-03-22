@@ -56,7 +56,9 @@ function getStorageConfig(runtimeBucket) {
     'STORAGE_ACCESS_KEY',
     'STORAGE_ACCESS_KEY_ID',
     'AWS_ACCESS_KEY_ID',
+    'AWS_ACCESS_KEY',
     'S3_ACCESS_KEY_ID',
+    'S3_ACCESS_KEY',
     'AWS_S3_ACCESS_KEY_ID',
     'AWS_S3_ACCESS_KEY',
     'ACCESS_KEY',
@@ -65,7 +67,9 @@ function getStorageConfig(runtimeBucket) {
     'STORAGE_SECRET_KEY',
     'STORAGE_SECRET_ACCESS_KEY',
     'AWS_SECRET_ACCESS_KEY',
+    'AWS_SECRET_KEY',
     'S3_SECRET_ACCESS_KEY',
+    'S3_SECRET_KEY',
     'AWS_S3_SECRET_ACCESS_KEY',
     'AWS_S3_SECRET_KEY',
     'SECRET_KEY',
@@ -84,7 +88,7 @@ function getStorageConfig(runtimeBucket) {
 
   if (!accessKeyId || !secretAccessKey) {
     throw new Error(
-      'Storage credential belum dikonfigurasi (STORAGE_ACCESS_KEY / STORAGE_SECRET_KEY).',
+      'Storage credential belum dikonfigurasi. Set STORAGE_ACCESS_KEY/STORAGE_SECRET_KEY (atau AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY).',
     );
   }
 
