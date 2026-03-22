@@ -43,9 +43,16 @@ function getStorageConfig(runtimeBucket) {
     'AWS_S3_BUCKET',
     'AWS_BUCKET',
   ]) || sanitizeEnvValue(runtimeBucket);
-  const region = firstEnvValue(['STORAGE_REGION', 'AWS_REGION', 'S3_REGION']) || 'auto';
+  const region =
+    firstEnvValue([
+      'STORAGE_REGION',
+      'AWS_REGION',
+      'AWS_DEFAULT_REGION',
+      'S3_REGION',
+    ]) || 'auto';
   const endpoint = firstEnvValue([
     'STORAGE_ENDPOINT',
+    'AWS_ENDPOINT_URL',
     'AWS_S3_ENDPOINT',
     'S3_ENDPOINT',
     'AWS_ENDPOINT',
