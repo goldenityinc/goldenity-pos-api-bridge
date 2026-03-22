@@ -29,10 +29,11 @@ function firstEnvValue(keys) {
   return undefined;
 }
 
-function getStorageConfig() {
+function getStorageConfig(runtimeBucket) {
   const bucket = firstEnvValue([
     'STORAGE_BUCKET',
     'AWS_S3_BUCKET_NAME',
+    'AWS_BUCKET_NAME',
     'BUCKET_NAME',
     'S3_BUCKET',
     'STORAGE_BUCKET_NAME',
@@ -41,13 +42,15 @@ function getStorageConfig() {
     'BUCKET',
     'AWS_S3_BUCKET',
     'AWS_BUCKET',
-  ]);
+  ]) || sanitizeEnvValue(runtimeBucket);
   const region = firstEnvValue(['STORAGE_REGION', 'AWS_REGION', 'S3_REGION']) || 'auto';
   const endpoint = firstEnvValue([
     'STORAGE_ENDPOINT',
     'AWS_S3_ENDPOINT',
     'S3_ENDPOINT',
     'AWS_ENDPOINT',
+    'R2_ENDPOINT',
+    'S3_URL',
   ]);
   const accessKeyId = firstEnvValue([
     'STORAGE_ACCESS_KEY',
@@ -55,6 +58,8 @@ function getStorageConfig() {
     'AWS_ACCESS_KEY_ID',
     'S3_ACCESS_KEY_ID',
     'AWS_S3_ACCESS_KEY_ID',
+    'AWS_S3_ACCESS_KEY',
+    'ACCESS_KEY',
   ]);
   const secretAccessKey = firstEnvValue([
     'STORAGE_SECRET_KEY',
@@ -62,6 +67,8 @@ function getStorageConfig() {
     'AWS_SECRET_ACCESS_KEY',
     'S3_SECRET_ACCESS_KEY',
     'AWS_S3_SECRET_ACCESS_KEY',
+    'AWS_S3_SECRET_KEY',
+    'SECRET_KEY',
   ]);
   const publicBaseUrl = firstEnvValue([
     'STORAGE_PUBLIC_BASE_URL',
@@ -163,7 +170,7 @@ async function uploadBase64Object({ bucket, fileName, base64, contentType }) {
     throw new Error('base64 wajib diisi');
   }
 
-  const config = getStorageConfig();
+  const config = getStorageConfig(bucket);
   const key = buildObjectKey(bucket, fileName);
   const body = Buffer.from(cleanedBase64, 'base64');
 
@@ -190,7 +197,7 @@ async function uploadBase64Object({ bucket, fileName, base64, contentType }) {
 }
 
 async function deleteObject({ bucket, fileName }) {
-  const config = getStorageConfig();
+  const config = getStorageConfig(bucket);
   const key = buildObjectKey(bucket, fileName);
   const client = createS3Client(config);
 
