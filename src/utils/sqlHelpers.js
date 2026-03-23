@@ -226,16 +226,29 @@ const buildUpsertQuery = (table, payload, onConflictValue) => {
   };
 };
 
-const getTableColumnSet = async (tenantDb, table) => {
+const getTableColumnDefinitions = async (tenantDb, table) => {
   const result = await tenantDb.query(
-    `SELECT column_name
+    `SELECT column_name, data_type, udt_name
      FROM information_schema.columns
      WHERE table_schema = ANY(current_schemas(false))
        AND table_name = $1`,
     [table],
   );
 
-  return new Set(result.rows.map((row) => row.column_name));
+  return new Map(
+    result.rows.map((row) => [
+      row.column_name,
+      {
+        dataType: row.data_type,
+        udtName: row.udt_name,
+      },
+    ]),
+  );
+};
+
+const getTableColumnSet = async (tenantDb, table) => {
+  const columnDefinitions = await getTableColumnDefinitions(tenantDb, table);
+  return new Set(columnDefinitions.keys());
 };
 
 const filterObjectByColumnSet = (payload, columnSet) => {
@@ -264,6 +277,65 @@ const filterPayloadByColumnSet = (payload, columnSet) => {
   }
 
   return filterObjectByColumnSet(payload, columnSet);
+};
+
+const normalizeValueForColumnDefinition = (value, columnDefinition) => {
+  if (!columnDefinition || value === undefined || value === null) {
+    return value;
+  }
+
+  const columnType = `${columnDefinition.dataType || ''}`.toLowerCase();
+  const udtName = `${columnDefinition.udtName || ''}`.toLowerCase();
+  const isJsonColumn = columnType === 'json' || columnType === 'jsonb' || udtName === 'json' || udtName === 'jsonb';
+
+  if (!isJsonColumn) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return value;
+    }
+
+    try {
+      JSON.parse(trimmed);
+      return trimmed;
+    } catch {
+      return JSON.stringify(value);
+    }
+  }
+
+  return JSON.stringify(value);
+};
+
+const normalizeObjectByColumnDefinitions = (payload, columnDefinitions) => {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return payload;
+  }
+
+  const next = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (!columnDefinitions.has(key) || value === undefined) {
+      continue;
+    }
+
+    next[key] = normalizeValueForColumnDefinition(value, columnDefinitions.get(key));
+  }
+
+  return next;
+};
+
+const normalizePayloadByColumnDefinitions = (payload, columnDefinitions) => {
+  if (!(columnDefinitions instanceof Map) || columnDefinitions.size === 0) {
+    return payload;
+  }
+
+  if (Array.isArray(payload)) {
+    return payload.map((row) => normalizeObjectByColumnDefinitions(row, columnDefinitions));
+  }
+
+  return normalizeObjectByColumnDefinitions(payload, columnDefinitions);
 };
 
 const runSelect = async (tenantDb, table, query = {}) => {
@@ -296,7 +368,9 @@ module.exports = {
   buildUpdateQuery,
   buildDeleteQuery,
   buildUpsertQuery,
+  getTableColumnDefinitions,
   getTableColumnSet,
   filterPayloadByColumnSet,
+  normalizePayloadByColumnDefinitions,
   runSelect,
 };

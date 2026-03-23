@@ -7,8 +7,8 @@ const {
   buildUpdateQuery,
   buildDeleteQuery,
   buildUpsertQuery,
-  getTableColumnSet,
-  filterPayloadByColumnSet,
+  getTableColumnDefinitions,
+  normalizePayloadByColumnDefinitions,
   runSelect,
 } = require('../utils/sqlHelpers');
 const { emitTableMutation } = require('../services/realtimeEmitter');
@@ -294,8 +294,8 @@ const createRecords = async (req, res) => {
           arrayPayload || parseBodyObject(req.body),
           { isCreate: true },
         );
-        const columnSet = await getTableColumnSet(req.tenantDb, table);
-        const filteredPayload = filterPayloadByColumnSet(payload, columnSet);
+        const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
+        const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
         if (!hasMutationFields(filteredPayload)) {
           throw createHttpError(400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
         }
@@ -334,15 +334,15 @@ const upsertRecords = async (req, res) => {
           parseBodyArray(req.body) || parseBodyObject(req.body),
           { isCreate: true },
         );
-        const columnSet = await getTableColumnSet(req.tenantDb, table);
-        const filteredPayload = filterPayloadByColumnSet(payload, columnSet);
+        const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
+        const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
         if (!hasMutationFields(filteredPayload)) {
           throw createHttpError(400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
         }
         validateProductCreateOrUpsertPayload(table, filteredPayload);
         const onConflict = req.body?.onConflict;
         const filteredOnConflict = normalizeArray(onConflict).filter((column) =>
-          columnSet.has(column),
+          columnDefinitions.has(column),
         );
         if (filteredOnConflict.length === 0) {
           throw createHttpError(400, 'onConflict tidak cocok dengan schema tabel');
@@ -386,8 +386,8 @@ const updateRecordById = async (req, res) => {
           parseBodyObject(req.body),
           { isCreate: false },
         );
-        const columnSet = await getTableColumnSet(req.tenantDb, table);
-        const filteredPayload = filterPayloadByColumnSet(payload, columnSet);
+        const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
+        const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
         await validateProductUpdatePayload({
           tenantDb: req.tenantDb,
           table,

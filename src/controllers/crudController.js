@@ -7,8 +7,8 @@ const {
   buildInsertQuery,
   buildUpdateQuery,
   buildDeleteQuery,
-  getTableColumnSet,
-  filterPayloadByColumnSet,
+  getTableColumnDefinitions,
+  normalizePayloadByColumnDefinitions,
   runSelect,
 } = require('../utils/sqlHelpers');
 
@@ -77,8 +77,8 @@ const createCrudController = (table) => ({
             arrayPayload.map((item) => normalizeUserPassword(table, item, { isCreate: true })),
           )
         : await normalizeUserPassword(table, parseBodyObject(req.body), { isCreate: true });
-      const columnSet = await getTableColumnSet(req.tenantDb, table);
-      const filteredPayload = filterPayloadByColumnSet(payload, columnSet);
+      const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
+      const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
       const hasFields = Array.isArray(filteredPayload)
         ? filteredPayload.some((row) => row && typeof row === 'object' && Object.keys(row).length > 0)
         : !!filteredPayload && typeof filteredPayload === 'object' && Object.keys(filteredPayload).length > 0;
@@ -107,8 +107,8 @@ const createCrudController = (table) => ({
     try {
       const idField = req.query.idField || 'id';
       const payload = await normalizeUserPassword(table, parseBodyObject(req.body));
-      const columnSet = await getTableColumnSet(req.tenantDb, table);
-      const filteredPayload = filterPayloadByColumnSet(payload, columnSet);
+      const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
+      const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
       const hasFields = !!filteredPayload && typeof filteredPayload === 'object' && Object.keys(filteredPayload).length > 0;
       if (!hasFields) {
         const existing = await runSelect(req.tenantDb, table, {

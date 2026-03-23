@@ -3,8 +3,8 @@ const {
   buildInsertQuery,
   buildUpdateQuery,
   buildDeleteQuery,
-  getTableColumnSet,
-  filterPayloadByColumnSet,
+  getTableColumnDefinitions,
+  normalizePayloadByColumnDefinitions,
   runSelect,
 } = require('../utils/sqlHelpers');
 const { emitTableMutation } = require('../services/realtimeEmitter');
@@ -103,8 +103,8 @@ const runSync = async (req, res) => {
         delete payload.id;
       }
 
-      const columnSet = await getTableColumnSet(req.tenantDb, table);
-      const filteredPayload = filterPayloadByColumnSet(payload, columnSet);
+      const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
+      const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
       if (!hasMutationFields(filteredPayload)) {
         return jsonError(res, 400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
       }
@@ -123,8 +123,8 @@ const runSync = async (req, res) => {
 
     if (action === 'UPDATE') {
       const payload = normalizePayloadForTable(table, data || {}, { isCreate: false });
-      const columnSet = await getTableColumnSet(req.tenantDb, table);
-      const filteredPayload = filterPayloadByColumnSet(payload, columnSet);
+      const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
+      const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
       if (!hasMutationFields(filteredPayload)) {
         const existing = await runSelect(req.tenantDb, table, {
           eq__id: id,
