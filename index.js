@@ -1,3 +1,4 @@
+const http = require('http');
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
@@ -5,9 +6,11 @@ require('dotenv').config();
 const publicRoutes = require('./src/routes/publicRoutes');
 const protectedRoutes = require('./src/routes/protectedRoutes');
 const { tenantResolver } = require('./src/middlewares/tenantResolver');
+const { initializeSocketServer } = require('./src/services/socketServer');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const server = http.createServer(app);
 
 const corsOptions = {
   origin: '*',
@@ -21,6 +24,8 @@ app.use(publicRoutes);
 app.use(tenantResolver);
 app.use(protectedRoutes);
 
-app.listen(PORT, () => {
+initializeSocketServer(server);
+
+server.listen(PORT, () => {
   console.log(`Goldenity Dynamic Bridge API running on port ${PORT}`);
 });

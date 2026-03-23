@@ -1,11 +1,50 @@
 const { jsonOk, jsonError } = require('../utils/http');
 const { buildInsertQuery } = require('../utils/sqlHelpers');
+const { emitTransactionCreated, emitTransactionUpdated } = require('../services/realtimeEmitter');
 
 const normalizePaymentType = (value) => (value || '').toString().trim().toUpperCase();
 
 const toNumber = (value) => {
   const numberValue = Number(value);
   return Number.isFinite(numberValue) ? numberValue : NaN;
+};
+
+const toPositiveInteger = (value) => {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+};
+
+const normalizeTransactionItems = (items) => {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return null;
+      }
+
+      const product = item.product && typeof item.product === 'object'
+        ? item.product
+        : {};
+      const productId = (
+        item.product_id ?? item.productId ?? product.id ?? ''
+      ).toString().trim();
+      const qty = toPositiveInteger(item.qty ?? item.quantity);
+      if (!productId || qty === null) {
+        return null;
+      }
+
+      return {
+        productId,
+        qty,
+      };
+    })
+    .filter(Boolean);
 };
 
 const ensureKasBonHistoryTable = async (client) => {
@@ -27,13 +66,64 @@ const ensureKasBonHistoryTable = async (client) => {
 };
 
 const createTransaction = async (req, res) => {
+  const client = await req.tenantDb.connect();
+
   try {
     const payload = { ...req.body };
+    const inventoryUpdates = [];
+    const transactionItems = normalizeTransactionItems(payload.items);
+
+    await client.query('BEGIN');
+
+    for (const item of transactionItems) {
+      const currentResult = await client.query(
+        'SELECT id, name, stock, is_service FROM "products" WHERE id = $1 LIMIT 1 FOR UPDATE',
+        [item.productId],
+      );
+
+      if ((currentResult.rowCount || 0) === 0) {
+        throw new Error(`Produk ${item.productId} tidak ditemukan`);
+      }
+
+      const currentProduct = currentResult.rows[0];
+      if (currentProduct.is_service === true) {
+        continue;
+      }
+
+      const currentStock = Number(currentProduct.stock ?? 0);
+      if (!Number.isFinite(currentStock)) {
+        throw new Error(`Stok produk ${item.productId} tidak valid`);
+      }
+
+      const nextStock = currentStock - item.qty;
+      if (nextStock < 0) {
+        throw new Error(`Stok produk ${currentProduct.name || item.productId} tidak mencukupi`);
+      }
+
+      const updateResult = await client.query(
+        'UPDATE "products" SET stock = $1 WHERE id = $2 RETURNING *',
+        [nextStock, item.productId],
+      );
+      if ((updateResult.rowCount || 0) > 0) {
+        inventoryUpdates.push(updateResult.rows[0]);
+      }
+    }
+
     const { sql, values } = buildInsertQuery('sales_records', payload);
-    const result = await req.tenantDb.query(sql, values);
-    return jsonOk(res, result.rows[0] || null, 'Transaction saved', 201);
+    const result = await client.query(sql, values);
+    await client.query('COMMIT');
+
+    const savedTransaction = result.rows[0] || null;
+    emitTransactionCreated(req, savedTransaction, {
+      inventoryUpdates,
+    });
+
+    return jsonOk(res, savedTransaction, 'Transaction saved', 201);
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
+  } finally {
+    client.release();
   }
 };
 
@@ -150,6 +240,10 @@ const settleKasBon = async (req, res) => {
 
     const updateResult = await client.query(updateSql, values);
     await client.query('COMMIT');
+
+    emitTransactionUpdated(req, updateResult.rows[0] || null, {
+      transactionId: id,
+    });
 
     return jsonOk(
       res,

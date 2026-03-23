@@ -1,5 +1,6 @@
 const { jsonOk, jsonError } = require('../utils/http');
 const { runSelect } = require('../utils/sqlHelpers');
+const { emitInventoryUpdated } = require('../services/realtimeEmitter');
 
 const getProducts = async (req, res) => {
   try {
@@ -52,8 +53,14 @@ const reduceStock = async (req, res) => {
       [newStock, productId],
     );
 
+    const updatedProduct = updateResult.rows[0] || null;
+    emitInventoryUpdated(req, updatedProduct, {
+      reason,
+      source: 'products_reduce_stock',
+    });
+
     return jsonOk(res, {
-      ...(updateResult.rows[0] || {}),
+      ...(updatedProduct || {}),
       reduced_qty: qty,
       reason,
     }, 'Stock reduced');

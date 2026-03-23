@@ -8,6 +8,7 @@ const {
   buildUpsertQuery,
   runSelect,
 } = require('../utils/sqlHelpers');
+const { emitTableMutation } = require('../services/realtimeEmitter');
 
 const createHttpError = (statusCode, message) => {
   const error = new Error(message);
@@ -269,21 +270,29 @@ const listRecords = async (req, res) => {
 
 const createRecords = async (req, res) => {
   try {
+    const table = req.params.table;
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
-      req.params.table,
+      table,
       async () => {
         const arrayPayload = parseBodyArray(req.body);
         const payload = normalizePayloadForTable(
-          req.params.table,
+          table,
           arrayPayload || parseBodyObject(req.body),
           { isCreate: true },
         );
-        validateProductCreateOrUpsertPayload(req.params.table, payload);
-        const { sql, values } = buildInsertQuery(req.params.table, payload);
+        validateProductCreateOrUpsertPayload(table, payload);
+        const { sql, values } = buildInsertQuery(table, payload);
         return req.tenantDb.query(sql, values);
       },
     );
+    for (const row of result.rows) {
+      emitTableMutation(req, {
+        table,
+        action: 'INSERT',
+        record: row,
+      });
+    }
     return jsonOk(res, result.rows, 'Created', 201);
   } catch (error) {
     return jsonError(
@@ -297,21 +306,29 @@ const createRecords = async (req, res) => {
 
 const upsertRecords = async (req, res) => {
   try {
+    const table = req.params.table;
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
-      req.params.table,
+      table,
       async () => {
         const payload = normalizePayloadForTable(
-          req.params.table,
+          table,
           parseBodyArray(req.body) || parseBodyObject(req.body),
           { isCreate: true },
         );
-        validateProductCreateOrUpsertPayload(req.params.table, payload);
+        validateProductCreateOrUpsertPayload(table, payload);
         const onConflict = req.body?.onConflict;
-        const { sql, values } = buildUpsertQuery(req.params.table, payload, onConflict);
+        const { sql, values } = buildUpsertQuery(table, payload, onConflict);
         return req.tenantDb.query(sql, values);
       },
     );
+    for (const row of result.rows) {
+      emitTableMutation(req, {
+        table,
+        action: 'UPSERT',
+        record: row,
+      });
+    }
     return jsonOk(res, result.rows, 'Upserted');
   } catch (error) {
     return jsonError(
@@ -325,24 +342,25 @@ const upsertRecords = async (req, res) => {
 
 const updateRecordById = async (req, res) => {
   try {
+    const table = req.params.table;
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
-      req.params.table,
+      table,
       async () => {
         const idField = req.query.idField || 'id';
         const payload = normalizePayloadForTable(
-          req.params.table,
+          table,
           parseBodyObject(req.body),
           { isCreate: false },
         );
         await validateProductUpdatePayload({
           tenantDb: req.tenantDb,
-          table: req.params.table,
+          table,
           idField,
           idValue: req.params.id,
           payload,
         });
-        const { sql, values } = buildUpdateQuery(req.params.table, payload, idField, req.params.id);
+        const { sql, values } = buildUpdateQuery(table, payload, idField, req.params.id);
         return req.tenantDb.query(sql, values);
       },
     );
@@ -350,6 +368,12 @@ const updateRecordById = async (req, res) => {
     if ((result.rowCount || 0) === 0) {
       return jsonError(res, 404, 'Record tidak ditemukan');
     }
+    emitTableMutation(req, {
+      table,
+      action: 'UPDATE',
+      record: result.rows[0] || null,
+      id: req.params.id,
+    });
     return jsonOk(res, result.rows[0] || null, 'Updated');
   } catch (error) {
     return jsonError(
@@ -363,15 +387,22 @@ const updateRecordById = async (req, res) => {
 
 const deleteRecordById = async (req, res) => {
   try {
+    const table = req.params.table;
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
-      req.params.table,
+      table,
       async () => {
         const idField = req.query.idField || 'id';
-        const { sql, values } = buildDeleteQuery(req.params.table, idField, req.params.id);
+        const { sql, values } = buildDeleteQuery(table, idField, req.params.id);
         return req.tenantDb.query(sql, values);
       },
     );
+    emitTableMutation(req, {
+      table,
+      action: 'DELETE',
+      record: result.rows[0] || null,
+      id: req.params.id,
+    });
     return jsonOk(res, result.rows[0] || null, 'Deleted');
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);

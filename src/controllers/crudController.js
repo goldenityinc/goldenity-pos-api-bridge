@@ -1,5 +1,6 @@
 const { jsonOk, jsonError } = require('../utils/http');
 const bcrypt = require('bcryptjs');
+const { emitTableMutation } = require('../services/realtimeEmitter');
 const {
   parseBodyArray,
   parseBodyObject,
@@ -76,6 +77,13 @@ const createCrudController = (table) => ({
         : await normalizeUserPassword(table, parseBodyObject(req.body), { isCreate: true });
       const { sql, values } = buildInsertQuery(table, payload);
       const result = await req.tenantDb.query(sql, values);
+      for (const row of result.rows) {
+        emitTableMutation(req, {
+          table,
+          action: 'INSERT',
+          record: row,
+        });
+      }
       return jsonOk(res, arrayPayload ? result.rows : (result.rows[0] || null), 'Created', 201);
     } catch (error) {
       if (error instanceof BadRequestError) {
@@ -91,6 +99,12 @@ const createCrudController = (table) => ({
       const payload = await normalizeUserPassword(table, parseBodyObject(req.body));
       const { sql, values } = buildUpdateQuery(table, payload, idField, req.params.id);
       const result = await req.tenantDb.query(sql, values);
+      emitTableMutation(req, {
+        table,
+        action: 'UPDATE',
+        record: result.rows[0] || null,
+        id: req.params.id,
+      });
       return jsonOk(res, result.rows[0] || null, 'Updated');
     } catch (error) {
       if (error instanceof BadRequestError) {
@@ -105,6 +119,12 @@ const createCrudController = (table) => ({
       const idField = req.query.idField || 'id';
       const { sql, values } = buildDeleteQuery(table, idField, req.params.id);
       const result = await req.tenantDb.query(sql, values);
+      emitTableMutation(req, {
+        table,
+        action: 'DELETE',
+        record: result.rows[0] || null,
+        id: req.params.id,
+      });
       return jsonOk(res, result.rows[0] || null, 'Deleted');
     } catch (error) {
       return jsonError(res, 500, error.message || 'Internal server error', error.message);

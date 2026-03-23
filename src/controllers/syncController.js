@@ -4,6 +4,7 @@ const {
   buildUpdateQuery,
   buildDeleteQuery,
 } = require('../utils/sqlHelpers');
+const { emitTableMutation } = require('../services/realtimeEmitter');
 
 const normalizeProductPayload = (payload = {}) => {
   const next = { ...payload };
@@ -97,6 +98,13 @@ const runSync = async (req, res) => {
 
       const { sql, values } = buildInsertQuery(table, payload);
       const result = await req.tenantDb.query(sql, values);
+      for (const row of result.rows) {
+        emitTableMutation(req, {
+          table,
+          action: 'INSERT',
+          record: row,
+        });
+      }
       return jsonOk(res, result.rows, 'Sync insert success', 201);
     }
 
@@ -104,12 +112,24 @@ const runSync = async (req, res) => {
       const payload = normalizePayloadForTable(table, data || {}, { isCreate: false });
       const { sql, values } = buildUpdateQuery(table, payload, 'id', id);
       const result = await req.tenantDb.query(sql, values);
+      emitTableMutation(req, {
+        table,
+        action: 'UPDATE',
+        record: result.rows[0] || null,
+        id,
+      });
       return jsonOk(res, result.rows, 'Sync update success');
     }
 
     if (action === 'DELETE') {
       const { sql, values } = buildDeleteQuery(table, 'id', id);
       const result = await req.tenantDb.query(sql, values);
+      emitTableMutation(req, {
+        table,
+        action: 'DELETE',
+        record: result.rows[0] || null,
+        id,
+      });
       return jsonOk(res, result.rows, 'Sync delete success');
     }
 
