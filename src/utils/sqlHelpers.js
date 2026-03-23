@@ -226,6 +226,46 @@ const buildUpsertQuery = (table, payload, onConflictValue) => {
   };
 };
 
+const getTableColumnSet = async (tenantDb, table) => {
+  const result = await tenantDb.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = ANY(current_schemas(false))
+       AND table_name = $1`,
+    [table],
+  );
+
+  return new Set(result.rows.map((row) => row.column_name));
+};
+
+const filterObjectByColumnSet = (payload, columnSet) => {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return payload;
+  }
+
+  const next = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (!columnSet.has(key) || value === undefined) {
+      continue;
+    }
+    next[key] = value;
+  }
+
+  return next;
+};
+
+const filterPayloadByColumnSet = (payload, columnSet) => {
+  if (!(columnSet instanceof Set) || columnSet.size === 0) {
+    return payload;
+  }
+
+  if (Array.isArray(payload)) {
+    return payload.map((row) => filterObjectByColumnSet(row, columnSet));
+  }
+
+  return filterObjectByColumnSet(payload, columnSet);
+};
+
 const runSelect = async (tenantDb, table, query = {}) => {
   const { sql, values } = buildSelectQuery(table, query);
   const result = await tenantDb.query(sql, values);
@@ -256,5 +296,7 @@ module.exports = {
   buildUpdateQuery,
   buildDeleteQuery,
   buildUpsertQuery,
+  getTableColumnSet,
+  filterPayloadByColumnSet,
   runSelect,
 };

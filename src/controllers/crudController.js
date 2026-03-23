@@ -7,6 +7,8 @@ const {
   buildInsertQuery,
   buildUpdateQuery,
   buildDeleteQuery,
+  getTableColumnSet,
+  filterPayloadByColumnSet,
   runSelect,
 } = require('../utils/sqlHelpers');
 
@@ -75,7 +77,15 @@ const createCrudController = (table) => ({
             arrayPayload.map((item) => normalizeUserPassword(table, item, { isCreate: true })),
           )
         : await normalizeUserPassword(table, parseBodyObject(req.body), { isCreate: true });
-      const { sql, values } = buildInsertQuery(table, payload);
+      const columnSet = await getTableColumnSet(req.tenantDb, table);
+      const filteredPayload = filterPayloadByColumnSet(payload, columnSet);
+      const hasFields = Array.isArray(filteredPayload)
+        ? filteredPayload.some((row) => row && typeof row === 'object' && Object.keys(row).length > 0)
+        : !!filteredPayload && typeof filteredPayload === 'object' && Object.keys(filteredPayload).length > 0;
+      if (!hasFields) {
+        throw new BadRequestError(`Tidak ada kolom yang cocok untuk tabel ${table}`);
+      }
+      const { sql, values } = buildInsertQuery(table, filteredPayload);
       const result = await req.tenantDb.query(sql, values);
       for (const row of result.rows) {
         emitTableMutation(req, {
@@ -97,7 +107,17 @@ const createCrudController = (table) => ({
     try {
       const idField = req.query.idField || 'id';
       const payload = await normalizeUserPassword(table, parseBodyObject(req.body));
-      const { sql, values } = buildUpdateQuery(table, payload, idField, req.params.id);
+      const columnSet = await getTableColumnSet(req.tenantDb, table);
+      const filteredPayload = filterPayloadByColumnSet(payload, columnSet);
+      const hasFields = !!filteredPayload && typeof filteredPayload === 'object' && Object.keys(filteredPayload).length > 0;
+      if (!hasFields) {
+        const existing = await runSelect(req.tenantDb, table, {
+          [`eq__${idField}`]: req.params.id,
+          maybeSingle: true,
+        });
+        return jsonOk(res, existing || null, 'Updated');
+      }
+      const { sql, values } = buildUpdateQuery(table, filteredPayload, idField, req.params.id);
       const result = await req.tenantDb.query(sql, values);
       emitTableMutation(req, {
         table,

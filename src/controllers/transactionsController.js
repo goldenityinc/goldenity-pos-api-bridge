@@ -1,5 +1,9 @@
 const { jsonOk, jsonError } = require('../utils/http');
-const { buildInsertQuery } = require('../utils/sqlHelpers');
+const {
+  buildInsertQuery,
+  getTableColumnSet,
+  filterPayloadByColumnSet,
+} = require('../utils/sqlHelpers');
 const { emitTransactionCreated, emitTransactionUpdated } = require('../services/realtimeEmitter');
 
 const normalizePaymentType = (value) => (value || '').toString().trim().toUpperCase();
@@ -70,6 +74,9 @@ const createTransaction = async (req, res) => {
 
   try {
     const payload = { ...req.body };
+    if (typeof payload.id === 'string') {
+      delete payload.id;
+    }
     const inventoryUpdates = [];
     const transactionItems = normalizeTransactionItems(payload.items);
 
@@ -109,7 +116,14 @@ const createTransaction = async (req, res) => {
       }
     }
 
-    const { sql, values } = buildInsertQuery('sales_records', payload);
+    const salesRecordColumns = await getTableColumnSet(client, 'sales_records');
+    const filteredPayload = filterPayloadByColumnSet(payload, salesRecordColumns);
+
+    if (Object.keys(filteredPayload).length === 0) {
+      throw new Error('Payload transaksi tidak cocok dengan schema sales_records tenant');
+    }
+
+    const { sql, values } = buildInsertQuery('sales_records', filteredPayload);
     const result = await client.query(sql, values);
     await client.query('COMMIT');
 

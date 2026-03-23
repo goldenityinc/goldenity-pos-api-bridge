@@ -1,11 +1,14 @@
 const { jsonOk, jsonError } = require('../utils/http');
 const {
+  normalizeArray,
   parseBodyArray,
   parseBodyObject,
   buildInsertQuery,
   buildUpdateQuery,
   buildDeleteQuery,
   buildUpsertQuery,
+  getTableColumnSet,
+  filterPayloadByColumnSet,
   runSelect,
 } = require('../utils/sqlHelpers');
 const { emitTableMutation } = require('../services/realtimeEmitter');
@@ -230,6 +233,16 @@ const resolvePrimaryKeyColumn = async (tenantDb, table) => {
   return result.rows[0]?.column_name || 'id';
 };
 
+const hasMutationFields = (payload) => {
+  if (Array.isArray(payload)) {
+    return payload.some(
+      (row) => row && typeof row === 'object' && Object.keys(row).length > 0,
+    );
+  }
+
+  return !!payload && typeof payload === 'object' && Object.keys(payload).length > 0;
+};
+
 const listRecords = async (req, res) => {
   try {
     const table = req.params.table;
@@ -281,8 +294,13 @@ const createRecords = async (req, res) => {
           arrayPayload || parseBodyObject(req.body),
           { isCreate: true },
         );
-        validateProductCreateOrUpsertPayload(table, payload);
-        const { sql, values } = buildInsertQuery(table, payload);
+        const columnSet = await getTableColumnSet(req.tenantDb, table);
+        const filteredPayload = filterPayloadByColumnSet(payload, columnSet);
+        if (!hasMutationFields(filteredPayload)) {
+          throw createHttpError(400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
+        }
+        validateProductCreateOrUpsertPayload(table, filteredPayload);
+        const { sql, values } = buildInsertQuery(table, filteredPayload);
         return req.tenantDb.query(sql, values);
       },
     );
@@ -316,9 +334,24 @@ const upsertRecords = async (req, res) => {
           parseBodyArray(req.body) || parseBodyObject(req.body),
           { isCreate: true },
         );
-        validateProductCreateOrUpsertPayload(table, payload);
+        const columnSet = await getTableColumnSet(req.tenantDb, table);
+        const filteredPayload = filterPayloadByColumnSet(payload, columnSet);
+        if (!hasMutationFields(filteredPayload)) {
+          throw createHttpError(400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
+        }
+        validateProductCreateOrUpsertPayload(table, filteredPayload);
         const onConflict = req.body?.onConflict;
-        const { sql, values } = buildUpsertQuery(table, payload, onConflict);
+        const filteredOnConflict = normalizeArray(onConflict).filter((column) =>
+          columnSet.has(column),
+        );
+        if (filteredOnConflict.length === 0) {
+          throw createHttpError(400, 'onConflict tidak cocok dengan schema tabel');
+        }
+        const { sql, values } = buildUpsertQuery(
+          table,
+          filteredPayload,
+          filteredOnConflict,
+        );
         return req.tenantDb.query(sql, values);
       },
     );
@@ -353,14 +386,31 @@ const updateRecordById = async (req, res) => {
           parseBodyObject(req.body),
           { isCreate: false },
         );
+        const columnSet = await getTableColumnSet(req.tenantDb, table);
+        const filteredPayload = filterPayloadByColumnSet(payload, columnSet);
         await validateProductUpdatePayload({
           tenantDb: req.tenantDb,
           table,
           idField,
           idValue: req.params.id,
-          payload,
+          payload: filteredPayload,
         });
-        const { sql, values } = buildUpdateQuery(table, payload, idField, req.params.id);
+        if (!hasMutationFields(filteredPayload)) {
+          const existing = await runSelect(req.tenantDb, table, {
+            [`eq__${idField}`]: req.params.id,
+            maybeSingle: true,
+          });
+          return {
+            rowCount: existing ? 1 : 0,
+            rows: existing ? [existing] : [],
+          };
+        }
+        const { sql, values } = buildUpdateQuery(
+          table,
+          filteredPayload,
+          idField,
+          req.params.id,
+        );
         return req.tenantDb.query(sql, values);
       },
     );
