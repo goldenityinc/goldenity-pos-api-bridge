@@ -1,4 +1,5 @@
 const { jsonOk, jsonError } = require('../utils/http');
+const { emitTableMutation } = require('../services/realtimeEmitter');
 const {
   parseBodyArray,
   parseBodyObject,
@@ -48,6 +49,13 @@ const createOrderHistoryItems = async (req, res) => {
     const payload = parseBodyArray(req.body) || parseBodyObject(req.body);
     const { sql, values } = buildInsertQuery('order_history_items', payload);
     const result = await req.tenantDb.query(sql, values);
+    for (const row of result.rows) {
+      emitTableMutation(req, {
+        table: 'order_history_items',
+        action: 'INSERT',
+        record: row,
+      });
+    }
     return jsonOk(res, result.rows, 'Created', 201);
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
@@ -66,6 +74,12 @@ const completeOrderHistoryItem = async (req, res) => {
     if ((result.rowCount || 0) === 0) {
       return jsonError(res, 404, 'Item tidak ditemukan');
     }
+    emitTableMutation(req, {
+      table: 'order_history_items',
+      action: 'UPDATE',
+      record: result.rows[0] || null,
+      id,
+    });
     return jsonOk(res, result.rows[0] || null, 'Status diperbarui menjadi Selesai');
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);

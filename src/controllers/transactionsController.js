@@ -257,6 +257,17 @@ const settleKasBon = async (req, res) => {
 
     emitTransactionUpdated(req, updateResult.rows[0] || null, {
       transactionId: id,
+      action: 'UPDATE',
+      mutationType: 'KASBON_SETTLED',
+      paymentHistory: {
+        sales_record_id: id,
+        paid_amount: paidAmount,
+        previous_balance: currentBalance,
+        remaining_balance: normalizedBalance,
+      },
+      paidAmount,
+      remainingBalance: normalizedBalance,
+      status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
     });
 
     return jsonOk(
