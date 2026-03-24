@@ -1,0 +1,161 @@
+const crypto = require('crypto');
+
+const { jsonOk, jsonError } = require('../utils/http');
+const { emitPettyCashUpdated } = require('../services/realtimeEmitter');
+
+const normalizeType = (value) => {
+  const normalized = (value ?? 'IN').toString().trim().toUpperCase();
+  return normalized === 'OUT' ? 'OUT' : 'IN';
+};
+
+const toIntegerAmount = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return NaN;
+  }
+  return Math.round(parsed);
+};
+
+const resolveUserIdFromRequest = (req) => {
+  return (
+    req?.auth?.userId ??
+    req?.auth?.user_id ??
+    req?.auth?.sub ??
+    req?.auth?.username ??
+    ''
+  )
+    .toString()
+    .trim();
+};
+
+const ensurePettyCashLogsTable = async (client) => {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS petty_cash_logs (
+      id UUID PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      user_id TEXT,
+      amount INTEGER NOT NULL,
+      type VARCHAR(3) NOT NULL DEFAULT 'IN',
+      notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS idx_petty_cash_logs_created_at
+    ON petty_cash_logs (created_at DESC);
+  `);
+
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS idx_petty_cash_logs_tenant_created_at
+    ON petty_cash_logs (tenant_id, created_at DESC);
+  `);
+};
+
+const mapPettyCashRow = (row = {}) => ({
+  id: row.id,
+  tenantId: row.tenant_id,
+  tenant_id: row.tenant_id,
+  userId: row.user_id,
+  user_id: row.user_id,
+  amount: Number(row.amount ?? 0),
+  type: normalizeType(row.type),
+  notes: row.notes ?? '',
+  createdAt: row.created_at,
+  created_at: row.created_at,
+});
+
+const getTodayPettyCashLogs = async (req, res) => {
+  const client = await req.tenantDb.connect();
+
+  try {
+    await ensurePettyCashLogsTable(client);
+
+    const tenantId = (req?.tenant?.tenantId ?? '').toString().trim();
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(start);
+    end.setDate(end.getDate() + 1);
+
+    const result = await client.query(
+      `SELECT id, tenant_id, user_id, amount, type, notes, created_at
+       FROM petty_cash_logs
+       WHERE tenant_id = $1
+         AND created_at >= $2
+         AND created_at < $3
+       ORDER BY created_at DESC`,
+      [tenantId, start.toISOString(), end.toISOString()],
+    );
+
+    return jsonOk(
+      res,
+      result.rows.map(mapPettyCashRow),
+      'Petty cash hari ini berhasil dimuat',
+    );
+  } catch (error) {
+    return jsonError(
+      res,
+      500,
+      'Gagal memuat petty cash hari ini',
+      error.message,
+    );
+  } finally {
+    client.release();
+  }
+};
+
+const createPettyCashLog = async (req, res) => {
+  const client = await req.tenantDb.connect();
+
+  try {
+    const tenantId = (req?.tenant?.tenantId ?? '').toString().trim();
+    const userId = resolveUserIdFromRequest(req);
+    const amount = toIntegerAmount(req.body?.amount);
+    const type = normalizeType(req.body?.type);
+    const notes = (req.body?.notes ?? '').toString().trim();
+    const id = crypto.randomUUID();
+
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
+
+    if (!Number.isInteger(amount) || amount <= 0) {
+      return jsonError(res, 400, 'Nominal petty cash harus lebih dari 0');
+    }
+
+    await ensurePettyCashLogsTable(client);
+
+    const insertResult = await client.query(
+      `INSERT INTO petty_cash_logs (
+         id,
+         tenant_id,
+         user_id,
+         amount,
+         type,
+         notes
+       ) VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, tenant_id, user_id, amount, type, notes, created_at`,
+      [id, tenantId, userId || null, amount, type, notes || null],
+    );
+
+    const createdLog = mapPettyCashRow(insertResult.rows[0] || {});
+    emitPettyCashUpdated(req, createdLog);
+
+    return jsonOk(res, createdLog, 'Petty cash berhasil disimpan', 201);
+  } catch (error) {
+    return jsonError(
+      res,
+      500,
+      'Gagal menyimpan petty cash',
+      error.message,
+    );
+  } finally {
+    client.release();
+  }
+};
+
+module.exports = {
+  getTodayPettyCashLogs,
+  createPettyCashLog,
+  ensurePettyCashLogsTable,
+};

@@ -370,6 +370,33 @@ const emitTransactionUpdated = (req, transactionRecord, extra = {}) => {
   });
 };
 
+const emitPettyCashUpdated = (req, pettyCashRecord) => {
+  const tenantId = resolveTenantIdFromRequest(req);
+  const deviceId = resolveDeviceIdFromRequest(req);
+  const log = normalizeRecord(pettyCashRecord);
+  const recordId = (log?.id ?? '').toString().trim();
+  if (!tenantId || !recordId || !log) {
+    return;
+  }
+
+  emitToTenant(tenantId, 'petty_cash_updated', {
+    tenantId,
+    log,
+    deviceId,
+    timestamp: toIsoNow(),
+  });
+
+  emitDbMutation(req, {
+    type: 'PETTY_CASH_UPDATED',
+    entity: 'petty_cash',
+    table: 'petty_cash_logs',
+    action: 'INSERT',
+    record: log,
+    recordId,
+    payload: { log },
+  });
+};
+
 const emitTableMutation = (req, { table, action, record, id, extra = {} }) => {
   const normalizedTable = (table ?? '').toString().trim();
   const normalizedAction = (action ?? '').toString().trim().toUpperCase();
@@ -445,5 +472,6 @@ module.exports = {
   emitProductChanged,
   emitTransactionCreated,
   emitTransactionUpdated,
+  emitPettyCashUpdated,
   emitTableMutation,
 };

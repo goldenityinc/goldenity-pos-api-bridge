@@ -7,6 +7,11 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum PettyCashDirection {
+  IN
+  OUT
+}
+
 model Product {
   id            String    @id @default(cuid())
   name          String
@@ -34,4 +39,20 @@ model Customer {
   updatedAt  DateTime? @updatedAt @map("updated_at")
 
   @@map("customers")
+}
+
+/// Shared petty cash logs are stored per tenant database. Because this bridge
+/// uses database-per-tenant, tenantId/userId are stored as scalar identifiers.
+model PettyCashLog {
+  id        String             @id @default(uuid()) @db.Uuid
+  tenantId  String             @map("tenant_id")
+  userId    String?            @map("user_id")
+  amount    Int
+  type      PettyCashDirection @default(IN)
+  notes     String?            @db.Text
+  createdAt DateTime           @default(now()) @map("created_at")
+
+  @@index([tenantId, createdAt])
+  @@index([userId])
+  @@map("petty_cash_logs")
 }

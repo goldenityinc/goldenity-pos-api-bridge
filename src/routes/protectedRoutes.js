@@ -6,6 +6,7 @@ const syncRoutes = require('./syncRoutes');
 const orderHistoryItemsRoutes = require('./orderHistoryItemsRoutes');
 const recordsRoutes = require('./recordsRoutes');
 const storageRoutes = require('./storageRoutes');
+const pettyCashRoutes = require('./pettyCashRoutes');
 const { createCrudTableRoutes } = require('./crudTableRoutes');
 const { resetOperationalData } = require('../controllers/debugController');
 
@@ -20,6 +21,7 @@ router.use('/order-history/items', orderHistoryItemsRoutes);
 router.use('/shopping-list', orderHistoryItemsRoutes);
 router.use('/records', recordsRoutes);
 router.use('/storage', storageRoutes);
+router.use('/petty-cash', pettyCashRoutes);
 router.post('/debug/reset-data', resetOperationalData);
 
 router.use('/users', createCrudTableRoutes('app_users'));
