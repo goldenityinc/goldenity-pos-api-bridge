@@ -1,4 +1,5 @@
 const { jsonOk, jsonError } = require('../utils/http');
+const { getTableColumnSet } = require('../utils/sqlHelpers');
 const { emitInventoryUpdated } = require('../services/realtimeEmitter');
 
 const normalizePositiveInteger = (value, fallback, { min = 0, max = 1000 } = {}) => {
@@ -27,6 +28,42 @@ const normalizeLastSyncDate = (value) => {
   return parsed.toISOString();
 };
 
+const resolveProductsSyncExpressions = async (tenantDb) => {
+  const columns = await getTableColumnSet(tenantDb, 'products');
+  const hasUpdatedAt = columns.has('updated_at');
+  const hasCreatedAt = columns.has('created_at');
+
+  if (hasUpdatedAt && hasCreatedAt) {
+    return {
+      filterExpression: 'COALESCE("updated_at", "created_at")',
+      orderExpression: 'COALESCE("updated_at", "created_at")',
+      syncColumn: 'updated_at_or_created_at',
+    };
+  }
+
+  if (hasUpdatedAt) {
+    return {
+      filterExpression: '"updated_at"',
+      orderExpression: '"updated_at"',
+      syncColumn: 'updated_at',
+    };
+  }
+
+  if (hasCreatedAt) {
+    return {
+      filterExpression: '"created_at"',
+      orderExpression: '"created_at"',
+      syncColumn: 'created_at',
+    };
+  }
+
+  return {
+    filterExpression: null,
+    orderExpression: '"id"',
+    syncColumn: 'id',
+  };
+};
+
 const getProducts = async (req, res) => {
   try {
     const limit = normalizePositiveInteger(req.query?.limit, 500, {
@@ -38,6 +75,7 @@ const getProducts = async (req, res) => {
       max: 1000000,
     });
     const lastSyncDate = normalizeLastSyncDate(req.query?.lastSyncDate);
+    const syncExpressions = await resolveProductsSyncExpressions(req.tenantDb);
 
     if (req.query?.lastSyncDate && !lastSyncDate) {
       return jsonError(res, 400, 'Format lastSyncDate tidak valid');
@@ -45,10 +83,9 @@ const getProducts = async (req, res) => {
 
     const values = [];
     let whereClause = '';
-    if (lastSyncDate) {
+    if (lastSyncDate && syncExpressions.filterExpression) {
       values.push(lastSyncDate);
-      whereClause =
-        ' WHERE (COALESCE("updated_at", "created_at") > $1 OR "created_at" > $1)';
+      whereClause = ` WHERE ${syncExpressions.filterExpression} > $1`;
     }
 
     const countResult = await req.tenantDb.query(
@@ -64,7 +101,7 @@ const getProducts = async (req, res) => {
       `SELECT *
        FROM "products"
        ${whereClause}
-       ORDER BY COALESCE("updated_at", "created_at") ASC, "id" ASC
+       ORDER BY ${syncExpressions.orderExpression} ASC, "id" ASC
        LIMIT $${limitParamIndex}
        OFFSET $${offsetParamIndex}`,
       dataValues,
@@ -82,6 +119,7 @@ const getProducts = async (req, res) => {
         offset,
         hasMore: offset + rows.length < total,
         lastSyncDate,
+        syncColumn: syncExpressions.syncColumn,
         serverNow: new Date().toISOString(),
       },
     });
