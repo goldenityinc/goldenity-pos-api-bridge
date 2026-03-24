@@ -76,6 +76,37 @@ const ensureProductsTableColumns = async (tenantDb, table) => {
     ALTER TABLE products
     ADD COLUMN IF NOT EXISTS image_url TEXT;
   `);
+
+  await tenantDb.query(`
+    ALTER TABLE products
+    ADD COLUMN IF NOT EXISTS reference_id TEXT;
+  `);
+
+  await tenantDb.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_products_reference_id_unique
+    ON products (reference_id)
+    WHERE reference_id IS NOT NULL;
+  `);
+};
+
+const findExistingRecordByReferenceId = async (tenantDb, table, payload) => {
+  if (table !== 'products' || !payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return null;
+  }
+
+  const referenceId = (
+    payload.reference_id ?? payload.referenceId ?? payload.local_id ?? payload.localId ?? ''
+  )
+    .toString()
+    .trim();
+  if (!referenceId) {
+    return null;
+  }
+
+  return runSelect(tenantDb, table, {
+    eq__reference_id: referenceId,
+    maybeSingle: true,
+  });
 };
 
 const prepareTableSchema = async (tenantDb, table) => {
@@ -107,6 +138,15 @@ const runSync = async (req, res) => {
       const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
       if (!hasMutationFields(filteredPayload)) {
         return jsonError(res, 400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
+      }
+
+      const existingRecord = await findExistingRecordByReferenceId(
+        req.tenantDb,
+        table,
+        filteredPayload,
+      );
+      if (existingRecord) {
+        return jsonOk(res, [existingRecord], 'Sync insert already exists');
       }
 
       const { sql, values } = buildInsertQuery(table, filteredPayload);

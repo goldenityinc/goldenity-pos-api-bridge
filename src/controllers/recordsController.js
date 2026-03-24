@@ -169,6 +169,37 @@ const ensureProductsTableColumns = async (tenantDb, table) => {
     ALTER TABLE products
     ADD COLUMN IF NOT EXISTS image_url TEXT;
   `);
+
+  await tenantDb.query(`
+    ALTER TABLE products
+    ADD COLUMN IF NOT EXISTS reference_id TEXT;
+  `);
+
+  await tenantDb.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_products_reference_id_unique
+    ON products (reference_id)
+    WHERE reference_id IS NOT NULL;
+  `);
+};
+
+const findExistingRecordByReferenceId = async (tenantDb, table, payload) => {
+  if (table !== 'products' || Array.isArray(payload) || !payload) {
+    return null;
+  }
+
+  const referenceId = (
+    payload.reference_id ?? payload.referenceId ?? payload.local_id ?? payload.localId ?? ''
+  )
+    .toString()
+    .trim();
+  if (!referenceId) {
+    return null;
+  }
+
+  return runSelect(tenantDb, table, {
+    eq__reference_id: referenceId,
+    maybeSingle: true,
+  });
 };
 
 const isUndefinedCustomersTableError = (error, table) => {
@@ -299,19 +330,38 @@ const createRecords = async (req, res) => {
         if (!hasMutationFields(filteredPayload)) {
           throw createHttpError(400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
         }
+        const existingRecord = await findExistingRecordByReferenceId(
+          req.tenantDb,
+          table,
+          filteredPayload,
+        );
+        if (existingRecord) {
+          return {
+            rows: [existingRecord],
+            rowCount: 1,
+            idempotentHit: true,
+          };
+        }
         validateProductCreateOrUpsertPayload(table, filteredPayload);
         const { sql, values } = buildInsertQuery(table, filteredPayload);
         return req.tenantDb.query(sql, values);
       },
     );
-    for (const row of result.rows) {
-      emitTableMutation(req, {
-        table,
-        action: 'INSERT',
-        record: row,
-      });
+    if (!result.idempotentHit) {
+      for (const row of result.rows) {
+        emitTableMutation(req, {
+          table,
+          action: 'INSERT',
+          record: row,
+        });
+      }
     }
-    return jsonOk(res, result.rows, 'Created', 201);
+    return jsonOk(
+      res,
+      result.rows,
+      result.idempotentHit ? 'Already exists' : 'Created',
+      result.idempotentHit ? 200 : 201,
+    );
   } catch (error) {
     return jsonError(
       res,
@@ -339,6 +389,18 @@ const upsertRecords = async (req, res) => {
         if (!hasMutationFields(filteredPayload)) {
           throw createHttpError(400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
         }
+        const existingRecord = await findExistingRecordByReferenceId(
+          req.tenantDb,
+          table,
+          filteredPayload,
+        );
+        if (existingRecord) {
+          return {
+            rows: [existingRecord],
+            rowCount: 1,
+            idempotentHit: true,
+          };
+        }
         validateProductCreateOrUpsertPayload(table, filteredPayload);
         const onConflict = req.body?.onConflict;
         const filteredOnConflict = normalizeArray(onConflict).filter((column) =>
@@ -355,12 +417,14 @@ const upsertRecords = async (req, res) => {
         return req.tenantDb.query(sql, values);
       },
     );
-    for (const row of result.rows) {
-      emitTableMutation(req, {
-        table,
-        action: 'UPSERT',
-        record: row,
-      });
+    if (!result.idempotentHit) {
+      for (const row of result.rows) {
+        emitTableMutation(req, {
+          table,
+          action: 'UPSERT',
+          record: row,
+        });
+      }
     }
     return jsonOk(res, result.rows, 'Upserted');
   } catch (error) {

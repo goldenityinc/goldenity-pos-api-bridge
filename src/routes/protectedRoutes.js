@@ -7,6 +7,7 @@ const orderHistoryItemsRoutes = require('./orderHistoryItemsRoutes');
 const recordsRoutes = require('./recordsRoutes');
 const storageRoutes = require('./storageRoutes');
 const { createCrudTableRoutes } = require('./crudTableRoutes');
+const { resetOperationalData } = require('../controllers/debugController');
 
 const router = express.Router();
 
@@ -19,6 +20,7 @@ router.use('/order-history/items', orderHistoryItemsRoutes);
 router.use('/shopping-list', orderHistoryItemsRoutes);
 router.use('/records', recordsRoutes);
 router.use('/storage', storageRoutes);
+router.post('/debug/reset-data', resetOperationalData);
 
 router.use('/users', createCrudTableRoutes('app_users'));
 router.use('/suppliers', createCrudTableRoutes('suppliers'));

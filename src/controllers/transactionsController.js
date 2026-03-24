@@ -21,6 +21,31 @@ const toPositiveInteger = (value) => {
   return parsed;
 };
 
+const normalizeReferenceId = (payload = {}) => {
+  return (
+    payload.reference_id ??
+    payload.referenceId ??
+    payload.local_id ??
+    payload.localId ??
+    ''
+  )
+    .toString()
+    .trim();
+};
+
+const ensureSalesRecordsReferenceIdColumn = async (client) => {
+  await client.query(`
+    ALTER TABLE sales_records
+    ADD COLUMN IF NOT EXISTS reference_id TEXT;
+  `);
+
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_records_reference_id_unique
+    ON sales_records (reference_id)
+    WHERE reference_id IS NOT NULL;
+  `);
+};
+
 const normalizeTransactionItems = (items) => {
   if (!Array.isArray(items)) {
     return [];
@@ -71,16 +96,34 @@ const ensureKasBonHistoryTable = async (client) => {
 
 const createTransaction = async (req, res) => {
   const client = await req.tenantDb.connect();
+  let referenceId = '';
 
   try {
     const payload = { ...req.body };
     if (typeof payload.id === 'string') {
       delete payload.id;
     }
+    referenceId = normalizeReferenceId(payload);
+    if (referenceId) {
+      payload.reference_id = referenceId;
+    }
     const inventoryUpdates = [];
     const transactionItems = normalizeTransactionItems(payload.items);
 
     await client.query('BEGIN');
+    await ensureSalesRecordsReferenceIdColumn(client);
+
+    if (referenceId) {
+      const existingResult = await client.query(
+        'SELECT * FROM sales_records WHERE reference_id = $1 LIMIT 1',
+        [referenceId],
+      );
+
+      if ((existingResult.rowCount || 0) > 0) {
+        await client.query('ROLLBACK');
+        return jsonOk(res, existingResult.rows[0] || null, 'Transaction already exists');
+      }
+    }
 
     for (const item of transactionItems) {
       const currentResult = await client.query(
@@ -135,6 +178,20 @@ const createTransaction = async (req, res) => {
     return jsonOk(res, savedTransaction, 'Transaction saved', 201);
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
+
+    if (error?.code === '23505' && referenceId) {
+      try {
+        const existingResult = await req.tenantDb.query(
+          'SELECT * FROM sales_records WHERE reference_id = $1 LIMIT 1',
+          [referenceId],
+        );
+
+        if ((existingResult.rowCount || 0) > 0) {
+          return jsonOk(res, existingResult.rows[0] || null, 'Transaction already exists');
+        }
+      } catch (_) {}
+    }
+
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
   } finally {
     client.release();

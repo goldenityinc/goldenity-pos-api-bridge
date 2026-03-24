@@ -1,11 +1,90 @@
 const { jsonOk, jsonError } = require('../utils/http');
-const { runSelect } = require('../utils/sqlHelpers');
 const { emitInventoryUpdated } = require('../services/realtimeEmitter');
+
+const normalizePositiveInteger = (value, fallback, { min = 0, max = 1000 } = {}) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  const normalized = Math.floor(parsed);
+  if (normalized < min) {
+    return fallback;
+  }
+
+  return Math.min(normalized, max);
+};
+
+const normalizeLastSyncDate = (value) => {
+  const raw = (value ?? '').toString().trim();
+  if (!raw) return null;
+
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+
+  return parsed.toISOString();
+};
 
 const getProducts = async (req, res) => {
   try {
-    const rows = await runSelect(req.tenantDb, 'products', req.query);
-    return jsonOk(res, rows);
+    const limit = normalizePositiveInteger(req.query?.limit, 500, {
+      min: 1,
+      max: 1000,
+    });
+    const offset = normalizePositiveInteger(req.query?.offset, 0, {
+      min: 0,
+      max: 1000000,
+    });
+    const lastSyncDate = normalizeLastSyncDate(req.query?.lastSyncDate);
+
+    if (req.query?.lastSyncDate && !lastSyncDate) {
+      return jsonError(res, 400, 'Format lastSyncDate tidak valid');
+    }
+
+    const values = [];
+    let whereClause = '';
+    if (lastSyncDate) {
+      values.push(lastSyncDate);
+      whereClause =
+        ' WHERE (COALESCE("updated_at", "created_at") > $1 OR "created_at" > $1)';
+    }
+
+    const countResult = await req.tenantDb.query(
+      `SELECT COUNT(*)::int AS total FROM "products"${whereClause}`,
+      values,
+    );
+    const total = Number(countResult.rows?.[0]?.total ?? 0);
+
+    const dataValues = [...values, limit, offset];
+    const limitParamIndex = values.length + 1;
+    const offsetParamIndex = values.length + 2;
+    const rowsResult = await req.tenantDb.query(
+      `SELECT *
+       FROM "products"
+       ${whereClause}
+       ORDER BY COALESCE("updated_at", "created_at") ASC, "id" ASC
+       LIMIT $${limitParamIndex}
+       OFFSET $${offsetParamIndex}`,
+      dataValues,
+    );
+
+    const rows = rowsResult.rows || [];
+    return res.status(200).json({
+      success: true,
+      message: 'Success',
+      data: rows,
+      meta: {
+        total,
+        count: rows.length,
+        limit,
+        offset,
+        hasMore: offset + rows.length < total,
+        lastSyncDate,
+        serverNow: new Date().toISOString(),
+      },
+    });
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
   }

@@ -6,6 +6,17 @@ const resolveTenantIdFromRequest = (req) => {
     .trim();
 };
 
+const resolveDeviceIdFromRequest = (req) => {
+  const headerDeviceId = req?.headers?.['x-device-id'];
+  if (typeof headerDeviceId === 'string' && headerDeviceId.trim()) {
+    return headerDeviceId.trim();
+  }
+
+  return (req?.body?.deviceId ?? req?.body?.device_id ?? '')
+    .toString()
+    .trim();
+};
+
 const toIsoNow = () => new Date().toISOString();
 
 const normalizeAction = (value) => (value ?? '').toString().trim().toUpperCase();
@@ -37,6 +48,7 @@ const emitDbMutation = (
   },
 ) => {
   const tenantId = resolveTenantIdFromRequest(req);
+  const deviceId = resolveDeviceIdFromRequest(req);
   const normalizedPayload = normalizeRecord(payload ?? record) ?? {};
   const resolvedRecordId = (recordId ?? normalizedPayload.id ?? '').toString().trim();
   if (!tenantId || !type || !entity) {
@@ -50,8 +62,9 @@ const emitDbMutation = (
     table: (table ?? entity).toString().trim(),
     action: normalizeAction(action),
     recordId: resolvedRecordId,
+    deviceId,
     payload: normalizedPayload,
-    meta: { ...meta },
+    meta: { ...meta, deviceId },
     timestamp: toIsoNow(),
   });
 };
@@ -120,6 +133,7 @@ const mapGenericMutationType = (table, action) => {
 
 const emitInventoryUpdated = (req, productRecord, extra = {}) => {
   const tenantId = resolveTenantIdFromRequest(req);
+  const deviceId = resolveDeviceIdFromRequest(req);
   const product = normalizeRecord(productRecord);
   if (!tenantId || !product) {
     return;
@@ -135,6 +149,7 @@ const emitInventoryUpdated = (req, productRecord, extra = {}) => {
     productId,
     newStock,
     product,
+    deviceId,
     reason: (extra.reason ?? '').toString().trim(),
     source: (extra.source ?? 'bridge').toString(),
     timestamp: toIsoNow(),
@@ -164,6 +179,7 @@ const emitInventoryUpdated = (req, productRecord, extra = {}) => {
 
 const emitProductChanged = (req, action, productRecord) => {
   const tenantId = resolveTenantIdFromRequest(req);
+  const deviceId = resolveDeviceIdFromRequest(req);
   const product = normalizeRecord(productRecord);
   const productId = (product?.id ?? '').toString().trim();
   if (!tenantId || !productId) {
@@ -174,6 +190,7 @@ const emitProductChanged = (req, action, productRecord) => {
     action,
     productId,
     product,
+    deviceId,
     timestamp: toIsoNow(),
   });
 
@@ -195,6 +212,7 @@ const emitProductChanged = (req, action, productRecord) => {
 
 const emitProductDeleted = (req, productId) => {
   const tenantId = resolveTenantIdFromRequest(req);
+  const deviceId = resolveDeviceIdFromRequest(req);
   const normalizedId = (productId ?? '').toString().trim();
   if (!tenantId || !normalizedId) {
     return;
@@ -203,6 +221,7 @@ const emitProductDeleted = (req, productId) => {
   emitToTenant(tenantId, 'product_changed', {
     action: 'DELETE',
     productId: normalizedId,
+    deviceId,
     timestamp: toIsoNow(),
   });
 
@@ -218,6 +237,7 @@ const emitProductDeleted = (req, productId) => {
 
 const emitCategoryChanged = (req, action, categoryRecord) => {
   const tenantId = resolveTenantIdFromRequest(req);
+  const deviceId = resolveDeviceIdFromRequest(req);
   const category = normalizeRecord(categoryRecord);
   const categoryId = (category?.id ?? '').toString().trim();
   if (!tenantId || !categoryId) {
@@ -228,6 +248,7 @@ const emitCategoryChanged = (req, action, categoryRecord) => {
     action,
     categoryId,
     category,
+    deviceId,
     timestamp: toIsoNow(),
   });
 
@@ -243,6 +264,7 @@ const emitCategoryChanged = (req, action, categoryRecord) => {
 
 const emitCategoryDeleted = (req, categoryId) => {
   const tenantId = resolveTenantIdFromRequest(req);
+  const deviceId = resolveDeviceIdFromRequest(req);
   const normalizedId = (categoryId ?? '').toString().trim();
   if (!tenantId || !normalizedId) {
     return;
@@ -251,6 +273,7 @@ const emitCategoryDeleted = (req, categoryId) => {
   emitToTenant(tenantId, 'category_changed', {
     action: 'DELETE',
     categoryId: normalizedId,
+    deviceId,
     timestamp: toIsoNow(),
   });
 
@@ -266,6 +289,7 @@ const emitCategoryDeleted = (req, categoryId) => {
 
 const emitTransactionCreated = (req, transactionRecord, extra = {}) => {
   const tenantId = resolveTenantIdFromRequest(req);
+  const deviceId = resolveDeviceIdFromRequest(req);
   const transaction = normalizeRecord(transactionRecord);
   if (!tenantId || !transaction) {
     return;
@@ -277,6 +301,7 @@ const emitTransactionCreated = (req, transactionRecord, extra = {}) => {
     totalPrice: toNumberOrNull(transaction.total_price ?? extra.totalPrice),
     paymentMethod: (transaction.payment_method ?? extra.paymentMethod ?? '').toString(),
     transaction,
+    deviceId,
     timestamp: toIsoNow(),
   });
 
@@ -307,6 +332,7 @@ const emitTransactionCreated = (req, transactionRecord, extra = {}) => {
 
 const emitTransactionUpdated = (req, transactionRecord, extra = {}) => {
   const tenantId = resolveTenantIdFromRequest(req);
+  const deviceId = resolveDeviceIdFromRequest(req);
   const transaction = normalizeRecord(transactionRecord);
   if (!tenantId || !transaction) {
     return;
@@ -315,6 +341,7 @@ const emitTransactionUpdated = (req, transactionRecord, extra = {}) => {
   emitToTenant(tenantId, 'transaction_updated', {
     transactionId: (transaction.id ?? extra.transactionId ?? '').toString(),
     transaction,
+    deviceId,
     timestamp: toIsoNow(),
   });
 
