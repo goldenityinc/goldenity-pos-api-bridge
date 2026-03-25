@@ -46,6 +46,14 @@ const ensureSalesRecordsReferenceIdColumn = async (client) => {
   `);
 };
 
+const ensureSalesRecordsCashierColumns = async (client) => {
+  await client.query(`
+    ALTER TABLE sales_records
+    ADD COLUMN IF NOT EXISTS cashier_id TEXT,
+    ADD COLUMN IF NOT EXISTS cashier_name TEXT;
+  `);
+};
+
 const normalizeTransactionItems = (items) => {
   if (!Array.isArray(items)) {
     return [];
@@ -112,6 +120,7 @@ const createTransaction = async (req, res) => {
 
     await client.query('BEGIN');
     await ensureSalesRecordsReferenceIdColumn(client);
+    await ensureSalesRecordsCashierColumns(client);
 
     if (referenceId) {
       const existingResult = await client.query(

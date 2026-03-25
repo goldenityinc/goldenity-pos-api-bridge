@@ -3,6 +3,8 @@ const crypto = require('crypto');
 const { jsonOk, jsonError } = require('../utils/http');
 const { emitPettyCashUpdated } = require('../services/realtimeEmitter');
 
+const WIB_TIME_ZONE = 'Asia/Jakarta';
+
 const normalizeType = (value) => {
   const normalized = (value ?? 'IN').toString().trim().toUpperCase();
   return normalized === 'OUT' ? 'OUT' : 'IN';
@@ -29,7 +31,14 @@ const resolveUserIdFromRequest = (req) => {
 };
 
 const resolveUsernameFromRequest = (req) => {
-  return (req?.auth?.username ?? req?.auth?.userName ?? req?.auth?.user_name ?? '')
+  return (
+    req?.auth?.username ??
+    req?.auth?.userName ??
+    req?.auth?.user_name ??
+    req?.body?.userName ??
+    req?.body?.user_name ??
+    ''
+  )
     .toString()
     .trim();
 };
@@ -40,11 +49,17 @@ const ensurePettyCashLogsTable = async (client) => {
       id UUID PRIMARY KEY,
       tenant_id TEXT NOT NULL,
       user_id TEXT,
+      user_name TEXT,
       amount INTEGER NOT NULL,
       type VARCHAR(3) NOT NULL DEFAULT 'IN',
       notes TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  await client.query(`
+    ALTER TABLE petty_cash_logs
+    ADD COLUMN IF NOT EXISTS user_name TEXT;
   `);
 
   await client.query(`
@@ -80,23 +95,19 @@ const getTodayPettyCashLogs = async (req, res) => {
     await ensurePettyCashLogsTable(client);
 
     const tenantId = (req?.tenant?.tenantId ?? '').toString().trim();
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(start);
-    end.setDate(end.getDate() + 1);
 
     const result = await client.query(
       `SELECT l.id, l.tenant_id, l.user_id, l.amount, l.type, l.notes, l.created_at,
-              u.username AS user_name
+              COALESCE(NULLIF(l.user_name, ''), u.username, '') AS user_name
        FROM petty_cash_logs l
        LEFT JOIN app_users u
          ON CAST(u.id AS TEXT) = l.user_id
          OR u.username = l.user_id
-       WHERE tenant_id = $1
-         AND l.created_at >= $2
-         AND l.created_at < $3
+       WHERE l.tenant_id = $1
+         AND (l.created_at AT TIME ZONE '${WIB_TIME_ZONE}')::date =
+             (CURRENT_TIMESTAMP AT TIME ZONE '${WIB_TIME_ZONE}')::date
        ORDER BY l.created_at DESC`,
-      [tenantId, start.toISOString(), end.toISOString()],
+      [tenantId],
     );
 
     return jsonOk(
@@ -143,12 +154,13 @@ const createPettyCashLog = async (req, res) => {
          id,
          tenant_id,
          user_id,
+         user_name,
          amount,
          type,
          notes
-       ) VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, tenant_id, user_id, amount, type, notes, created_at`,
-      [id, tenantId, userId || null, amount, type, notes || null],
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, tenant_id, user_id, user_name, amount, type, notes, created_at`,
+      [id, tenantId, userId || null, userName || null, amount, type, notes || null],
     );
 
     const createdLog = mapPettyCashRow({
