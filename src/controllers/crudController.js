@@ -11,6 +11,10 @@ const {
   normalizePayloadByColumnDefinitions,
   runSelect,
 } = require('../utils/sqlHelpers');
+const {
+  getCachedResponse,
+  storeResponse,
+} = require('../utils/idempotencyCache');
 
 const BCRYPT_REGEX = /^\$2[aby]\$\d{2}\$.{53}$/;
 
@@ -71,6 +75,11 @@ const createCrudController = (table) => ({
 
   create: async (req, res) => {
     try {
+      const cachedResponse = getCachedResponse(req, table);
+      if (cachedResponse !== null) {
+        return jsonOk(res, cachedResponse, 'Created (idempotent)', 200);
+      }
+
       const arrayPayload = parseBodyArray(req.body);
       const payload = arrayPayload
         ? await Promise.all(
@@ -94,7 +103,9 @@ const createCrudController = (table) => ({
           record: row,
         });
       }
-      return jsonOk(res, arrayPayload ? result.rows : (result.rows[0] || null), 'Created', 201);
+      const responsePayload = arrayPayload ? result.rows : (result.rows[0] || null);
+      storeResponse(req, table, responsePayload);
+      return jsonOk(res, responsePayload, 'Created', 201);
     } catch (error) {
       if (error instanceof BadRequestError) {
         return jsonError(res, error.statusCode, error.message, error.message);

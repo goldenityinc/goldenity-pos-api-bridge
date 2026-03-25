@@ -6,6 +6,10 @@ const {
   buildInsertQuery,
   runSelect,
 } = require('../utils/sqlHelpers');
+const {
+  getCachedResponse,
+  storeResponse,
+} = require('../utils/idempotencyCache');
 
 const ensureSelectedColumn = (selectValue, columnName) => {
   if (!selectValue || selectValue === '*') {
@@ -46,6 +50,11 @@ const getOrderHistoryItems = async (req, res) => {
 
 const createOrderHistoryItems = async (req, res) => {
   try {
+    const cachedResponse = getCachedResponse(req, 'order_history_items');
+    if (cachedResponse !== null) {
+      return jsonOk(res, cachedResponse, 'Created (idempotent)', 200);
+    }
+
     const payload = parseBodyArray(req.body) || parseBodyObject(req.body);
     const { sql, values } = buildInsertQuery('order_history_items', payload);
     const result = await req.tenantDb.query(sql, values);
@@ -56,6 +65,7 @@ const createOrderHistoryItems = async (req, res) => {
         record: row,
       });
     }
+    storeResponse(req, 'order_history_items', result.rows);
     return jsonOk(res, result.rows, 'Created', 201);
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);

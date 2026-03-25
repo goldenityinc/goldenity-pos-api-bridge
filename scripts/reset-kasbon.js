@@ -1,6 +1,11 @@
 require('dotenv').config();
 
-const { PrismaClient } = require('@prisma/client');
+const jwt = require('jsonwebtoken');
+
+const {
+  getOrCreateTenantPool,
+  pools,
+} = require('../src/middlewares/tenantResolver');
 
 function getCliArg(prefix) {
   return process.argv
@@ -15,26 +20,21 @@ function wantsHelp() {
 function printHelp() {
   console.log(`Gunakan salah satu mode berikut:
 
-  node scripts/reset-kasbon.js --mode=delete --db-url=<TENANT_DB_URL>
-  node scripts/reset-kasbon.js --mode=soft --db-url=<TENANT_DB_URL>
+  node scripts/reset-kasbon.js --mode=delete --tenant-id=<TENANT_ID> --db-url=<TENANT_DB_URL>
+  node scripts/reset-kasbon.js --mode=soft --tenant-id=<TENANT_ID> --db-url=<TENANT_DB_URL>
+  node scripts/reset-kasbon.js --mode=delete --token=<JWT_LOGIN_BRIDGE>
 
 Atau lewat npm script:
 
-  npm run kasbon:reset -- --db-url=<TENANT_DB_URL>
-  npm run kasbon:soft-fix -- --db-url=<TENANT_DB_URL>
+  npm run kasbon:reset -- --tenant-id=<TENANT_ID> --db-url=<TENANT_DB_URL>
+  npm run kasbon:soft-fix -- --tenant-id=<TENANT_ID> --db-url=<TENANT_DB_URL>
 
 Catatan:
-- Script ini berjalan pada tabel sales_records dan kas_bon_payment_history.
-- Repo bridge ini tidak memiliki model Prisma KasBon terpisah.
+- Script ini memakai logika koneksi tenant yang sama dengan bridge runtime melalui getOrCreateTenantPool().
+- Bridge tidak melakukan lookup tenant dari db_tpp; tenantId dan dbUrl harus tersedia dari CLI/env atau token login bridge.
+- Jika tenant punya tabel literal "KasBon", mode delete akan menjalankan DELETE FROM "KasBon".
+- Jika tabel "KasBon" tidak ada, script otomatis memakai model live sales_records + kas_bon_payment_history.
 - Gunakan URL database tenant POS, bukan database auth/admin pusat.`);
-}
-
-function getDatabaseUrl() {
-  return (
-    getCliArg('--db-url=') ||
-    process.env.DATABASE_URL_TPP ||
-    process.env.DATABASE_URL
-  );
 }
 
 function getMode() {
@@ -45,15 +45,70 @@ function getMode() {
   throw new Error("Mode tidak valid. Gunakan '--mode=delete' atau '--mode=soft'.");
 }
 
-async function getSalesRecordColumns(prisma) {
-  const rows = await prisma.$queryRawUnsafe(`
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = 'public'
-      AND table_name = 'sales_records'
-  `);
+function resolveTenantContext() {
+  const token = (getCliArg('--token=') || process.env.BRIDGE_JWT || '').trim();
+  if (token) {
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
+      throw new Error('JWT_SECRET wajib diisi untuk memakai --token.');
+    }
 
-  return new Set((rows || []).map((row) => row.column_name));
+    const payload = jwt.verify(token, jwtSecret);
+    const tenantId = (payload?.tenantId || payload?.tenant_id || '').toString().trim();
+    const dbUrl = (payload?.dbUrl || '').toString().trim();
+    if (!tenantId || !dbUrl) {
+      throw new Error('Token bridge tidak mengandung tenantId/dbUrl yang valid.');
+    }
+
+    return { tenantId, dbUrl, source: 'token' };
+  }
+
+  const tenantId = (
+    getCliArg('--tenant-id=') ||
+    process.env.TENANT_ID ||
+    process.env.TENANT_ID_TPP ||
+    ''
+  ).trim();
+  const dbUrl = (
+    getCliArg('--db-url=') ||
+    process.env.DATABASE_URL_TPP ||
+    process.env.DATABASE_URL ||
+    ''
+  ).trim();
+
+  if (!tenantId) {
+    throw new Error('tenantId tidak ditemukan. Kirim --tenant-id=<TENANT_ID> atau gunakan --token=<JWT_LOGIN_BRIDGE>.');
+  }
+
+  if (!dbUrl) {
+    throw new Error('Database URL tidak ditemukan. Kirim --db-url=<TENANT_DB_URL> atau gunakan --token=<JWT_LOGIN_BRIDGE>.');
+  }
+
+  return { tenantId, dbUrl, source: 'cli/env' };
+}
+
+async function hasTable(client, tableName) {
+  const result = await client.query(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM information_schema.tables
+       WHERE table_schema = 'public'
+         AND table_name = $1
+     ) AS exists`,
+    [tableName],
+  );
+  return result.rows[0]?.exists === true;
+}
+
+async function getTableColumns(client, tableName) {
+  const result = await client.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = $1`,
+    [tableName],
+  );
+  return new Set((result.rows || []).map((row) => row.column_name));
 }
 
 function buildKasBonPredicate(columns) {
@@ -68,26 +123,35 @@ function buildKasBonPredicate(columns) {
   return `UPPER(COALESCE(${paymentColumn}::text, '')) = 'KAS BON'`;
 }
 
-async function deleteKasBon(prisma, columns) {
+async function deleteLiteralKasBonTable(client) {
+  const result = await client.query('DELETE FROM "KasBon"');
+  console.log(`✅ Berhasil menghapus ${result.rowCount || 0} data dari tabel literal "KasBon".`);
+}
+
+async function deleteKasBonSalesRecords(client, columns) {
   const predicate = buildKasBonPredicate(columns);
 
-  const deletedHistory = await prisma.$executeRawUnsafe(`
-    DELETE FROM kas_bon_payment_history
-    WHERE sales_record_id IN (
-      SELECT id FROM sales_records WHERE ${predicate}
-    )
-  `).catch(() => 0);
+  let deletedHistory = 0;
+  if (await hasTable(client, 'kas_bon_payment_history')) {
+    const historyResult = await client.query(`
+      DELETE FROM kas_bon_payment_history
+      WHERE sales_record_id IN (
+        SELECT id FROM sales_records WHERE ${predicate}
+      )
+    `);
+    deletedHistory = historyResult.rowCount || 0;
+  }
 
-  const deletedSales = await prisma.$executeRawUnsafe(`
+  const salesResult = await client.query(`
     DELETE FROM sales_records
     WHERE ${predicate}
   `);
 
-  console.log(`✅ Berhasil menghapus ${deletedSales} data Kas Bon.`);
+  console.log(`✅ Berhasil menghapus ${salesResult.rowCount || 0} data Kas Bon dari sales_records.`);
   console.log(`ℹ️ Riwayat pembayaran terhapus: ${deletedHistory}`);
 }
 
-async function softFixKasBon(prisma, columns) {
+async function softFixKasBonSalesRecords(client, columns) {
   const predicate = buildKasBonPredicate(columns);
   const updates = [];
 
@@ -105,7 +169,7 @@ async function softFixKasBon(prisma, columns) {
     throw new Error('Tidak ada kolom status/saldo Kas Bon yang bisa diperbarui di sales_records.');
   }
 
-  const updatedSales = await prisma.$executeRawUnsafe(`
+  const result = await client.query(`
     UPDATE sales_records
     SET ${updates.join(', ')}
     WHERE ${predicate}
@@ -116,7 +180,42 @@ async function softFixKasBon(prisma, columns) {
       )
   `);
 
-  console.log(`✅ Berhasil menidurkan ${updatedSales} data Kas Bon.`);
+  console.log(`✅ Berhasil menidurkan ${result.rowCount || 0} data Kas Bon di sales_records.`);
+}
+
+async function runReset(client, mode) {
+  const hasLiteralKasBon = await hasTable(client, 'KasBon');
+  if (hasLiteralKasBon) {
+    if (mode !== 'delete') {
+      throw new Error('Mode soft tidak didukung untuk tabel literal "KasBon". Gunakan --mode=delete.');
+    }
+
+    console.log('Tabel literal "KasBon" ditemukan. Menjalankan reset langsung ke tabel tersebut...');
+    await deleteLiteralKasBonTable(client);
+    return;
+  }
+
+  const salesRecordColumns = await getTableColumns(client, 'sales_records');
+  if (!salesRecordColumns.has('id')) {
+    throw new Error('Tabel literal "KasBon" tidak ditemukan, dan sales_records tidak tersedia atau tidak valid.');
+  }
+
+  console.log('Tabel literal "KasBon" tidak ditemukan. Menggunakan model live sales_records + kas_bon_payment_history...');
+  if (mode === 'delete') {
+    await deleteKasBonSalesRecords(client, salesRecordColumns);
+  } else {
+    await softFixKasBonSalesRecords(client, salesRecordColumns);
+  }
+}
+
+async function closePools() {
+  const closers = [];
+  for (const entry of pools.values()) {
+    if (entry?.pool?.end) {
+      closers.push(entry.pool.end().catch(() => {}));
+    }
+  }
+  await Promise.all(closers);
 }
 
 async function main() {
@@ -125,37 +224,23 @@ async function main() {
     return;
   }
 
-  const databaseUrl = getDatabaseUrl();
   const mode = getMode();
-
-  if (!databaseUrl) {
-    throw new Error(
-      'Database URL tidak ditemukan. Isi DATABASE_URL_TPP / DATABASE_URL, atau kirim --db-url=<url>.',
-    );
-  }
-
-  const prisma = new PrismaClient({
-    datasources: {
-      db: {
-        url: databaseUrl,
-      },
-    },
-  });
+  const { tenantId, dbUrl, source } = resolveTenantContext();
+  const pool = getOrCreateTenantPool(tenantId, dbUrl);
+  const client = await pool.connect();
 
   try {
-    const columns = await getSalesRecordColumns(prisma);
-    if (!columns.has('id')) {
-      throw new Error('Tabel sales_records tidak tersedia atau tidak valid.');
-    }
-
-    console.log(`Mulai proses Kas Bon mode=${mode}...`);
-    if (mode === 'delete') {
-      await deleteKasBon(prisma, columns);
-    } else {
-      await softFixKasBon(prisma, columns);
-    }
+    await client.query('SELECT 1');
+    console.log(`Mulai proses Kas Bon mode=${mode} tenantId=${tenantId} source=${source}...`);
+    await client.query('BEGIN');
+    await runReset(client, mode);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
   } finally {
-    await prisma.$disconnect();
+    client.release();
+    await closePools();
   }
 }
 
