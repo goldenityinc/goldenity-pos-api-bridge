@@ -330,6 +330,31 @@ const emitTransactionCreated = (req, transactionRecord, extra = {}) => {
   }
 };
 
+const emitKasBonCreated = (req, transactionRecord, extra = {}) => {
+  const tenantId = resolveTenantIdFromRequest(req);
+  const deviceId = resolveDeviceIdFromRequest(req);
+  const transaction = normalizeRecord(transactionRecord);
+  if (!tenantId || !transaction) {
+    return;
+  }
+
+  emitToTenant(tenantId, 'kas_bon_created', {
+    transactionId: (transaction.id ?? extra.transactionId ?? '').toString(),
+    receiptNumber: (transaction.receipt_number ?? extra.receiptNumber ?? '').toString(),
+    customerName: (transaction.customer_name ?? extra.customerName ?? '').toString(),
+    totalPrice: toNumberOrNull(transaction.total_price ?? extra.totalPrice),
+    remainingBalance: toNumberOrNull(
+      transaction.remaining_balance ??
+      transaction.outstanding_balance ??
+      extra.remainingBalance,
+    ),
+    paymentStatus: (transaction.payment_status ?? extra.paymentStatus ?? '').toString(),
+    transaction,
+    deviceId,
+    timestamp: toIsoNow(),
+  });
+};
+
 const emitTransactionUpdated = (req, transactionRecord, extra = {}) => {
   const tenantId = resolveTenantIdFromRequest(req);
   const deviceId = resolveDeviceIdFromRequest(req);
@@ -470,6 +495,7 @@ module.exports = {
   emitDbMutation,
   emitInventoryUpdated,
   emitProductChanged,
+  emitKasBonCreated,
   emitTransactionCreated,
   emitTransactionUpdated,
   emitPettyCashUpdated,

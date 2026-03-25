@@ -4,7 +4,11 @@ const {
   getTableColumnDefinitions,
   normalizePayloadByColumnDefinitions,
 } = require('../utils/sqlHelpers');
-const { emitTransactionCreated, emitTransactionUpdated } = require('../services/realtimeEmitter');
+const {
+  emitKasBonCreated,
+  emitTransactionCreated,
+  emitTransactionUpdated,
+} = require('../services/realtimeEmitter');
 
 const normalizePaymentType = (value) => (value || '').toString().trim().toUpperCase();
 
@@ -52,6 +56,28 @@ const ensureSalesRecordsCashierColumns = async (client) => {
     ADD COLUMN IF NOT EXISTS cashier_id TEXT,
     ADD COLUMN IF NOT EXISTS cashier_name TEXT;
   `);
+};
+
+const ensureSalesRecordsKasBonColumns = async (client) => {
+  await client.query(`
+    ALTER TABLE sales_records
+    ADD COLUMN IF NOT EXISTS payment_method TEXT,
+    ADD COLUMN IF NOT EXISTS payment_status TEXT,
+    ADD COLUMN IF NOT EXISTS remaining_balance NUMERIC(14,2) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS outstanding_balance NUMERIC(14,2) DEFAULT 0;
+  `);
+};
+
+const hasMeaningfulValue = (value) => {
+  if (value === null || value === undefined) {
+    return false;
+  }
+
+  if (typeof value === 'string') {
+    return value.trim().length > 0;
+  }
+
+  return true;
 };
 
 const normalizeTransactionItems = (items) => {
@@ -115,12 +141,36 @@ const createTransaction = async (req, res) => {
     if (referenceId) {
       payload.reference_id = referenceId;
     }
+    const isKasBonTransaction = normalizePaymentType(
+      payload.payment_method ?? payload.payment_type,
+    ) === 'KAS BON';
+    if (isKasBonTransaction) {
+      if (!hasMeaningfulValue(payload.payment_status)) {
+        payload.payment_status = 'Belum Lunas';
+      }
+
+      const resolvedBalance = toNumber(
+        payload.remaining_balance ??
+        payload.outstanding_balance ??
+        payload.total_price ??
+        payload.total_amount,
+      );
+      if (Number.isFinite(resolvedBalance)) {
+        if (!hasMeaningfulValue(payload.remaining_balance)) {
+          payload.remaining_balance = resolvedBalance;
+        }
+        if (!hasMeaningfulValue(payload.outstanding_balance)) {
+          payload.outstanding_balance = resolvedBalance;
+        }
+      }
+    }
     const inventoryUpdates = [];
     const transactionItems = normalizeTransactionItems(payload.items);
 
     await client.query('BEGIN');
     await ensureSalesRecordsReferenceIdColumn(client);
     await ensureSalesRecordsCashierColumns(client);
+    await ensureSalesRecordsKasBonColumns(client);
 
     if (referenceId) {
       const existingResult = await client.query(
@@ -183,6 +233,12 @@ const createTransaction = async (req, res) => {
     emitTransactionCreated(req, savedTransaction, {
       inventoryUpdates,
     });
+    if (isKasBonTransaction) {
+      emitKasBonCreated(req, savedTransaction, {
+        paymentStatus: payload.payment_status,
+        remainingBalance: payload.remaining_balance ?? payload.outstanding_balance,
+      });
+    }
 
     return jsonOk(res, savedTransaction, 'Transaction saved', 201);
   } catch (error) {
