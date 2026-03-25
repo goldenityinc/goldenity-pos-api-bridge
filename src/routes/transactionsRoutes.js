@@ -5,5 +5,6 @@ const router = express.Router();
 
 router.post('/', createTransaction);
 router.post('/kas-bon/:id/settle', settleKasBon);
+router.post('/kas-bon/:id/pay', settleKasBon);
 
 module.exports = router;

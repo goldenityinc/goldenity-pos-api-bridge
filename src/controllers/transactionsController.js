@@ -6,6 +6,7 @@ const {
 } = require('../utils/sqlHelpers');
 const {
   emitKasBonCreated,
+  emitKasBonUpdated,
   emitTransactionCreated,
   emitTransactionUpdated,
 } = require('../services/realtimeEmitter');
@@ -377,7 +378,16 @@ const settleKasBon = async (req, res) => {
     const updateResult = await client.query(updateSql, values);
     await client.query('COMMIT');
 
-    emitTransactionUpdated(req, updateResult.rows[0] || null, {
+    const updatedTransaction = updateResult.rows[0] || null;
+
+    emitKasBonUpdated(req, updatedTransaction, {
+      transactionId: id,
+      paidAmount,
+      remainingBalance: normalizedBalance,
+      status: isLunas ? 'Lunas' : 'Belum Lunas',
+    });
+
+    emitTransactionUpdated(req, updatedTransaction, {
       transactionId: id,
       action: 'UPDATE',
       mutationType: 'KASBON_SETTLED',
@@ -395,7 +405,7 @@ const settleKasBon = async (req, res) => {
     return jsonOk(
       res,
       {
-        transaction: updateResult.rows[0] || null,
+        transaction: updatedTransaction,
         paid_amount: paidAmount,
         remaining_balance: normalizedBalance,
         status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
