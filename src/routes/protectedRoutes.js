@@ -8,6 +8,10 @@ const recordsRoutes = require('./recordsRoutes');
 const storageRoutes = require('./storageRoutes');
 const pettyCashRoutes = require('./pettyCashRoutes');
 const { createCrudTableRoutes } = require('./crudTableRoutes');
+const {
+	listActiveKasBon,
+	settleKasBon,
+} = require('../controllers/transactionsController');
 const { resetOperationalData } = require('../controllers/debugController');
 
 const router = express.Router();
@@ -22,6 +26,9 @@ router.use('/shopping-list', orderHistoryItemsRoutes);
 router.use('/records', recordsRoutes);
 router.use('/storage', storageRoutes);
 router.use('/petty-cash', pettyCashRoutes);
+router.get('/kas-bon', listActiveKasBon);
+router.post('/kas-bon/:id/settle', settleKasBon);
+router.post('/kas-bon/:id/pay', settleKasBon);
 router.post('/debug/reset-data', resetOperationalData);
 
 router.use('/users', createCrudTableRoutes('app_users'));

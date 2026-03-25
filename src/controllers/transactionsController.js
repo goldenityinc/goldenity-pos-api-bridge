@@ -129,6 +129,60 @@ const ensureKasBonHistoryTable = async (client) => {
   `);
 };
 
+const listActiveKasBon = async (req, res) => {
+  const client = await req.tenantDb.connect();
+
+  try {
+    const columnsResult = await client.query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = ANY(current_schemas(false))
+         AND table_name = 'sales_records'`,
+    );
+    const columns = new Set(columnsResult.rows.map((row) => row.column_name));
+
+    const paymentColumn = columns.has('payment_method')
+      ? 'payment_method'
+      : (columns.has('payment_type') ? 'payment_type' : null);
+    const amountColumn = columns.has('total_price')
+      ? 'total_price'
+      : (columns.has('total_amount') ? 'total_amount' : null);
+    const remainingColumn = columns.has('remaining_balance')
+      ? 'remaining_balance'
+      : (columns.has('outstanding_balance') ? 'outstanding_balance' : null);
+
+    if (!paymentColumn || !amountColumn) {
+      return jsonError(res, 500, 'Kolom kas bon sales_records tidak lengkap');
+    }
+
+    const filters = [
+      `UPPER(COALESCE(${paymentColumn}::text, '')) = 'KAS BON'`,
+    ];
+    if (columns.has('payment_status')) {
+      filters.push(`UPPER(COALESCE(payment_status::text, 'BELUM LUNAS')) <> 'LUNAS'`);
+    }
+
+    const balanceExpression = remainingColumn
+      ? `COALESCE(${remainingColumn}, ${amountColumn}, 0)`
+      : `COALESCE(${amountColumn}, 0)`;
+    filters.push(`${balanceExpression} > 0`);
+
+    const orderColumn = columns.has('created_at') ? 'created_at' : 'id';
+    const rowsResult = await client.query(
+      `SELECT *
+       FROM sales_records
+       WHERE ${filters.join(' AND ')}
+       ORDER BY ${orderColumn} DESC`,
+    );
+
+    return jsonOk(res, rowsResult.rows || [], 'Kas bon aktif berhasil dimuat');
+  } catch (error) {
+    return jsonError(res, 500, error.message || 'Internal server error', error.message);
+  } finally {
+    client.release();
+  }
+};
+
 const createTransaction = async (req, res) => {
   const client = await req.tenantDb.connect();
   let referenceId = '';
@@ -307,6 +361,8 @@ const settleKasBon = async (req, res) => {
       `SELECT id,
               ${paymentColumn} AS payment_value,
               ${amountColumn} AS amount_value,
+              ${columns.has('payment_status') ? 'payment_status,' : "NULL::TEXT AS payment_status,"}
+              ${columns.has('outstanding_balance') ? 'outstanding_balance,' : 'NULL::NUMERIC AS outstanding_balance,'}
               remaining_balance
        FROM sales_records
        WHERE id = $1
@@ -321,16 +377,29 @@ const settleKasBon = async (req, res) => {
 
     const transaction = transactionResult.rows[0];
     const paymentType = normalizePaymentType(transaction.payment_value);
+    const paymentStatus = normalizePaymentType(transaction.payment_status);
 
     if (paymentType !== 'KAS BON') {
       await client.query('ROLLBACK');
       return jsonError(res, 400, 'Transaksi ini bukan tipe pembayaran KAS BON');
     }
 
+    if (paymentStatus === 'LUNAS') {
+      await client.query('ROLLBACK');
+      return jsonError(res, 400, 'Kas Bon ini sudah dilunasi sebelumnya!');
+    }
+
     const fallbackBalance = toNumber(transaction.amount_value);
     const currentBalance = Number.isFinite(toNumber(transaction.remaining_balance))
       ? toNumber(transaction.remaining_balance)
-      : fallbackBalance;
+      : (Number.isFinite(toNumber(transaction.outstanding_balance))
+        ? toNumber(transaction.outstanding_balance)
+        : fallbackBalance);
+
+    if (currentBalance <= 0) {
+      await client.query('ROLLBACK');
+      return jsonError(res, 400, 'Kas Bon ini sudah dilunasi sebelumnya!');
+    }
 
     if (!Number.isFinite(currentBalance) || currentBalance < 0) {
       await client.query('ROLLBACK');
@@ -360,12 +429,15 @@ const settleKasBon = async (req, res) => {
     );
 
     const updateClauses = ['remaining_balance = $1'];
+    if (columns.has('outstanding_balance')) {
+      updateClauses.push('outstanding_balance = $1');
+    }
     const values = [normalizedBalance, id];
 
-    if (isLunas && columns.has('payment_status')) {
+    if (columns.has('payment_status')) {
       const paramPosition = values.length + 1;
       updateClauses.push(`payment_status = $${paramPosition}`);
-      values.push('LUNAS');
+      values.push(isLunas ? 'LUNAS' : 'BELUM LUNAS');
     }
 
     const updateSql = `
@@ -422,5 +494,6 @@ const settleKasBon = async (req, res) => {
 
 module.exports = {
   createTransaction,
+  listActiveKasBon,
   settleKasBon,
 };
