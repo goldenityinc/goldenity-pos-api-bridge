@@ -26,12 +26,15 @@ const toPositiveInteger = (value) => {
   return parsed;
 };
 
-const normalizeReferenceId = (payload = {}) => {
+const normalizeReferenceId = (payload = {}, fallbackValue = '') => {
   return (
     payload.reference_id ??
     payload.referenceId ??
+    payload.transaction_id ??
+    payload.transactionId ??
     payload.local_id ??
     payload.localId ??
+    fallbackValue ??
     ''
   )
     .toString()
@@ -189,10 +192,13 @@ const createTransaction = async (req, res) => {
 
   try {
     const payload = { ...req.body };
-    if (typeof payload.id === 'string') {
+    const clientProvidedId = typeof payload.id === 'string'
+      ? payload.id.trim()
+      : '';
+    if (clientProvidedId) {
       delete payload.id;
     }
-    referenceId = normalizeReferenceId(payload);
+    referenceId = normalizeReferenceId(payload, clientProvidedId);
     if (referenceId) {
       payload.reference_id = referenceId;
     }
