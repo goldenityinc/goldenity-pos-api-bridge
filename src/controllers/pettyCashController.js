@@ -28,6 +28,12 @@ const resolveUserIdFromRequest = (req) => {
     .trim();
 };
 
+const resolveUsernameFromRequest = (req) => {
+  return (req?.auth?.username ?? req?.auth?.userName ?? req?.auth?.user_name ?? '')
+    .toString()
+    .trim();
+};
+
 const ensurePettyCashLogsTable = async (client) => {
   await client.query(`
     CREATE TABLE IF NOT EXISTS petty_cash_logs (
@@ -58,6 +64,8 @@ const mapPettyCashRow = (row = {}) => ({
   tenant_id: row.tenant_id,
   userId: row.user_id,
   user_id: row.user_id,
+  userName: (row.user_name ?? '').toString().trim(),
+  user_name: (row.user_name ?? '').toString().trim(),
   amount: Number(row.amount ?? 0),
   type: normalizeType(row.type),
   notes: row.notes ?? '',
@@ -78,12 +86,16 @@ const getTodayPettyCashLogs = async (req, res) => {
     end.setDate(end.getDate() + 1);
 
     const result = await client.query(
-      `SELECT id, tenant_id, user_id, amount, type, notes, created_at
-       FROM petty_cash_logs
+      `SELECT l.id, l.tenant_id, l.user_id, l.amount, l.type, l.notes, l.created_at,
+              u.username AS user_name
+       FROM petty_cash_logs l
+       LEFT JOIN app_users u
+         ON CAST(u.id AS TEXT) = l.user_id
+         OR u.username = l.user_id
        WHERE tenant_id = $1
-         AND created_at >= $2
-         AND created_at < $3
-       ORDER BY created_at DESC`,
+         AND l.created_at >= $2
+         AND l.created_at < $3
+       ORDER BY l.created_at DESC`,
       [tenantId, start.toISOString(), end.toISOString()],
     );
 
@@ -110,6 +122,7 @@ const createPettyCashLog = async (req, res) => {
   try {
     const tenantId = (req?.tenant?.tenantId ?? '').toString().trim();
     const userId = resolveUserIdFromRequest(req);
+    const userName = resolveUsernameFromRequest(req);
     const amount = toIntegerAmount(req.body?.amount);
     const type = normalizeType(req.body?.type);
     const notes = (req.body?.notes ?? '').toString().trim();
@@ -138,7 +151,10 @@ const createPettyCashLog = async (req, res) => {
       [id, tenantId, userId || null, amount, type, notes || null],
     );
 
-    const createdLog = mapPettyCashRow(insertResult.rows[0] || {});
+    const createdLog = mapPettyCashRow({
+      ...(insertResult.rows[0] || {}),
+      user_name: userName,
+    });
     emitPettyCashUpdated(req, createdLog);
 
     return jsonOk(res, createdLog, 'Petty cash berhasil disimpan', 201);
