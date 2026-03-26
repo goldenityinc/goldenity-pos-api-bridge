@@ -449,6 +449,54 @@ const emitPettyCashUpdated = (req, pettyCashRecord) => {
   });
 };
 
+const emitProcurementCreated = (req, procurementRecord, extra = {}) => {
+  const tenantId = resolveTenantIdFromRequest(req);
+  const deviceId = resolveDeviceIdFromRequest(req);
+  const procurement = normalizeRecord(procurementRecord);
+  const recordId = (procurement?.id ?? extra.recordId ?? '').toString().trim();
+  if (!tenantId || !recordId || !procurement) {
+    return;
+  }
+
+  emitToTenant(tenantId, 'procurement_created', {
+    tenantId,
+    id: recordId,
+    procurementId: recordId,
+    procurement,
+    deviceId,
+    timestamp: toIsoNow(),
+  });
+};
+
+const emitProcurementUpdated = (req, procurementRecord, extra = {}) => {
+  const tenantId = resolveTenantIdFromRequest(req);
+  const deviceId = resolveDeviceIdFromRequest(req);
+  const procurement = normalizeRecord(procurementRecord) ?? normalizeRecord(extra.payload);
+  const recordId = (
+    procurement?.id ??
+    extra.recordId ??
+    procurement?.order_history_id ??
+    procurement?.order_id ??
+    ''
+  )
+    .toString()
+    .trim();
+  if (!tenantId || !recordId) {
+    return;
+  }
+
+  emitToTenant(tenantId, 'procurement_updated', {
+    tenantId,
+    id: recordId,
+    procurementId: recordId,
+    procurement,
+    table: (extra.table ?? '').toString().trim(),
+    action: normalizeAction(extra.action),
+    deviceId,
+    timestamp: toIsoNow(),
+  });
+};
+
 const emitTableMutation = (req, { table, action, record, id, extra = {} }) => {
   const normalizedTable = (table ?? '').toString().trim();
   const normalizedAction = (action ?? '').toString().trim().toUpperCase();
@@ -489,6 +537,21 @@ const emitTableMutation = (req, { table, action, record, id, extra = {} }) => {
     normalizedTable === 'order_history' ||
     normalizedTable === 'order_history_items'
   ) {
+    if (normalizedTable === 'order_history' && normalizedAction === 'INSERT') {
+      emitProcurementCreated(req, normalizedRecord, {
+        recordId,
+        action: normalizedAction,
+        table: normalizedTable,
+      });
+    } else {
+      emitProcurementUpdated(req, normalizedRecord, {
+        recordId,
+        action: normalizedAction,
+        table: normalizedTable,
+        payload: normalizedRecord,
+      });
+    }
+
     emitDbMutation(req, {
       type: mapOrderHistoryMutationType(normalizedTable, normalizedAction),
       entity: normalizedTable,
@@ -527,5 +590,7 @@ module.exports = {
   emitTransactionCreated,
   emitTransactionUpdated,
   emitPettyCashUpdated,
+  emitProcurementCreated,
+  emitProcurementUpdated,
   emitTableMutation,
 };

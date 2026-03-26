@@ -18,6 +18,28 @@ const toIntegerAmount = (value) => {
   return Math.round(parsed);
 };
 
+const normalizeUtcIsoString = (value) => {
+  if (!value) {
+    return null;
+  }
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+
+  const text = value.toString().trim();
+  if (!text) {
+    return null;
+  }
+
+  const parsedDate = new Date(text);
+  if (Number.isNaN(parsedDate.getTime())) {
+    return null;
+  }
+
+  return parsedDate.toISOString();
+};
+
 const resolveUserIdFromRequest = (req) => {
   return (
     req?.auth?.userId ??
@@ -84,8 +106,8 @@ const mapPettyCashRow = (row = {}) => ({
   amount: Number(row.amount ?? 0),
   type: normalizeType(row.type),
   notes: row.notes ?? '',
-  createdAt: row.created_at,
-  created_at: row.created_at,
+  createdAt: normalizeUtcIsoString(row.created_at),
+  created_at: normalizeUtcIsoString(row.created_at),
 });
 
 const getTodayPettyCashLogs = async (req, res) => {
