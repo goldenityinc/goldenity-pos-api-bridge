@@ -3,6 +3,7 @@ const productsRoutes = require('./productsRoutes');
 const categoriesRoutes = require('./categoriesRoutes');
 const transactionsRoutes = require('./transactionsRoutes');
 const syncRoutes = require('./syncRoutes');
+const inventoryRoutes = require('./inventoryRoutes');
 const orderHistoryItemsRoutes = require('./orderHistoryItemsRoutes');
 const recordsRoutes = require('./recordsRoutes');
 const storageRoutes = require('./storageRoutes');
@@ -17,6 +18,7 @@ const { resetOperationalData } = require('../controllers/debugController');
 const router = express.Router();
 
 router.use('/products', productsRoutes);
+router.use('/inventory', inventoryRoutes);
 router.use('/categories', categoriesRoutes);
 router.use('/transactions', transactionsRoutes);
 router.use('/sync', syncRoutes);
