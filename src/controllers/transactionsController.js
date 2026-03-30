@@ -165,9 +165,14 @@ const listActiveKasBon = async (req, res) => {
     const filters = [
       `UPPER(COALESCE(${paymentColumn}::text, '')) = 'KAS BON'`,
     ];
-    if (columns.has('tenant_id')) {
-      filters.push('tenant_id = $1');
+    if (!columns.has('tenant_id')) {
+      return jsonError(
+        res,
+        500,
+        'Security guard: tabel sales_records wajib memiliki tenant_id sebelum endpoint ini digunakan',
+      );
     }
+    filters.push('tenant_id = $1');
     if (columns.has('payment_status')) {
       filters.push(`UPPER(COALESCE(payment_status::text, 'BELUM LUNAS')) <> 'LUNAS'`);
     }
@@ -248,9 +253,14 @@ const createTransaction = async (req, res) => {
     hasSalesTenantColumn = salesRecordColumnSet.has('tenant_id');
     const productsColumnSet = await getTableColumnSet(client, 'products');
     const hasProductsTenantColumn = productsColumnSet.has('tenant_id');
+    if (!hasSalesTenantColumn) {
+      throw new Error('Security guard: tabel sales_records wajib memiliki tenant_id');
+    }
+    if (!hasProductsTenantColumn) {
+      throw new Error('Security guard: tabel products wajib memiliki tenant_id');
+    }
 
     if (referenceId) {
-      const hasSalesTenantColumn = salesRecordColumnSet.has('tenant_id');
       const existingResult = await client.query(
         hasSalesTenantColumn
           ? 'SELECT * FROM sales_records WHERE reference_id = $1 AND tenant_id = $2 LIMIT 1'
@@ -406,6 +416,15 @@ const settleKasBon = async (req, res) => {
     if (transactionResult.rowCount === 0) {
       await client.query('ROLLBACK');
       return jsonError(res, 404, 'Data transaksi tidak ditemukan');
+    }
+
+    if (!columns.has('tenant_id')) {
+      await client.query('ROLLBACK');
+      return jsonError(
+        res,
+        500,
+        'Security guard: tabel sales_records wajib memiliki tenant_id sebelum endpoint ini digunakan',
+      );
     }
 
     const transaction = transactionResult.rows[0];

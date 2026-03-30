@@ -86,6 +86,13 @@ const getProducts = async (req, res) => {
     let whereClause = '';
     const productsColumns = await getTableColumnSet(req.tenantDb, 'products');
     const hasTenantColumn = productsColumns.has('tenant_id');
+    if (!hasTenantColumn) {
+      return jsonError(
+        res,
+        500,
+        'Security guard: tabel products wajib memiliki tenant_id sebelum endpoint ini digunakan',
+      );
+    }
     if (hasTenantColumn) {
       values.push(tenantId);
       whereClause = ` WHERE tenant_id = $${values.length}`;
@@ -152,6 +159,13 @@ const reduceStock = async (req, res) => {
 
     const productsColumns = await getTableColumnSet(req.tenantDb, 'products');
     const hasTenantColumn = productsColumns.has('tenant_id');
+    if (!hasTenantColumn) {
+      return jsonError(
+        res,
+        500,
+        'Security guard: tabel products wajib memiliki tenant_id sebelum endpoint ini digunakan',
+      );
+    }
     const currentResult = await req.tenantDb.query(
       hasTenantColumn
         ? 'SELECT id, stock FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1'

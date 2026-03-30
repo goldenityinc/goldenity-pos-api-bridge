@@ -107,6 +107,13 @@ const exportInventoryCsv = async (req, res) => {
     const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     const columnSet = await getTableColumnSet(req.tenantDb, 'products');
     const hasTenantColumn = columnSet.has('tenant_id');
+    if (!hasTenantColumn) {
+      return jsonError(
+        res,
+        500,
+        'Security guard: tabel products wajib memiliki tenant_id sebelum endpoint ini digunakan',
+      );
+    }
     const result = await req.tenantDb.query(
       `SELECT
           name,
@@ -146,6 +153,13 @@ const importInventoryCsv = async (req, res) => {
     const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     const columnSet = await getTableColumnSet(req.tenantDb, 'products');
     const hasTenantColumn = columnSet.has('tenant_id');
+    if (!hasTenantColumn) {
+      return jsonError(
+        res,
+        500,
+        'Security guard: tabel products wajib memiliki tenant_id sebelum endpoint ini digunakan',
+      );
+    }
     const parsedRows = parseInventoryCsvRows(req.file.buffer);
     if (parsedRows.length === 0) {
       return jsonError(res, 400, 'File CSV kosong atau tidak memiliki baris data');
