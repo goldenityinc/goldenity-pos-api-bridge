@@ -12,14 +12,14 @@ enum PettyCashDirection {
   OUT
 }
 
+/// The `tenants` table is OWNED by goldenity-admin-core-api.
+/// @@ignore tells Prisma: "table exists in DB, do NOT manage or drop it from bridge."
 model Tenant {
-  id            String         @id
-  slug          String?        @unique
-  products      Product[]
-  customers     Customer[]
-  pettyCashLogs PettyCashLog[]
+  id   String  @id
+  slug String? @unique
 
   @@map("tenants")
+  @@ignore
 }
 
 model Product {
@@ -38,8 +38,6 @@ model Product {
   createdAt     DateTime? @default(now()) @map("created_at")
   updatedAt     DateTime? @updatedAt @map("updated_at")
 
-  tenant        Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
   @@index([tenantId])
   @@map("products")
 }
@@ -53,14 +51,12 @@ model Customer {
   createdAt  DateTime? @default(now()) @map("created_at")
   updatedAt  DateTime? @updatedAt @map("updated_at")
 
-  tenant     Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
   @@index([tenantId])
   @@map("customers")
 }
 
-/// Shared petty cash logs are stored per tenant database. Because this bridge
-/// uses database-per-tenant, tenantId/userId are stored as scalar identifiers.
+/// Petty cash logs per tenant. tenantId stored as scalar (no FK to tenants table
+/// since tenants table is managed by admin-core, not bridge).
 model PettyCashLog {
   id        String             @id @default(uuid()) @db.Uuid
   tenantId  String             @map("tenant_id")
@@ -69,8 +65,6 @@ model PettyCashLog {
   type      PettyCashDirection @default(IN)
   notes     String?            @db.Text
   createdAt DateTime           @default(now()) @map("created_at")
-
-  tenant    Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@index([tenantId, createdAt])
   @@index([userId])

@@ -70,6 +70,10 @@ const ensureCustomersTable = async (tenantDb, table) => {
     ALTER TABLE customers
     ADD COLUMN IF NOT EXISTS total_spent DOUBLE PRECISION DEFAULT 0;
   `);
+  await tenantDb.query(`
+    ALTER TABLE customers
+    ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+  `);
 };
 
 const ensureProductsTableColumns = async (tenantDb, table) => {
