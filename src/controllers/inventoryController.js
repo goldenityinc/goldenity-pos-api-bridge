@@ -2,6 +2,7 @@ const { parse } = require('csv-parse/sync');
 const { jsonError, jsonOk } = require('../utils/http');
 const { emitTableMutation } = require('../services/realtimeEmitter');
 const { getTableColumnSet, normalizeTenantId } = require('../utils/sqlHelpers');
+const { ensureTenantScopedTable } = require('../utils/tenantScope');
 
 const INVENTORY_CSV_HEADERS = [
   'Nama',
@@ -105,15 +106,9 @@ const downloadInventoryTemplate = async (_req, res) => {
 const exportInventoryCsv = async (req, res) => {
   try {
     const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    await ensureTenantScopedTable(req.tenantDb, 'products', tenantId);
     const columnSet = await getTableColumnSet(req.tenantDb, 'products');
     const hasTenantColumn = columnSet.has('tenant_id');
-    if (!hasTenantColumn) {
-      return jsonError(
-        res,
-        500,
-        'Security guard: tabel products wajib memiliki tenant_id sebelum endpoint ini digunakan',
-      );
-    }
     const result = await req.tenantDb.query(
       `SELECT
           name,
@@ -151,15 +146,9 @@ const importInventoryCsv = async (req, res) => {
 
   try {
     const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    await ensureTenantScopedTable(req.tenantDb, 'products', tenantId);
     const columnSet = await getTableColumnSet(req.tenantDb, 'products');
     const hasTenantColumn = columnSet.has('tenant_id');
-    if (!hasTenantColumn) {
-      return jsonError(
-        res,
-        500,
-        'Security guard: tabel products wajib memiliki tenant_id sebelum endpoint ini digunakan',
-      );
-    }
     const parsedRows = parseInventoryCsvRows(req.file.buffer);
     if (parsedRows.length === 0) {
       return jsonError(res, 400, 'File CSV kosong atau tidak memiliki baris data');

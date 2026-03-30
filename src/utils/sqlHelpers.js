@@ -1,3 +1,5 @@
+const { ensureTenantScopedTable } = require('./tenantScope');
+
 const toBool = (value, fallback = false) => {
   if (value === undefined) return fallback;
   if (typeof value === 'boolean') return value;
@@ -434,6 +436,14 @@ const normalizePayloadByColumnDefinitions = (payload, columnDefinitions) => {
 
 const runSelect = async (tenantDb, table, query = {}, options = {}) => {
   const tenantId = normalizeTenantId(options.tenantId);
+
+  if (isTenantScopedTable(table)) {
+    if (!tenantId) {
+      throw new Error('Security guard: tenantId wajib tersedia untuk operasi read');
+    }
+    await ensureTenantScopedTable(tenantDb, table, tenantId);
+  }
+
   const columnSet = await getTableColumnSet(tenantDb, table);
   const hasTenantColumn = columnSet.has(TENANT_COLUMN);
 

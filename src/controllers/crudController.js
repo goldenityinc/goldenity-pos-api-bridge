@@ -14,6 +14,7 @@ const {
   normalizeTenantId,
   runSelect,
 } = require('../utils/sqlHelpers');
+const { ensureTenantScopedTable } = require('../utils/tenantScope');
 const {
   getCachedResponse,
   storeResponse,
@@ -70,6 +71,7 @@ const createCrudController = (table) => ({
   list: async (req, res) => {
     try {
       const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+      await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const rows = await runSelect(req.tenantDb, table, req.query, { tenantId });
       return jsonOk(res, rows);
     } catch (error) {
@@ -91,6 +93,7 @@ const createCrudController = (table) => ({
           )
         : await normalizeUserPassword(table, parseBodyObject(req.body), { isCreate: true });
       const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+      await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
       const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
@@ -125,6 +128,7 @@ const createCrudController = (table) => ({
       const idField = req.query.idField || 'id';
       const payload = await normalizeUserPassword(table, parseBodyObject(req.body));
       const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+      await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
       const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
@@ -164,6 +168,7 @@ const createCrudController = (table) => ({
     try {
       const idField = req.query.idField || 'id';
       const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+      await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnSet = await getTableColumnSet(req.tenantDb, table);
       const { sql, values } = buildDeleteQuery(
         table,

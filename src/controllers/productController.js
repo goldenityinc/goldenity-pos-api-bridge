@@ -1,5 +1,6 @@
 const { jsonOk, jsonError } = require('../utils/http');
 const { getTableColumnSet, normalizeTenantId } = require('../utils/sqlHelpers');
+const { ensureTenantScopedTable } = require('../utils/tenantScope');
 const { emitInventoryUpdated } = require('../services/realtimeEmitter');
 
 const normalizePositiveInteger = (value, fallback, { min = 0, max = 1000 } = {}) => {
@@ -67,6 +68,7 @@ const resolveProductsSyncExpressions = async (tenantDb) => {
 const getProducts = async (req, res) => {
   try {
     const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    await ensureTenantScopedTable(req.tenantDb, 'products', tenantId);
     const limit = normalizePositiveInteger(req.query?.limit, 500, {
       min: 1,
       max: 1000,
@@ -86,13 +88,6 @@ const getProducts = async (req, res) => {
     let whereClause = '';
     const productsColumns = await getTableColumnSet(req.tenantDb, 'products');
     const hasTenantColumn = productsColumns.has('tenant_id');
-    if (!hasTenantColumn) {
-      return jsonError(
-        res,
-        500,
-        'Security guard: tabel products wajib memiliki tenant_id sebelum endpoint ini digunakan',
-      );
-    }
     if (hasTenantColumn) {
       values.push(tenantId);
       whereClause = ` WHERE tenant_id = $${values.length}`;
@@ -145,6 +140,7 @@ const getProducts = async (req, res) => {
 const reduceStock = async (req, res) => {
   try {
     const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    await ensureTenantScopedTable(req.tenantDb, 'products', tenantId);
     const productId = req.params.id;
     const qty = Number(req.body?.qty);
     const reason = (req.body?.reason ?? '').toString().trim();
@@ -159,13 +155,6 @@ const reduceStock = async (req, res) => {
 
     const productsColumns = await getTableColumnSet(req.tenantDb, 'products');
     const hasTenantColumn = productsColumns.has('tenant_id');
-    if (!hasTenantColumn) {
-      return jsonError(
-        res,
-        500,
-        'Security guard: tabel products wajib memiliki tenant_id sebelum endpoint ini digunakan',
-      );
-    }
     const currentResult = await req.tenantDb.query(
       hasTenantColumn
         ? 'SELECT id, stock FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1'

@@ -7,6 +7,7 @@ const {
   enforceTenantIdOnPayload,
   normalizeTenantId,
 } = require('../utils/sqlHelpers');
+const { ensureTenantScopedTable } = require('../utils/tenantScope');
 const {
   emitKasBonCreated,
   emitKasBonUpdated,
@@ -140,6 +141,7 @@ const listActiveKasBon = async (req, res) => {
 
   try {
     const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    await ensureTenantScopedTable(client, 'sales_records', tenantId);
     const columnsResult = await client.query(
       `SELECT column_name
        FROM information_schema.columns
@@ -165,13 +167,6 @@ const listActiveKasBon = async (req, res) => {
     const filters = [
       `UPPER(COALESCE(${paymentColumn}::text, '')) = 'KAS BON'`,
     ];
-    if (!columns.has('tenant_id')) {
-      return jsonError(
-        res,
-        500,
-        'Security guard: tabel sales_records wajib memiliki tenant_id sebelum endpoint ini digunakan',
-      );
-    }
     filters.push('tenant_id = $1');
     if (columns.has('payment_status')) {
       filters.push(`UPPER(COALESCE(payment_status::text, 'BELUM LUNAS')) <> 'LUNAS'`);
@@ -248,17 +243,13 @@ const createTransaction = async (req, res) => {
     await ensureSalesRecordsReferenceIdColumn(client);
     await ensureSalesRecordsCashierColumns(client);
     await ensureSalesRecordsKasBonColumns(client);
+    await ensureTenantScopedTable(client, 'sales_records', tenantId);
+    await ensureTenantScopedTable(client, 'products', tenantId);
     const salesRecordColumnDefinitions = await getTableColumnDefinitions(client, 'sales_records');
     const salesRecordColumnSet = new Set(salesRecordColumnDefinitions.keys());
     hasSalesTenantColumn = salesRecordColumnSet.has('tenant_id');
     const productsColumnSet = await getTableColumnSet(client, 'products');
     const hasProductsTenantColumn = productsColumnSet.has('tenant_id');
-    if (!hasSalesTenantColumn) {
-      throw new Error('Security guard: tabel sales_records wajib memiliki tenant_id');
-    }
-    if (!hasProductsTenantColumn) {
-      throw new Error('Security guard: tabel products wajib memiliki tenant_id');
-    }
 
     if (referenceId) {
       const existingResult = await client.query(
@@ -364,6 +355,7 @@ const settleKasBon = async (req, res) => {
 
   try {
     const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    await ensureTenantScopedTable(client, 'sales_records', tenantId);
     const id = req.params.id;
     const paidAmount = toNumber(req.body?.paid_amount ?? req.body?.amount);
 
@@ -418,14 +410,6 @@ const settleKasBon = async (req, res) => {
       return jsonError(res, 404, 'Data transaksi tidak ditemukan');
     }
 
-    if (!columns.has('tenant_id')) {
-      await client.query('ROLLBACK');
-      return jsonError(
-        res,
-        500,
-        'Security guard: tabel sales_records wajib memiliki tenant_id sebelum endpoint ini digunakan',
-      );
-    }
 
     const transaction = transactionResult.rows[0];
     const paymentType = normalizePaymentType(transaction.payment_value);
