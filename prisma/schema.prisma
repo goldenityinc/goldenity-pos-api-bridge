@@ -12,8 +12,19 @@ enum PettyCashDirection {
   OUT
 }
 
+model Tenant {
+  id            String         @id
+  slug          String?        @unique
+  products      Product[]
+  customers     Customer[]
+  pettyCashLogs PettyCashLog[]
+
+  @@map("tenants")
+}
+
 model Product {
   id            String    @id @default(cuid())
+  tenantId      String    @map("tenant_id")
   name          String
   barcode       String?
   category      String?
@@ -27,17 +38,24 @@ model Product {
   createdAt     DateTime? @default(now()) @map("created_at")
   updatedAt     DateTime? @updatedAt @map("updated_at")
 
+  tenant        Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
   @@map("products")
 }
 
 model Customer {
   id         Int       @id @default(autoincrement())
+  tenantId   String    @map("tenant_id")
   name       String
   phone      String?
   totalSpent Float     @default(0) @map("total_spent")
   createdAt  DateTime? @default(now()) @map("created_at")
   updatedAt  DateTime? @updatedAt @map("updated_at")
 
+  tenant     Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
   @@map("customers")
 }
 
@@ -51,6 +69,8 @@ model PettyCashLog {
   type      PettyCashDirection @default(IN)
   notes     String?            @db.Text
   createdAt DateTime           @default(now()) @map("created_at")
+
+  tenant    Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@index([tenantId, createdAt])
   @@index([userId])

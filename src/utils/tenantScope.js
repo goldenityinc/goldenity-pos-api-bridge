@@ -1,4 +1,5 @@
 const ensuredTenantTables = new Set();
+const TENANT_COLUMN = 'tenant_id';
 
 const isSafeIdentifier = (value) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 
@@ -18,16 +19,21 @@ const ensureTenantScopedTable = async (tenantDb, table, tenantId) => {
     return;
   }
 
-  await tenantDb.query(
-    `ALTER TABLE "${normalizedTable}" ADD COLUMN IF NOT EXISTS tenant_id TEXT`,
+  const result = await tenantDb.query(
+    `SELECT 1
+     FROM information_schema.columns
+     WHERE table_schema = ANY(current_schemas(false))
+       AND table_name = $1
+       AND column_name = $2
+     LIMIT 1`,
+    [normalizedTable, TENANT_COLUMN],
   );
-  await tenantDb.query(
-    `UPDATE "${normalizedTable}" SET tenant_id = $1 WHERE tenant_id IS NULL`,
-    [normalizedTenantId],
-  );
-  await tenantDb.query(
-    `CREATE INDEX IF NOT EXISTS idx_${normalizedTable}_tenant_id ON "${normalizedTable}" (tenant_id)`,
-  );
+
+  if ((result.rowCount || 0) === 0) {
+    throw new Error(
+      `Security guard: tabel ${normalizedTable} wajib memiliki kolom ${TENANT_COLUMN} pada shared database`,
+    );
+  }
 
   ensuredTenantTables.add(cacheKey);
 };

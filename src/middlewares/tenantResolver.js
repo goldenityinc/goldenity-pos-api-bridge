@@ -1,7 +1,16 @@
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 
-const pools = global.__goldenityTenantPools || (global.__goldenityTenantPools = new Map());
+const createSharedPool = () => {
+  const connectionString = (process.env.DATABASE_URL || '').trim();
+  if (!connectionString) {
+    throw new Error('DATABASE_URL belum dikonfigurasi untuk shared database bridge');
+  }
+
+  const pool = new Pool({ connectionString });
+  global.__goldenitySharedPool = pool;
+  return pool;
+};
 
 const getAuthToken = (req) => {
   const authorization = req.headers.authorization || '';
@@ -11,24 +20,7 @@ const getAuthToken = (req) => {
   return authorization.slice(7).trim();
 };
 
-const getOrCreateTenantPool = (tenantId, dbUrl) => {
-  const existing = pools.get(tenantId);
-
-  if (!existing) {
-    const pool = new Pool({ connectionString: dbUrl });
-    pools.set(tenantId, { dbUrl, pool });
-    return pool;
-  }
-
-  if (existing.dbUrl !== dbUrl) {
-    const pool = new Pool({ connectionString: dbUrl });
-    pools.set(tenantId, { dbUrl, pool });
-    void existing.pool.end().catch(() => {});
-    return pool;
-  }
-
-  return existing.pool;
-};
+const getSharedPool = () => global.__goldenitySharedPool || createSharedPool();
 
 const tenantResolver = async (req, res, next) => {
   try {
@@ -45,7 +37,6 @@ const tenantResolver = async (req, res, next) => {
     const payload = jwt.verify(token, jwtSecret);
 
     const tenantId = payload?.tenantId || payload?.tenant_id;
-    const dbUrl = payload?.dbUrl;
 
     if (!tenantId || typeof tenantId !== 'string') {
       return res.status(401).json({
@@ -55,19 +46,11 @@ const tenantResolver = async (req, res, next) => {
       });
     }
 
-    if (!dbUrl || typeof dbUrl !== 'string') {
-      return res.status(401).json({
-        success: false,
-        message: 'dbUrl tidak ditemukan di token',
-        error: null,
-      });
-    }
-
-    const pool = getOrCreateTenantPool(tenantId, dbUrl);
+    const pool = getSharedPool();
     await pool.query('SELECT 1');
 
     req.auth = payload;
-    req.tenant = { tenantId, dbUrl };
+    req.tenant = { tenantId };
     req.tenantDb = pool;
     req.db = pool;
 
@@ -83,6 +66,5 @@ const tenantResolver = async (req, res, next) => {
 
 module.exports = {
   tenantResolver,
-  getOrCreateTenantPool,
-  pools,
+  getSharedPool,
 };

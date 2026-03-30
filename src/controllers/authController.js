@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const { getOrCreateTenantPool } = require('../middlewares/tenantResolver');
+const { getSharedPool } = require('../middlewares/tenantResolver');
 const { jsonOk, jsonError } = require('../utils/http');
 
 const login = async (req, res) => {
@@ -14,17 +14,16 @@ const login = async (req, res) => {
       username,
       password,
       tenantId,
-      dbUrl,
     } = req.body || {};
 
-    if (!username || !password || !tenantId || !dbUrl) {
-      return jsonError(res, 400, 'username, password, tenantId, dan dbUrl wajib diisi');
+    if (!username || !password || !tenantId) {
+      return jsonError(res, 400, 'username, password, dan tenantId wajib diisi');
     }
 
-    const pool = getOrCreateTenantPool(tenantId, dbUrl);
+    const pool = getSharedPool();
     const result = await pool.query(
-      'SELECT * FROM app_users WHERE username = $1 LIMIT 1',
-      [username],
+      'SELECT * FROM app_users WHERE username = $1 AND tenant_id = $2 LIMIT 1',
+      [username, tenantId],
     );
 
     const user = result.rows[0];
@@ -48,7 +47,6 @@ const login = async (req, res) => {
         sub: user.id,
         username: user.username,
         tenantId,
-        dbUrl,
       },
       jwtSecret,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' },
@@ -59,10 +57,9 @@ const login = async (req, res) => {
     let customRolePermissions = null;
     if (user.custom_role_id) {
       try {
-        const pool = getOrCreateTenantPool(tenantId, dbUrl);
         const roleResult = await pool.query(
-          'SELECT permissions FROM custom_roles WHERE id = $1 LIMIT 1',
-          [user.custom_role_id],
+          'SELECT permissions FROM custom_roles WHERE id = $1 AND tenant_id = $2 LIMIT 1',
+          [user.custom_role_id, tenantId],
         );
         if (roleResult.rows[0]) {
           customRolePermissions = roleResult.rows[0].permissions;
