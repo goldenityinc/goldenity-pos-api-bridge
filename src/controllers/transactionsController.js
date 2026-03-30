@@ -112,14 +112,32 @@ const normalizeTransactionItems = (items) => {
       const productId = (
         item.product_id ?? item.productId ?? product.id ?? ''
       ).toString().trim();
+      const productName = (
+        item.product_name ?? item.productName ?? product.name ?? ''
+      ).toString().trim();
+      const isService =
+        item.is_service === true ||
+        item.isService === true ||
+        item.is_custom_item === true ||
+        item.isCustomItem === true ||
+        product.is_service === true ||
+        product.isService === true ||
+        product.is_custom_item === true ||
+        product.isCustomItem === true;
       const qty = toPositiveInteger(item.qty ?? item.quantity);
-      if (!productId || qty === null) {
+      if (qty === null) {
+        return null;
+      }
+
+      if (!productId && !isService) {
         return null;
       }
 
       return {
         productId,
+        productName,
         qty,
+        isService,
       };
     })
     .filter(Boolean);
@@ -274,6 +292,10 @@ const createTransaction = async (req, res) => {
     }
 
     for (const item of transactionItems) {
+      if (item.isService) {
+        continue;
+      }
+
       const currentResult = await client.query(
         hasProductsTenantColumn
           ? 'SELECT id, name, stock, is_service FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
@@ -282,7 +304,7 @@ const createTransaction = async (req, res) => {
       );
 
       if ((currentResult.rowCount || 0) === 0) {
-        throw new Error(`Produk ${item.productId} tidak ditemukan`);
+        throw new Error(`Produk ${item.productName || item.productId} tidak ditemukan`);
       }
 
       const currentProduct = currentResult.rows[0];
