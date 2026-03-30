@@ -1,4 +1,5 @@
 const { jsonOk, jsonError } = require('../utils/http');
+const { randomUUID } = require('crypto');
 const {
   buildInsertQuery,
   buildUpdateQuery,
@@ -12,11 +13,15 @@ const {
 } = require('../utils/sqlHelpers');
 const { emitTableMutation } = require('../services/realtimeEmitter');
 
-const normalizeProductPayload = (payload = {}) => {
+const normalizeProductPayload = (payload = {}, { isCreate = false } = {}) => {
   const next = { ...payload };
 
   if (next.imageUrl !== undefined && next.image_url === undefined) {
     next.image_url = next.imageUrl;
+  }
+
+  if (isCreate && (next.id === undefined || next.id === null || `${next.id}`.trim() === '')) {
+    next.id = randomUUID();
   }
 
   delete next.imageUrl;
@@ -42,7 +47,7 @@ const normalizePayloadForTable = (table, payload, options = {}) => {
   }
 
   if (table === 'products') {
-    return normalizeProductPayload(payload);
+    return normalizeProductPayload(payload, options);
   }
 
   if (table === 'customers') {
@@ -140,9 +145,6 @@ const runSync = async (req, res) => {
 
     if (action === 'INSERT') {
       const payload = normalizePayloadForTable(table, { ...(data || {}) }, { isCreate: true });
-      if (typeof payload.id === 'string') {
-        delete payload.id;
-      }
 
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);

@@ -1,4 +1,5 @@
 const { jsonOk, jsonError } = require('../utils/http');
+const { randomUUID } = require('crypto');
 const {
   normalizeArray,
   parseBodyArray,
@@ -77,11 +78,15 @@ const validateProductCreateOrUpsertPayload = (table, payload) => {
   }
 };
 
-const normalizeProductPayload = (payload = {}) => {
+const normalizeProductPayload = (payload = {}, { isCreate = false } = {}) => {
   const next = { ...payload };
 
   if (next.imageUrl !== undefined && next.image_url === undefined) {
     next.image_url = next.imageUrl;
+  }
+
+  if (isCreate && (next.id === undefined || next.id === null || `${next.id}`.trim() === '')) {
+    next.id = randomUUID();
   }
 
   delete next.imageUrl;
@@ -111,7 +116,7 @@ const normalizePayloadForTable = (table, payload, options = {}) => {
   }
 
   if (table === 'products') {
-    return normalizeProductPayload(payload);
+    return normalizeProductPayload(payload, options);
   }
 
   if (table === 'customers') {
