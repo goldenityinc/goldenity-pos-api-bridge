@@ -380,6 +380,7 @@ model AppInstance {
   tenantId           String            @map("tenantId")
   solutionId         String            @map("solutionId")
   tier               SubscriptionTier
+  addons             String[]          @default([])
   status             AppInstanceStatus @default(ACTIVE)
   dbConnectionString String?
   appUrl             String?

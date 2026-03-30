@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { getSharedPool } = require('../middlewares/tenantResolver');
 const { jsonOk, jsonError } = require('../utils/http');
+const { normalizeSubscriptionAddons } = require('../constants/subscriptionAddons');
 
 const login = async (req, res) => {
   try {
@@ -42,11 +43,37 @@ const login = async (req, res) => {
       return jsonError(res, 401, 'Login gagal', 'Unauthorized');
     }
 
+    const subscriptionResult = await pool.query(
+      `
+      SELECT
+        ai."tier"::text AS tier,
+        COALESCE(ai."addons", ARRAY[]::text[]) AS addons
+      FROM app_instances ai
+      LEFT JOIN solutions s ON s.id = ai."solutionId"
+      WHERE ai."tenantId" = $1
+        AND ai.status = 'ACTIVE'
+      ORDER BY
+        CASE
+          WHEN UPPER(COALESCE(s.code, '')) = 'POS' THEN 0
+          WHEN UPPER(COALESCE(s.name, '')) LIKE '%POS%' THEN 1
+          ELSE 2
+        END,
+        ai."updatedAt" DESC
+      LIMIT 1
+      `,
+      [tenantId],
+    );
+
+    const resolvedTier = subscriptionResult.rows[0]?.tier ?? null;
+    const resolvedAddons = normalizeSubscriptionAddons(subscriptionResult.rows[0]?.addons);
+
     const token = jwt.sign(
       {
         sub: user.id,
         username: user.username,
         tenantId,
+        tier: resolvedTier,
+        addons: resolvedAddons,
       },
       jwtSecret,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' },
@@ -70,7 +97,16 @@ const login = async (req, res) => {
     }
 
     return jsonOk(res, {
-      user: { ...user, custom_role_permissions: customRolePermissions },
+      user: {
+        ...user,
+        custom_role_permissions: customRolePermissions,
+        tier: resolvedTier,
+        addons: resolvedAddons,
+      },
+      subscription: {
+        tier: resolvedTier,
+        addons: resolvedAddons,
+      },
       token,
     });
   } catch (error) {
