@@ -3,8 +3,8 @@ const { jsonOk, jsonError } = require('../utils/http');
 const ALLOWED_STATUS = new Set([
   'PENDING',
   'IN_PROGRESS',
+  'WAITING_CONFIRMATION',
   'DONE',
-  'DELIVERED',
   'CANCELLED',
 ]);
 
@@ -33,10 +33,20 @@ const ensureServiceOrdersTable = async (client) => {
       complaint TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'PENDING',
       estimated_cost NUMERIC(14,2),
+      technician_notes TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+
+  try {
+    await client.query(`
+      ALTER TABLE service_orders
+      ADD COLUMN IF NOT EXISTS technician_notes TEXT
+    `);
+  } catch (err) {
+    console.warn('[ensureServiceOrdersTable] technician_notes ALTER warning:', err.message);
+  }
 
   // Fix existing table schema if needed - ensure timestamp columns have defaults
   try {
@@ -100,11 +110,19 @@ const mapRow = (row = {}) => ({
   status: row.status,
   estimatedCost: row.estimated_cost === null ? null : Number(row.estimated_cost),
   estimated_cost: row.estimated_cost === null ? null : Number(row.estimated_cost),
+  technicianNotes: row.technician_notes,
+  technician_notes: row.technician_notes,
   createdAt: row.created_at,
   created_at: row.created_at,
   updatedAt: row.updated_at,
   updated_at: row.updated_at,
 });
+
+const safeStringField = (value) => {
+  if (value === null || value === undefined) return null;
+  const trimmed = value.toString().trim();
+  return trimmed === '' ? null : trimmed;
+};
 
 const createServiceOrder = async (req, res) => {
   const client = await req.tenantDb.connect();
@@ -114,13 +132,6 @@ const createServiceOrder = async (req, res) => {
     if (!tenantId) {
       return jsonError(res, 401, 'Tenant tidak valid');
     }
-
-    // Helper function to safely extract optional string fields (convert empty string to null)
-    const safeStringField = (value) => {
-      if (value === null || value === undefined) return null;
-      const trimmed = value.toString().trim();
-      return trimmed === '' ? null : trimmed;
-    };
 
     // Required fields - always convert to string and trim
     const customerName = (req.body?.customerName ?? req.body?.customer_name ?? '')
@@ -140,6 +151,9 @@ const createServiceOrder = async (req, res) => {
     );
     const serialNumber = safeStringField(
       req.body?.serialNumber ?? req.body?.serial_number,
+    );
+    const technicianNotes = safeStringField(
+      req.body?.technicianNotes ?? req.body?.technician_notes,
     );
 
     // Numeric optional field
@@ -175,7 +189,8 @@ const createServiceOrder = async (req, res) => {
          serial_number,
          complaint,
          status,
-         estimated_cost
+         estimated_cost,
+         technician_notes
        ) VALUES (
          COALESCE($1, gen_random_uuid()::text),
          $2,
@@ -186,7 +201,8 @@ const createServiceOrder = async (req, res) => {
          $7,
          $8,
          'PENDING',
-         $9
+         $9,
+         $10
        )
        RETURNING *`,
       [
@@ -199,6 +215,7 @@ const createServiceOrder = async (req, res) => {
         serialNumber,
         complaint,
         estimatedCost,
+        technicianNotes,
       ],
     );
 
@@ -218,6 +235,7 @@ const createServiceOrder = async (req, res) => {
       serialNumber: req.body?.serialNumber,
       complaint: req.body?.complaint,
       estimatedCost: req.body?.estimatedCost,
+      technicianNotes: req.body?.technicianNotes,
     });
     return jsonError(
       res,
@@ -278,13 +296,18 @@ const getServiceOrders = async (req, res) => {
   }
 };
 
-const updateServiceStatus = async (req, res) => {
+const updateServiceOrder = async (req, res) => {
   const client = await req.tenantDb.connect();
 
   try {
     const tenantId = normalizeTenantId(req);
     const id = (req.params?.id ?? '').toString().trim();
-    const nextStatus = normalizeStatus(req.body?.status);
+    const nextStatusRaw = req.body?.status;
+    const nextStatus = nextStatusRaw == null ? null : normalizeStatus(nextStatusRaw);
+    const estimatedCostRaw = req.body?.estimatedCost ?? req.body?.estimated_cost;
+    const technicianNotes = safeStringField(
+      req.body?.technicianNotes ?? req.body?.technician_notes,
+    );
 
     if (!tenantId) {
       return jsonError(res, 401, 'Tenant tidak valid');
@@ -292,11 +315,54 @@ const updateServiceStatus = async (req, res) => {
     if (!id) {
       return jsonError(res, 400, 'id service order wajib diisi');
     }
-    if (!ALLOWED_STATUS.has(nextStatus)) {
+    if (nextStatus !== null && !ALLOWED_STATUS.has(nextStatus)) {
       return jsonError(
         res,
         400,
-        'Status tidak valid. Gunakan: PENDING, IN_PROGRESS, DONE, DELIVERED, CANCELLED',
+        'Status tidak valid. Gunakan: PENDING, IN_PROGRESS, WAITING_CONFIRMATION, DONE, CANCELLED',
+      );
+    }
+
+    let estimatedCost;
+    if (
+      estimatedCostRaw === undefined ||
+      estimatedCostRaw === null ||
+      estimatedCostRaw === ''
+    ) {
+      estimatedCost = null;
+    } else {
+      estimatedCost = Number(estimatedCostRaw);
+      if (!Number.isFinite(estimatedCost)) {
+        return jsonError(res, 400, 'estimatedCost harus berupa angka valid');
+      }
+    }
+
+    const fields = [];
+    const params = [];
+
+    if (nextStatus !== null) {
+      params.push(nextStatus);
+      fields.push(`status = $${params.length}`);
+    }
+
+    if (estimatedCostRaw !== undefined) {
+      params.push(estimatedCost);
+      fields.push(`estimated_cost = $${params.length}`);
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'technicianNotes') ||
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'technician_notes')
+    ) {
+      params.push(technicianNotes);
+      fields.push(`technician_notes = $${params.length}`);
+    }
+
+    if (!fields.length) {
+      return jsonError(
+        res,
+        400,
+        'Minimal satu field harus diupdate: status, estimatedCost, atau technicianNotes',
       );
     }
 
@@ -304,12 +370,12 @@ const updateServiceStatus = async (req, res) => {
 
     const result = await client.query(
       `UPDATE service_orders
-       SET status = $1,
+       SET ${fields.join(', ')},
            updated_at = NOW()
-       WHERE id = $2
-         AND tenant_id = $3
+       WHERE id = $${fields.length + 1}
+         AND tenant_id = $${fields.length + 2}
        RETURNING *`,
-      [nextStatus, id, tenantId],
+      [...params, id, tenantId],
     );
 
     if (!result.rows.length) {
@@ -319,18 +385,20 @@ const updateServiceStatus = async (req, res) => {
     return jsonOk(
       res,
       mapRow(result.rows[0]),
-      'Status service order berhasil diperbarui',
+      'Service order berhasil diperbarui',
     );
   } catch (error) {
-    console.error('[serviceOrderController.updateServiceStatus] Error:', error);
+    console.error('[serviceOrderController.updateServiceOrder] Error:', error);
     console.error('Request params:', {
       id: req.params?.id,
-      newStatus: req.body?.status,
+      status: req.body?.status,
+      estimatedCost: req.body?.estimatedCost,
+      technicianNotes: req.body?.technicianNotes,
     });
     return jsonError(
       res,
       500,
-      error.message || 'Gagal memperbarui status service order',
+      error.message || 'Gagal memperbarui service order',
     );
   } finally {
     client.release();
@@ -340,5 +408,5 @@ const updateServiceStatus = async (req, res) => {
 module.exports = {
   createServiceOrder,
   getServiceOrders,
-  updateServiceStatus,
+  updateServiceOrder,
 };

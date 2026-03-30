@@ -3,13 +3,13 @@ const express = require('express');
 const {
   createServiceOrder,
   getServiceOrders,
-  updateServiceStatus,
+  updateServiceOrder,
 } = require('../controllers/serviceOrderController');
 
 const router = express.Router();
 
 router.get('/', getServiceOrders);
 router.post('/', createServiceOrder);
-router.patch('/:id/status', updateServiceStatus);
+router.patch('/:id', updateServiceOrder);
 
 module.exports = router;
