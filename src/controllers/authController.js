@@ -54,7 +54,28 @@ const login = async (req, res) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' },
     );
 
-    return jsonOk(res, { user, token });
+    // Jika user memiliki custom_role_id, sertakan permissions-nya
+    // supaya POS app bisa menerapkan akses RBAC tanpa round-trip tambahan.
+    let customRolePermissions = null;
+    if (user.custom_role_id) {
+      try {
+        const pool = getOrCreateTenantPool(tenantId, dbUrl);
+        const roleResult = await pool.query(
+          'SELECT permissions FROM custom_roles WHERE id = $1 LIMIT 1',
+          [user.custom_role_id],
+        );
+        if (roleResult.rows[0]) {
+          customRolePermissions = roleResult.rows[0].permissions;
+        }
+      } catch {
+        // custom_roles table mungkin belum ada di tenant lama – skip
+      }
+    }
+
+    return jsonOk(res, {
+      user: { ...user, custom_role_permissions: customRolePermissions },
+      token,
+    });
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
   }

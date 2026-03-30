@@ -8,6 +8,7 @@ const orderHistoryItemsRoutes = require('./orderHistoryItemsRoutes');
 const recordsRoutes = require('./recordsRoutes');
 const storageRoutes = require('./storageRoutes');
 const pettyCashRoutes = require('./pettyCashRoutes');
+const roleRoutes = require('./roleRoutes');
 const { createCrudTableRoutes } = require('./crudTableRoutes');
 const {
 	listActiveKasBon,
@@ -28,6 +29,8 @@ router.use('/shopping-list', orderHistoryItemsRoutes);
 router.use('/records', recordsRoutes);
 router.use('/storage', storageRoutes);
 router.use('/petty-cash', pettyCashRoutes);
+router.use('/api/roles', roleRoutes);
+router.use('/roles', roleRoutes);
 router.get('/kas-bon', listActiveKasBon);
 router.post('/kas-bon/:id/settle', settleKasBon);
 router.post('/kas-bon/:id/pay', settleKasBon);
@@ -40,5 +43,7 @@ router.use('/order_history', createCrudTableRoutes('order_history'));
 router.use('/daily_cash', createCrudTableRoutes('daily_cash'));
 router.use('/expenses', createCrudTableRoutes('expenses'));
 router.use('/store_settings', createCrudTableRoutes('store_settings'));
+// Dynamic RBAC: custom role definitions per tenant
+router.use('/custom-roles', createCrudTableRoutes('custom_roles'));
 
 module.exports = router;
