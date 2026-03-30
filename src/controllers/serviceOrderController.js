@@ -20,6 +20,7 @@ const normalizeStatus = (value) => (value ?? '')
   .toUpperCase();
 
 const ensureServiceOrdersTable = async (client) => {
+  // Create table if not exists with proper defaults
   await client.query(`
     CREATE TABLE IF NOT EXISTS service_orders (
       id TEXT PRIMARY KEY,
@@ -37,6 +38,34 @@ const ensureServiceOrdersTable = async (client) => {
     );
   `);
 
+  // Fix existing table schema if needed - ensure timestamp columns have defaults
+  try {
+    // Attempt to add/fix default for created_at (ignore if already exists)
+    await client.query(`
+      ALTER TABLE service_orders 
+      ALTER COLUMN created_at SET DEFAULT NOW()
+    `);
+  } catch (err) {
+    // Expected if column already has default
+    if (!err.message.includes('already has a default definition')) {
+      console.warn('[ensureServiceOrdersTable] created_at ALTER warning:', err.message);
+    }
+  }
+
+  try {
+    // Attempt to add/fix default for updated_at (ignore if already exists)
+    await client.query(`
+      ALTER TABLE service_orders 
+      ALTER COLUMN updated_at SET DEFAULT NOW()
+    `);
+  } catch (err) {
+    // Expected if column already has default
+    if (!err.message.includes('already has a default definition')) {
+      console.warn('[ensureServiceOrdersTable] updated_at ALTER warning:', err.message);
+    }
+  }
+
+  // Create indexes if they don't exist
   await client.query(`
     CREATE INDEX IF NOT EXISTS idx_service_orders_tenant_id
     ON service_orders (tenant_id);
