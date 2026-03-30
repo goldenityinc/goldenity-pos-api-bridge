@@ -4,7 +4,10 @@ const {
   buildUpdateQuery,
   buildDeleteQuery,
   getTableColumnDefinitions,
+  getTableColumnSet,
   normalizePayloadByColumnDefinitions,
+  enforceTenantIdOnPayload,
+  normalizeTenantId,
   runSelect,
 } = require('../utils/sqlHelpers');
 const { emitTableMutation } = require('../services/realtimeEmitter');
@@ -89,7 +92,7 @@ const ensureProductsTableColumns = async (tenantDb, table) => {
   `);
 };
 
-const findExistingRecordByReferenceId = async (tenantDb, table, payload) => {
+const findExistingRecordByReferenceId = async (tenantDb, table, payload, tenantId) => {
   if (table !== 'products' || !payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return null;
   }
@@ -106,7 +109,7 @@ const findExistingRecordByReferenceId = async (tenantDb, table, payload) => {
   return runSelect(tenantDb, table, {
     eq__reference_id: referenceId,
     maybeSingle: true,
-  });
+  }, { tenantId });
 };
 
 const prepareTableSchema = async (tenantDb, table) => {
@@ -118,9 +121,12 @@ const hasMutationFields = (payload) => {
   return !!payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length > 0;
 };
 
+const resolveTenantId = (req) => normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+
 const runSync = async (req, res) => {
   try {
     const { table, action, data, id } = req.body || {};
+    const tenantId = resolveTenantId(req);
 
     if (!table || !action) {
       return jsonError(res, 400, 'table dan action wajib diisi');
@@ -135,7 +141,8 @@ const runSync = async (req, res) => {
       }
 
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-      const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
+      const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+      const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
       if (!hasMutationFields(filteredPayload)) {
         return jsonError(res, 400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
       }
@@ -144,6 +151,7 @@ const runSync = async (req, res) => {
         req.tenantDb,
         table,
         filteredPayload,
+        tenantId,
       );
       if (existingRecord) {
         return jsonOk(res, [existingRecord], 'Sync insert already exists');
@@ -164,15 +172,23 @@ const runSync = async (req, res) => {
     if (action === 'UPDATE') {
       const payload = normalizePayloadForTable(table, data || {}, { isCreate: false });
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-      const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
+      const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+      const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
       if (!hasMutationFields(filteredPayload)) {
         const existing = await runSelect(req.tenantDb, table, {
           eq__id: id,
           maybeSingle: true,
-        });
+        }, { tenantId });
         return jsonOk(res, existing ? [existing] : [], 'Sync update skipped');
       }
-      const { sql, values } = buildUpdateQuery(table, filteredPayload, 'id', id);
+      const columnSet = await getTableColumnSet(req.tenantDb, table);
+      const { sql, values } = buildUpdateQuery(
+        table,
+        filteredPayload,
+        'id',
+        id,
+        { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
+      );
       const result = await req.tenantDb.query(sql, values);
       emitTableMutation(req, {
         table,
@@ -184,7 +200,13 @@ const runSync = async (req, res) => {
     }
 
     if (action === 'DELETE') {
-      const { sql, values } = buildDeleteQuery(table, 'id', id);
+      const columnSet = await getTableColumnSet(req.tenantDb, table);
+      const { sql, values } = buildDeleteQuery(
+        table,
+        'id',
+        id,
+        { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
+      );
       const result = await req.tenantDb.query(sql, values);
       emitTableMutation(req, {
         table,

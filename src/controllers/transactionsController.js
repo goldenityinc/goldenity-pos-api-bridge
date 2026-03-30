@@ -2,7 +2,10 @@ const { jsonOk, jsonError } = require('../utils/http');
 const {
   buildInsertQuery,
   getTableColumnDefinitions,
+  getTableColumnSet,
   normalizePayloadByColumnDefinitions,
+  enforceTenantIdOnPayload,
+  normalizeTenantId,
 } = require('../utils/sqlHelpers');
 const {
   emitKasBonCreated,
@@ -136,6 +139,7 @@ const listActiveKasBon = async (req, res) => {
   const client = await req.tenantDb.connect();
 
   try {
+    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     const columnsResult = await client.query(
       `SELECT column_name
        FROM information_schema.columns
@@ -161,6 +165,9 @@ const listActiveKasBon = async (req, res) => {
     const filters = [
       `UPPER(COALESCE(${paymentColumn}::text, '')) = 'KAS BON'`,
     ];
+    if (columns.has('tenant_id')) {
+      filters.push('tenant_id = $1');
+    }
     if (columns.has('payment_status')) {
       filters.push(`UPPER(COALESCE(payment_status::text, 'BELUM LUNAS')) <> 'LUNAS'`);
     }
@@ -176,6 +183,7 @@ const listActiveKasBon = async (req, res) => {
        FROM sales_records
        WHERE ${filters.join(' AND ')}
        ORDER BY ${orderColumn} DESC`,
+      columns.has('tenant_id') ? [tenantId] : [],
     );
 
     return jsonOk(res, rowsResult.rows || [], 'Kas bon aktif berhasil dimuat');
@@ -189,8 +197,11 @@ const listActiveKasBon = async (req, res) => {
 const createTransaction = async (req, res) => {
   const client = await req.tenantDb.connect();
   let referenceId = '';
+  let tenantId = '';
+  let hasSalesTenantColumn = false;
 
   try {
+    tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     const payload = { ...req.body };
     const clientProvidedId = typeof payload.id === 'string'
       ? payload.id.trim()
@@ -232,11 +243,19 @@ const createTransaction = async (req, res) => {
     await ensureSalesRecordsReferenceIdColumn(client);
     await ensureSalesRecordsCashierColumns(client);
     await ensureSalesRecordsKasBonColumns(client);
+    const salesRecordColumnDefinitions = await getTableColumnDefinitions(client, 'sales_records');
+    const salesRecordColumnSet = new Set(salesRecordColumnDefinitions.keys());
+    hasSalesTenantColumn = salesRecordColumnSet.has('tenant_id');
+    const productsColumnSet = await getTableColumnSet(client, 'products');
+    const hasProductsTenantColumn = productsColumnSet.has('tenant_id');
 
     if (referenceId) {
+      const hasSalesTenantColumn = salesRecordColumnSet.has('tenant_id');
       const existingResult = await client.query(
-        'SELECT * FROM sales_records WHERE reference_id = $1 LIMIT 1',
-        [referenceId],
+        hasSalesTenantColumn
+          ? 'SELECT * FROM sales_records WHERE reference_id = $1 AND tenant_id = $2 LIMIT 1'
+          : 'SELECT * FROM sales_records WHERE reference_id = $1 LIMIT 1',
+        hasSalesTenantColumn ? [referenceId, tenantId] : [referenceId],
       );
 
       if ((existingResult.rowCount || 0) > 0) {
@@ -247,8 +266,10 @@ const createTransaction = async (req, res) => {
 
     for (const item of transactionItems) {
       const currentResult = await client.query(
-        'SELECT id, name, stock, is_service FROM "products" WHERE id = $1 LIMIT 1 FOR UPDATE',
-        [item.productId],
+        hasProductsTenantColumn
+          ? 'SELECT id, name, stock, is_service FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
+          : 'SELECT id, name, stock, is_service FROM "products" WHERE id = $1 LIMIT 1 FOR UPDATE',
+        hasProductsTenantColumn ? [item.productId, tenantId] : [item.productId],
       );
 
       if ((currentResult.rowCount || 0) === 0) {
@@ -271,16 +292,18 @@ const createTransaction = async (req, res) => {
       }
 
       const updateResult = await client.query(
-        'UPDATE "products" SET stock = $1 WHERE id = $2 RETURNING *',
-        [nextStock, item.productId],
+        hasProductsTenantColumn
+          ? 'UPDATE "products" SET stock = $1 WHERE id = $2 AND tenant_id = $3 RETURNING *'
+          : 'UPDATE "products" SET stock = $1 WHERE id = $2 RETURNING *',
+        hasProductsTenantColumn ? [nextStock, item.productId, tenantId] : [nextStock, item.productId],
       );
       if ((updateResult.rowCount || 0) > 0) {
         inventoryUpdates.push(updateResult.rows[0]);
       }
     }
 
-    const salesRecordColumns = await getTableColumnDefinitions(client, 'sales_records');
-    const filteredPayload = normalizePayloadByColumnDefinitions(payload, salesRecordColumns);
+    const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, salesRecordColumnDefinitions);
+    const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, salesRecordColumnDefinitions);
 
     if (Object.keys(filteredPayload).length === 0) {
       throw new Error('Payload transaksi tidak cocok dengan schema sales_records tenant');
@@ -308,8 +331,10 @@ const createTransaction = async (req, res) => {
     if (error?.code === '23505' && referenceId) {
       try {
         const existingResult = await req.tenantDb.query(
-          'SELECT * FROM sales_records WHERE reference_id = $1 LIMIT 1',
-          [referenceId],
+          hasSalesTenantColumn
+            ? 'SELECT * FROM sales_records WHERE reference_id = $1 AND tenant_id = $2 LIMIT 1'
+            : 'SELECT * FROM sales_records WHERE reference_id = $1 LIMIT 1',
+          hasSalesTenantColumn ? [referenceId, tenantId] : [referenceId],
         );
 
         if ((existingResult.rowCount || 0) > 0) {
@@ -328,6 +353,7 @@ const settleKasBon = async (req, res) => {
   const client = await req.tenantDb.connect();
 
   try {
+    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     const id = req.params.id;
     const paidAmount = toNumber(req.body?.paid_amount ?? req.body?.amount);
 
@@ -372,8 +398,9 @@ const settleKasBon = async (req, res) => {
               remaining_balance
        FROM sales_records
        WHERE id = $1
+         ${columns.has('tenant_id') ? 'AND tenant_id = $2' : ''}
        FOR UPDATE`,
-      [id],
+      columns.has('tenant_id') ? [id, tenantId] : [id],
     );
 
     if (transactionResult.rowCount === 0) {
@@ -450,10 +477,14 @@ const settleKasBon = async (req, res) => {
       UPDATE sales_records
       SET ${updateClauses.join(', ')}
       WHERE id = $2
+        ${columns.has('tenant_id') ? `AND tenant_id = $${values.length + 1}` : ''}
       RETURNING *
     `;
 
-    const updateResult = await client.query(updateSql, values);
+    const updateResult = await client.query(
+      updateSql,
+      columns.has('tenant_id') ? [...values, tenantId] : values,
+    );
     await client.query('COMMIT');
 
     const updatedTransaction = updateResult.rows[0] || null;

@@ -8,7 +8,10 @@ const {
   buildDeleteQuery,
   buildUpsertQuery,
   getTableColumnDefinitions,
+  getTableColumnSet,
   normalizePayloadByColumnDefinitions,
+  enforceTenantIdOnPayload,
+  normalizeTenantId,
   runSelect,
 } = require('../utils/sqlHelpers');
 const { emitTableMutation } = require('../services/realtimeEmitter');
@@ -124,6 +127,7 @@ const validateProductUpdatePayload = async ({
   idField,
   idValue,
   payload,
+  tenantId,
 }) => {
   if (table !== 'products') {
     return;
@@ -132,7 +136,7 @@ const validateProductUpdatePayload = async ({
   const existing = await runSelect(tenantDb, table, {
     [`eq__${idField}`]: idValue,
     maybeSingle: true,
-  });
+  }, { tenantId });
 
   if (!existing) {
     throw createHttpError(404, 'Record tidak ditemukan');
@@ -182,7 +186,7 @@ const ensureProductsTableColumns = async (tenantDb, table) => {
   `);
 };
 
-const findExistingRecordByReferenceId = async (tenantDb, table, payload) => {
+const findExistingRecordByReferenceId = async (tenantDb, table, payload, tenantId) => {
   if (table !== 'products' || Array.isArray(payload) || !payload) {
     return null;
   }
@@ -199,7 +203,7 @@ const findExistingRecordByReferenceId = async (tenantDb, table, payload) => {
   return runSelect(tenantDb, table, {
     eq__reference_id: referenceId,
     maybeSingle: true,
-  });
+  }, { tenantId });
 };
 
 const isUndefinedCustomersTableError = (error, table) => {
@@ -274,9 +278,12 @@ const hasMutationFields = (payload) => {
   return !!payload && typeof payload === 'object' && Object.keys(payload).length > 0;
 };
 
+const resolveTenantId = (req) => normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+
 const listRecords = async (req, res) => {
   try {
     const table = req.params.table;
+    const tenantId = resolveTenantId(req);
 
     if (table === 'sales_records') {
       const primaryKeyColumn = await resolvePrimaryKeyColumn(req.tenantDb, table);
@@ -288,7 +295,7 @@ const listRecords = async (req, res) => {
       const rows = await runWithCustomersTableRetry(
         req.tenantDb,
         table,
-        () => runSelect(req.tenantDb, table, query),
+        () => runSelect(req.tenantDb, table, query, { tenantId }),
       );
 
       const normalizedRows = Array.isArray(rows)
@@ -304,7 +311,7 @@ const listRecords = async (req, res) => {
     const rows = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
-      () => runSelect(req.tenantDb, table, req.query),
+      () => runSelect(req.tenantDb, table, req.query, { tenantId }),
     );
     return jsonOk(res, rows);
   } catch (error) {
@@ -315,6 +322,7 @@ const listRecords = async (req, res) => {
 const createRecords = async (req, res) => {
   try {
     const table = req.params.table;
+    const tenantId = resolveTenantId(req);
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
@@ -326,7 +334,8 @@ const createRecords = async (req, res) => {
           { isCreate: true },
         );
         const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-        const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
+        const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+        const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
         if (!hasMutationFields(filteredPayload)) {
           throw createHttpError(400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
         }
@@ -334,6 +343,7 @@ const createRecords = async (req, res) => {
           req.tenantDb,
           table,
           filteredPayload,
+          tenantId,
         );
         if (existingRecord) {
           return {
@@ -375,6 +385,7 @@ const createRecords = async (req, res) => {
 const upsertRecords = async (req, res) => {
   try {
     const table = req.params.table;
+    const tenantId = resolveTenantId(req);
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
@@ -385,7 +396,8 @@ const upsertRecords = async (req, res) => {
           { isCreate: true },
         );
         const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-        const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
+        const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+        const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
         if (!hasMutationFields(filteredPayload)) {
           throw createHttpError(400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
         }
@@ -393,6 +405,7 @@ const upsertRecords = async (req, res) => {
           req.tenantDb,
           table,
           filteredPayload,
+          tenantId,
         );
         if (existingRecord) {
           return {
@@ -440,6 +453,7 @@ const upsertRecords = async (req, res) => {
 const updateRecordById = async (req, res) => {
   try {
     const table = req.params.table;
+    const tenantId = resolveTenantId(req);
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
@@ -451,29 +465,33 @@ const updateRecordById = async (req, res) => {
           { isCreate: false },
         );
         const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-        const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
+        const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+        const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
         await validateProductUpdatePayload({
           tenantDb: req.tenantDb,
           table,
           idField,
           idValue: req.params.id,
           payload: filteredPayload,
+          tenantId,
         });
         if (!hasMutationFields(filteredPayload)) {
           const existing = await runSelect(req.tenantDb, table, {
             [`eq__${idField}`]: req.params.id,
             maybeSingle: true,
-          });
+          }, { tenantId });
           return {
             rowCount: existing ? 1 : 0,
             rows: existing ? [existing] : [],
           };
         }
+        const columnSet = await getTableColumnSet(req.tenantDb, table);
         const { sql, values } = buildUpdateQuery(
           table,
           filteredPayload,
           idField,
           req.params.id,
+          { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
         );
         return req.tenantDb.query(sql, values);
       },
@@ -502,12 +520,19 @@ const updateRecordById = async (req, res) => {
 const deleteRecordById = async (req, res) => {
   try {
     const table = req.params.table;
+    const tenantId = resolveTenantId(req);
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
       async () => {
         const idField = req.query.idField || 'id';
-        const { sql, values } = buildDeleteQuery(table, idField, req.params.id);
+        const columnSet = await getTableColumnSet(req.tenantDb, table);
+        const { sql, values } = buildDeleteQuery(
+          table,
+          idField,
+          req.params.id,
+          { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
+        );
         return req.tenantDb.query(sql, values);
       },
     );

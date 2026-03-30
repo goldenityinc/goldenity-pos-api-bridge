@@ -1,5 +1,5 @@
 const { jsonOk, jsonError } = require('../utils/http');
-const { runSelect } = require('../utils/sqlHelpers');
+const { runSelect, normalizeTenantId } = require('../utils/sqlHelpers');
 
 const normalizeCategoriesQuery = (query = {}) => {
   const normalized = { ...query };
@@ -18,10 +18,12 @@ const normalizeCategoriesQuery = (query = {}) => {
 
 const getCategories = async (req, res) => {
   try {
+    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     const rows = await runSelect(
       req.tenantDb,
       'categories',
       normalizeCategoriesQuery(req.query),
+      { tenantId },
     );
     return jsonOk(res, rows);
   } catch (error) {

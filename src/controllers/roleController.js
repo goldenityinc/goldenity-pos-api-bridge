@@ -1,5 +1,6 @@
 const { jsonOk, jsonError } = require('../utils/http');
 const { randomUUID } = require('crypto');
+const { normalizeTenantId } = require('../utils/sqlHelpers');
 
 const normalizeRoleRow = (row) => ({
   ...row,
@@ -65,22 +66,34 @@ const ensureCustomRolesInfra = async (pool) => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS custom_roles (
       id          UUID PRIMARY KEY,
+      tenant_id   TEXT NOT NULL,
       name        VARCHAR(80) NOT NULL,
       description TEXT,
       is_default  BOOLEAN NOT NULL DEFAULT false,
       permissions JSONB NOT NULL DEFAULT '{}',
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE(name)
+      UNIQUE(tenant_id, name)
     )
   `);
+
+  await pool.query(
+    'ALTER TABLE custom_roles ADD COLUMN IF NOT EXISTS tenant_id TEXT',
+  );
 
   await pool.query(
     'ALTER TABLE custom_roles ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT false',
   );
 
   await pool.query(
+    'ALTER TABLE custom_roles ALTER COLUMN tenant_id SET NOT NULL',
+  ).catch(() => {});
+
+  await pool.query(
     'CREATE INDEX IF NOT EXISTS idx_custom_roles_is_default ON custom_roles(is_default)',
+  );
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS idx_custom_roles_tenant_id ON custom_roles(tenant_id)',
   );
 
   await pool.query(`
@@ -92,13 +105,16 @@ const ensureCustomRolesInfra = async (pool) => {
 const listRoles = async (req, res) => {
   try {
     const pool = req.db;
+    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     await ensureCustomRolesInfra(pool);
     const result = await pool.query(
       `
       SELECT id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
       FROM custom_roles
+      WHERE tenant_id = $1
       ORDER BY created_at ASC
       `,
+      [tenantId],
     );
 
     return jsonOk(res, result.rows.map(normalizeRoleRow));
@@ -110,6 +126,7 @@ const listRoles = async (req, res) => {
 const createRole = async (req, res) => {
   try {
     const pool = req.db;
+    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     await ensureCustomRolesInfra(pool);
     const { name, description = null, permissions } = req.body || {};
 
@@ -122,11 +139,11 @@ const createRole = async (req, res) => {
 
     const result = await pool.query(
       `
-      INSERT INTO custom_roles (id, name, description, permissions, is_default)
-      VALUES ($1, $2, $3, $4::jsonb, false)
+      INSERT INTO custom_roles (id, tenant_id, name, description, permissions, is_default)
+      VALUES ($1, $2, $3, $4, $5::jsonb, false)
       RETURNING id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
       `,
-      [randomUUID(), name.trim(), description, JSON.stringify(permissions)],
+      [randomUUID(), tenantId, name.trim(), description, JSON.stringify(permissions)],
     );
 
     return jsonOk(res, normalizeRoleRow(result.rows[0]), 'Role created', 201);
@@ -141,6 +158,7 @@ const createRole = async (req, res) => {
 const updateRole = async (req, res) => {
   try {
     const pool = req.db;
+    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     await ensureCustomRolesInfra(pool);
     const { id } = req.params;
     const { name, description, permissions } = req.body || {};
@@ -149,10 +167,10 @@ const updateRole = async (req, res) => {
       `
       SELECT id, name, description, permissions, COALESCE(is_default, false) AS is_default
       FROM custom_roles
-      WHERE id = $1
+      WHERE id = $1 AND tenant_id = $2
       LIMIT 1
       `,
-      [id],
+      [id, tenantId],
     );
 
     const existing = existingResult.rows[0];
@@ -177,10 +195,10 @@ const updateRole = async (req, res) => {
         `
         UPDATE custom_roles
         SET permissions = $2::jsonb, updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND tenant_id = $3
         RETURNING id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
         `,
-        [id, JSON.stringify(permissions)],
+        [id, JSON.stringify(permissions), tenantId],
       );
 
       return jsonOk(res, normalizeRoleRow(updatedDefault.rows[0]), 'Role updated');
@@ -196,10 +214,10 @@ const updateRole = async (req, res) => {
           description = $3,
           permissions = $4::jsonb,
           updated_at = NOW()
-      WHERE id = $1
+      WHERE id = $1 AND tenant_id = $5
       RETURNING id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
       `,
-      [id, safeName, safeDescription, JSON.stringify(permissions)],
+      [id, safeName, safeDescription, JSON.stringify(permissions), tenantId],
     );
 
     return jsonOk(res, normalizeRoleRow(updated.rows[0]), 'Role updated');
@@ -214,12 +232,13 @@ const updateRole = async (req, res) => {
 const deleteRole = async (req, res) => {
   try {
     const pool = req.db;
+    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     await ensureCustomRolesInfra(pool);
     const { id } = req.params;
 
     const existingResult = await pool.query(
-      'SELECT id, COALESCE(is_default, false) AS is_default FROM custom_roles WHERE id = $1 LIMIT 1',
-      [id],
+      'SELECT id, COALESCE(is_default, false) AS is_default FROM custom_roles WHERE id = $1 AND tenant_id = $2 LIMIT 1',
+      [id, tenantId],
     );
 
     const existing = existingResult.rows[0];
@@ -231,7 +250,7 @@ const deleteRole = async (req, res) => {
       return jsonError(res, 403, 'Role bawaan tidak boleh dihapus');
     }
 
-    await pool.query('DELETE FROM custom_roles WHERE id = $1', [id]);
+    await pool.query('DELETE FROM custom_roles WHERE id = $1 AND tenant_id = $2', [id, tenantId]);
     return jsonOk(res, null, 'Role deleted');
   } catch (error) {
     return jsonError(res, 500, 'Gagal menghapus role', error.message);
@@ -241,16 +260,17 @@ const deleteRole = async (req, res) => {
 const seedDefaultRoles = async (req, res) => {
   try {
     const pool = req.db;
+    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     await ensureCustomRolesInfra(pool);
 
     for (const role of defaultRolePayloads()) {
       await pool.query(
         `
-        INSERT INTO custom_roles (id, name, description, permissions, is_default)
-        VALUES ($1, $2, $3, $4::jsonb, true)
-        ON CONFLICT (name) DO NOTHING
+        INSERT INTO custom_roles (id, tenant_id, name, description, permissions, is_default)
+        VALUES ($1, $2, $3, $4, $5::jsonb, true)
+        ON CONFLICT (tenant_id, name) DO NOTHING
         `,
-        [randomUUID(), role.name, role.description, JSON.stringify(role.permissions)],
+        [randomUUID(), tenantId, role.name, role.description, JSON.stringify(role.permissions)],
       );
     }
 
@@ -258,8 +278,10 @@ const seedDefaultRoles = async (req, res) => {
       `
       SELECT id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
       FROM custom_roles
+      WHERE tenant_id = $1
       ORDER BY created_at ASC
       `,
+      [tenantId],
     );
 
     return jsonOk(res, result.rows.map(normalizeRoleRow), 'Default roles seeded');

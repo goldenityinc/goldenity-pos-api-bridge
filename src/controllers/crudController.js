@@ -8,7 +8,10 @@ const {
   buildUpdateQuery,
   buildDeleteQuery,
   getTableColumnDefinitions,
+  getTableColumnSet,
   normalizePayloadByColumnDefinitions,
+  enforceTenantIdOnPayload,
+  normalizeTenantId,
   runSelect,
 } = require('../utils/sqlHelpers');
 const {
@@ -66,7 +69,8 @@ async function normalizeUserPassword(table, payload, options = {}) {
 const createCrudController = (table) => ({
   list: async (req, res) => {
     try {
-      const rows = await runSelect(req.tenantDb, table, req.query);
+      const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+      const rows = await runSelect(req.tenantDb, table, req.query, { tenantId });
       return jsonOk(res, rows);
     } catch (error) {
       return jsonError(res, 500, error.message || 'Internal server error', error.message);
@@ -86,8 +90,10 @@ const createCrudController = (table) => ({
             arrayPayload.map((item) => normalizeUserPassword(table, item, { isCreate: true })),
           )
         : await normalizeUserPassword(table, parseBodyObject(req.body), { isCreate: true });
+      const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-      const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
+      const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+      const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
       const hasFields = Array.isArray(filteredPayload)
         ? filteredPayload.some((row) => row && typeof row === 'object' && Object.keys(row).length > 0)
         : !!filteredPayload && typeof filteredPayload === 'object' && Object.keys(filteredPayload).length > 0;
@@ -118,17 +124,26 @@ const createCrudController = (table) => ({
     try {
       const idField = req.query.idField || 'id';
       const payload = await normalizeUserPassword(table, parseBodyObject(req.body));
+      const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-      const filteredPayload = normalizePayloadByColumnDefinitions(payload, columnDefinitions);
+      const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+      const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
       const hasFields = !!filteredPayload && typeof filteredPayload === 'object' && Object.keys(filteredPayload).length > 0;
       if (!hasFields) {
         const existing = await runSelect(req.tenantDb, table, {
           [`eq__${idField}`]: req.params.id,
           maybeSingle: true,
-        });
+        }, { tenantId });
         return jsonOk(res, existing || null, 'Updated');
       }
-      const { sql, values } = buildUpdateQuery(table, filteredPayload, idField, req.params.id);
+      const columnSet = await getTableColumnSet(req.tenantDb, table);
+      const { sql, values } = buildUpdateQuery(
+        table,
+        filteredPayload,
+        idField,
+        req.params.id,
+        { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
+      );
       const result = await req.tenantDb.query(sql, values);
       emitTableMutation(req, {
         table,
@@ -148,7 +163,14 @@ const createCrudController = (table) => ({
   deleteById: async (req, res) => {
     try {
       const idField = req.query.idField || 'id';
-      const { sql, values } = buildDeleteQuery(table, idField, req.params.id);
+      const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+      const columnSet = await getTableColumnSet(req.tenantDb, table);
+      const { sql, values } = buildDeleteQuery(
+        table,
+        idField,
+        req.params.id,
+        { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
+      );
       const result = await req.tenantDb.query(sql, values);
       emitTableMutation(req, {
         table,

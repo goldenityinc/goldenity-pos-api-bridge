@@ -39,6 +39,76 @@ const parseBodyObject = (body) => {
   return {};
 };
 
+const TENANT_COLUMN = 'tenant_id';
+const TENANT_FILTER_KEYS = new Set([
+  `eq__${TENANT_COLUMN}`,
+  `neq__${TENANT_COLUMN}`,
+  `gte__${TENANT_COLUMN}`,
+  `lte__${TENANT_COLUMN}`,
+  `ilike__${TENANT_COLUMN}`,
+  `in__${TENANT_COLUMN}`,
+]);
+
+const TENANT_SCOPED_TABLES = new Set([
+  'products',
+  'sales_records',
+  'app_users',
+  'customers',
+  'suppliers',
+  'custom_roles',
+  'order_history',
+  'order_history_items',
+  'categories',
+  'expenses',
+  'daily_cash',
+  'restock_history',
+  'store_settings',
+]);
+
+const normalizeTenantId = (tenantId) => (tenantId ?? '').toString().trim();
+
+const isTenantScopedTable = (table) => TENANT_SCOPED_TABLES.has((table ?? '').toString().trim());
+
+const stripTenantFilters = (query = {}) => {
+  const next = { ...query };
+  for (const key of Object.keys(next)) {
+    if (TENANT_FILTER_KEYS.has(key)) {
+      delete next[key];
+    }
+  }
+  return next;
+};
+
+const enforceTenantIdOnPayload = (payload, tenantId, columnDefinitions) => {
+  if (!(columnDefinitions instanceof Map) || !columnDefinitions.has(TENANT_COLUMN)) {
+    return payload;
+  }
+
+  const normalizedTenantId = normalizeTenantId(tenantId);
+  if (!normalizedTenantId) {
+    throw new Error('Security guard: tenantId wajib tersedia untuk operasi write');
+  }
+
+  if (Array.isArray(payload)) {
+    return payload.map((row) => {
+      if (!row || typeof row !== 'object') return row;
+      return {
+        ...row,
+        [TENANT_COLUMN]: normalizedTenantId,
+      };
+    });
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    return payload;
+  }
+
+  return {
+    ...payload,
+    [TENANT_COLUMN]: normalizedTenantId,
+  };
+};
+
 const isValidIdentifier = (value) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 
 const quoteIdentifier = (value, label = 'identifier') => {
@@ -175,7 +245,7 @@ const buildInsertQuery = (table, payload) => {
   };
 };
 
-const buildUpdateQuery = (table, payload, idField, idValue) => {
+const buildUpdateQuery = (table, payload, idField, idValue, options = {}) => {
   const entries = Object.entries(payload || {});
   if (entries.length === 0) {
     throw new Error('Payload must contain at least one field');
@@ -188,17 +258,41 @@ const buildUpdateQuery = (table, payload, idField, idValue) => {
   });
 
   values.push(parseQueryValue(idValue));
+  const whereClauses = [`${quoteIdentifier(idField, 'column')} = $${values.length}`];
+
+  if (options.hasTenantColumn) {
+    const normalizedTenantId = normalizeTenantId(options.tenantId);
+    if (!normalizedTenantId) {
+      throw new Error('Security guard: tenantId wajib tersedia untuk operasi update');
+    }
+    values.push(normalizedTenantId);
+    whereClauses.push(`${quoteIdentifier(TENANT_COLUMN, 'column')} = $${values.length}`);
+  }
 
   return {
-    sql: `UPDATE ${quoteIdentifier(table, 'table')} SET ${setClauses.join(', ')} WHERE ${quoteIdentifier(idField, 'column')} = $${values.length} RETURNING *`,
+    sql: `UPDATE ${quoteIdentifier(table, 'table')} SET ${setClauses.join(', ')} WHERE ${whereClauses.join(' AND ')} RETURNING *`,
     values,
   };
 };
 
-const buildDeleteQuery = (table, idField, idValue) => ({
-  sql: `DELETE FROM ${quoteIdentifier(table, 'table')} WHERE ${quoteIdentifier(idField, 'column')} = $1 RETURNING *`,
-  values: [parseQueryValue(idValue)],
-});
+const buildDeleteQuery = (table, idField, idValue, options = {}) => {
+  const values = [parseQueryValue(idValue)];
+  const whereClauses = [`${quoteIdentifier(idField, 'column')} = $1`];
+
+  if (options.hasTenantColumn) {
+    const normalizedTenantId = normalizeTenantId(options.tenantId);
+    if (!normalizedTenantId) {
+      throw new Error('Security guard: tenantId wajib tersedia untuk operasi delete');
+    }
+    values.push(normalizedTenantId);
+    whereClauses.push(`${quoteIdentifier(TENANT_COLUMN, 'column')} = $${values.length}`);
+  }
+
+  return {
+    sql: `DELETE FROM ${quoteIdentifier(table, 'table')} WHERE ${whereClauses.join(' AND ')} RETURNING *`,
+    values,
+  };
+};
 
 const buildUpsertQuery = (table, payload, onConflictValue) => {
   const rows = Array.isArray(payload) ? payload : [payload];
@@ -338,8 +432,25 @@ const normalizePayloadByColumnDefinitions = (payload, columnDefinitions) => {
   return normalizeObjectByColumnDefinitions(payload, columnDefinitions);
 };
 
-const runSelect = async (tenantDb, table, query = {}) => {
-  const { sql, values } = buildSelectQuery(table, query);
+const runSelect = async (tenantDb, table, query = {}, options = {}) => {
+  const tenantId = normalizeTenantId(options.tenantId);
+  const columnSet = await getTableColumnSet(tenantDb, table);
+  const hasTenantColumn = columnSet.has(TENANT_COLUMN);
+
+  if (isTenantScopedTable(table) && !hasTenantColumn) {
+    throw new Error(`Security guard: tabel ${table} wajib memiliki kolom ${TENANT_COLUMN}`);
+  }
+
+  let scopedQuery = { ...query };
+  if (hasTenantColumn) {
+    if (!tenantId) {
+      throw new Error('Security guard: tenantId wajib tersedia untuk operasi read');
+    }
+    scopedQuery = stripTenantFilters(scopedQuery);
+    scopedQuery[`eq__${TENANT_COLUMN}`] = tenantId;
+  }
+
+  const { sql, values } = buildSelectQuery(table, scopedQuery);
   const result = await tenantDb.query(sql, values);
 
   if (toBool(query.single)) {
@@ -372,5 +483,8 @@ module.exports = {
   getTableColumnSet,
   filterPayloadByColumnSet,
   normalizePayloadByColumnDefinitions,
+  enforceTenantIdOnPayload,
+  normalizeTenantId,
+  isTenantScopedTable,
   runSelect,
 };

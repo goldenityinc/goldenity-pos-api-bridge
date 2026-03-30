@@ -1,6 +1,7 @@
 const { parse } = require('csv-parse/sync');
 const { jsonError, jsonOk } = require('../utils/http');
 const { emitTableMutation } = require('../services/realtimeEmitter');
+const { getTableColumnSet, normalizeTenantId } = require('../utils/sqlHelpers');
 
 const INVENTORY_CSV_HEADERS = [
   'Nama',
@@ -103,6 +104,9 @@ const downloadInventoryTemplate = async (_req, res) => {
 
 const exportInventoryCsv = async (req, res) => {
   try {
+    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const columnSet = await getTableColumnSet(req.tenantDb, 'products');
+    const hasTenantColumn = columnSet.has('tenant_id');
     const result = await req.tenantDb.query(
       `SELECT
           name,
@@ -112,7 +116,9 @@ const exportInventoryCsv = async (req, res) => {
           price,
           stock
        FROM "products"
+       ${hasTenantColumn ? 'WHERE tenant_id = $1' : ''}
        ORDER BY LOWER(COALESCE(name, '')) ASC, id ASC`,
+      hasTenantColumn ? [tenantId] : [],
     );
 
     const rows = (result.rows || []).map((row) => ({
@@ -137,6 +143,9 @@ const importInventoryCsv = async (req, res) => {
   }
 
   try {
+    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const columnSet = await getTableColumnSet(req.tenantDb, 'products');
+    const hasTenantColumn = columnSet.has('tenant_id');
     const parsedRows = parseInventoryCsvRows(req.file.buffer);
     if (parsedRows.length === 0) {
       return jsonError(res, 400, 'File CSV kosong atau tidak memiliki baris data');
@@ -188,9 +197,10 @@ const importInventoryCsv = async (req, res) => {
         `SELECT id
          FROM "products"
          WHERE barcode = $1
+           ${hasTenantColumn ? 'AND tenant_id = $2' : ''}
          ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, id DESC
          LIMIT 1`,
-        [barcode],
+        hasTenantColumn ? [barcode, tenantId] : [barcode],
       );
 
       if ((existingResult.rowCount || 0) > 0) {
@@ -205,8 +215,11 @@ const importInventoryCsv = async (req, res) => {
                stock = $6,
                updated_at = NOW()
            WHERE id = $7
+             ${hasTenantColumn ? 'AND tenant_id = $8' : ''}
            RETURNING *`,
-          [name, barcode, category || null, purchasePrice, sellingPrice, stock, existingId],
+          hasTenantColumn
+            ? [name, barcode, category || null, purchasePrice, sellingPrice, stock, existingId, tenantId]
+            : [name, barcode, category || null, purchasePrice, sellingPrice, stock, existingId],
         );
         emitTableMutation(req, {
           table: 'products',
@@ -226,9 +239,12 @@ const importInventoryCsv = async (req, res) => {
           purchase_price,
           price,
           stock
-        ) VALUES ($1, $2, $3, $4, $5, $6)
+          ${hasTenantColumn ? ', tenant_id' : ''}
+        ) VALUES ($1, $2, $3, $4, $5, $6${hasTenantColumn ? ', $7' : ''})
         RETURNING *`,
-        [name, barcode, category || null, purchasePrice, sellingPrice, stock],
+        hasTenantColumn
+          ? [name, barcode, category || null, purchasePrice, sellingPrice, stock, tenantId]
+          : [name, barcode, category || null, purchasePrice, sellingPrice, stock],
       );
 
       emitTableMutation(req, {

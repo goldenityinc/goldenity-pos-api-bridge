@@ -1,5 +1,5 @@
 const { jsonOk, jsonError } = require('../utils/http');
-const { getTableColumnSet } = require('../utils/sqlHelpers');
+const { getTableColumnSet, normalizeTenantId } = require('../utils/sqlHelpers');
 const { emitInventoryUpdated } = require('../services/realtimeEmitter');
 
 const normalizePositiveInteger = (value, fallback, { min = 0, max = 1000 } = {}) => {
@@ -66,6 +66,7 @@ const resolveProductsSyncExpressions = async (tenantDb) => {
 
 const getProducts = async (req, res) => {
   try {
+    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     const limit = normalizePositiveInteger(req.query?.limit, 500, {
       min: 1,
       max: 1000,
@@ -83,9 +84,15 @@ const getProducts = async (req, res) => {
 
     const values = [];
     let whereClause = '';
+    const productsColumns = await getTableColumnSet(req.tenantDb, 'products');
+    const hasTenantColumn = productsColumns.has('tenant_id');
+    if (hasTenantColumn) {
+      values.push(tenantId);
+      whereClause = ` WHERE tenant_id = $${values.length}`;
+    }
     if (lastSyncDate && syncExpressions.filterExpression) {
       values.push(lastSyncDate);
-      whereClause = ` WHERE ${syncExpressions.filterExpression} > $1`;
+      whereClause += hasTenantColumn ? ` AND ${syncExpressions.filterExpression} > $${values.length}` : ` WHERE ${syncExpressions.filterExpression} > $${values.length}`;
     }
 
     const countResult = await req.tenantDb.query(
@@ -130,6 +137,7 @@ const getProducts = async (req, res) => {
 
 const reduceStock = async (req, res) => {
   try {
+    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     const productId = req.params.id;
     const qty = Number(req.body?.qty);
     const reason = (req.body?.reason ?? '').toString().trim();
@@ -142,9 +150,13 @@ const reduceStock = async (req, res) => {
       return jsonError(res, 400, 'reason wajib diisi');
     }
 
+    const productsColumns = await getTableColumnSet(req.tenantDb, 'products');
+    const hasTenantColumn = productsColumns.has('tenant_id');
     const currentResult = await req.tenantDb.query(
-      'SELECT id, stock FROM "products" WHERE id = $1 LIMIT 1',
-      [productId],
+      hasTenantColumn
+        ? 'SELECT id, stock FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1'
+        : 'SELECT id, stock FROM "products" WHERE id = $1 LIMIT 1',
+      hasTenantColumn ? [productId, tenantId] : [productId],
     );
 
     if ((currentResult.rowCount || 0) === 0) {
@@ -166,8 +178,10 @@ const reduceStock = async (req, res) => {
 
     const newStock = currentStock - qty;
     const updateResult = await req.tenantDb.query(
-      'UPDATE "products" SET stock = $1 WHERE id = $2 RETURNING *',
-      [newStock, productId],
+      hasTenantColumn
+        ? 'UPDATE "products" SET stock = $1 WHERE id = $2 AND tenant_id = $3 RETURNING *'
+        : 'UPDATE "products" SET stock = $1 WHERE id = $2 RETURNING *',
+      hasTenantColumn ? [newStock, productId, tenantId] : [newStock, productId],
     );
 
     const updatedProduct = updateResult.rows[0] || null;
