@@ -58,6 +58,13 @@ const ensureSalesRecordsReferenceIdColumn = async (client) => {
   `);
 };
 
+const ensureSalesRecordsReceiptNumberColumn = async (client) => {
+  await client.query(`
+    ALTER TABLE sales_records
+    ADD COLUMN IF NOT EXISTS receipt_number TEXT;
+  `);
+};
+
 const ensureSalesRecordsCashierColumns = async (client) => {
   await client.query(`
     ALTER TABLE sales_records
@@ -241,6 +248,7 @@ const createTransaction = async (req, res) => {
 
     await client.query('BEGIN');
     await ensureSalesRecordsReferenceIdColumn(client);
+    await ensureSalesRecordsReceiptNumberColumn(client);
     await ensureSalesRecordsCashierColumns(client);
     await ensureSalesRecordsKasBonColumns(client);
     await ensureTenantScopedTable(client, 'sales_records', tenantId);
