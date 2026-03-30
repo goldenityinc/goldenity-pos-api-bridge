@@ -75,6 +75,7 @@ model Tenant {
   storeSettings       StoreSetting[]
   dailyCashRows       DailyCash[]
   pettyCashLogs       PettyCashLog[]
+  serviceOrders       ServiceOrder[]
   usersByTenantColumn User[]            @relation("UsersTenantSnake")
 
   @@map("tenants")
@@ -359,6 +360,28 @@ model PettyCashLog {
   @@index([tenantId, createdAt])
   @@index([userId])
   @@map("petty_cash_logs")
+}
+
+model ServiceOrder {
+  id            String   @id @default(cuid())
+  tenantId      String   @map("tenant_id")
+  customerName  String   @map("customer_name")
+  customerPhone String?  @map("customer_phone")
+  deviceType    String   @map("device_type")
+  deviceBrand   String?  @map("device_brand")
+  serialNumber  String?  @map("serial_number")
+  complaint     String
+  status        String   @default("PENDING")
+  estimatedCost Decimal? @map("estimated_cost") @db.Decimal(14, 2)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenant        Tenant   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@index([createdAt])
+  @@map("service_orders")
 }
 
 model Solution {

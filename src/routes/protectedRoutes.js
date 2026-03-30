@@ -9,6 +9,7 @@ const recordsRoutes = require('./recordsRoutes');
 const storageRoutes = require('./storageRoutes');
 const pettyCashRoutes = require('./pettyCashRoutes');
 const roleRoutes = require('./roleRoutes');
+const serviceOrderRoutes = require('./serviceOrderRoutes');
 const { createCrudTableRoutes } = require('./crudTableRoutes');
 const {
 	listActiveKasBon,
@@ -29,6 +30,8 @@ router.use('/shopping-list', orderHistoryItemsRoutes);
 router.use('/records', recordsRoutes);
 router.use('/storage', storageRoutes);
 router.use('/petty-cash', pettyCashRoutes);
+router.use('/api/service-orders', serviceOrderRoutes);
+router.use('/service-orders', serviceOrderRoutes);
 router.use('/api/roles', roleRoutes);
 router.use('/roles', roleRoutes);
 router.get('/kas-bon', listActiveKasBon);
