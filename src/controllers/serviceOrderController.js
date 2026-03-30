@@ -86,22 +86,34 @@ const createServiceOrder = async (req, res) => {
       return jsonError(res, 401, 'Tenant tidak valid');
     }
 
+    // Helper function to safely extract optional string fields (convert empty string to null)
+    const safeStringField = (value) => {
+      if (value === null || value === undefined) return null;
+      const trimmed = value.toString().trim();
+      return trimmed === '' ? null : trimmed;
+    };
+
+    // Required fields - always convert to string and trim
     const customerName = (req.body?.customerName ?? req.body?.customer_name ?? '')
-      .toString()
-      .trim();
-    const customerPhone = (req.body?.customerPhone ?? req.body?.customer_phone ?? '')
       .toString()
       .trim();
     const deviceType = (req.body?.deviceType ?? req.body?.device_type ?? '')
       .toString()
       .trim();
-    const deviceBrand = (req.body?.deviceBrand ?? req.body?.device_brand ?? '')
-      .toString()
-      .trim();
-    const serialNumber = (req.body?.serialNumber ?? req.body?.serial_number ?? '')
-      .toString()
-      .trim();
     const complaint = (req.body?.complaint ?? '').toString().trim();
+
+    // Optional fields - convert empty string/null to null
+    const customerPhone = safeStringField(
+      req.body?.customerPhone ?? req.body?.customer_phone,
+    );
+    const deviceBrand = safeStringField(
+      req.body?.deviceBrand ?? req.body?.device_brand,
+    );
+    const serialNumber = safeStringField(
+      req.body?.serialNumber ?? req.body?.serial_number,
+    );
+
+    // Numeric optional field
     const estimatedCostRaw = req.body?.estimatedCost ?? req.body?.estimated_cost;
     const estimatedCost =
       estimatedCostRaw === undefined || estimatedCostRaw === null || estimatedCostRaw === ''
@@ -139,10 +151,10 @@ const createServiceOrder = async (req, res) => {
          COALESCE($1, gen_random_uuid()::text),
          $2,
          $3,
-         NULLIF($4, ''),
+         $4,
          $5,
-         NULLIF($6, ''),
-         NULLIF($7, ''),
+         $6,
+         $7,
          $8,
          'PENDING',
          $9
@@ -168,7 +180,21 @@ const createServiceOrder = async (req, res) => {
       201,
     );
   } catch (error) {
-    return jsonError(res, 500, 'Gagal membuat service order', error.message);
+    console.error('[serviceOrderController.createServiceOrder] Error:', error);
+    console.error('Request body:', {
+      customerName: req.body?.customerName,
+      customerPhone: req.body?.customerPhone,
+      deviceType: req.body?.deviceType,
+      deviceBrand: req.body?.deviceBrand,
+      serialNumber: req.body?.serialNumber,
+      complaint: req.body?.complaint,
+      estimatedCost: req.body?.estimatedCost,
+    });
+    return jsonError(
+      res,
+      500,
+      error.message || 'Gagal membuat service order',
+    );
   } finally {
     client.release();
   }
@@ -211,7 +237,13 @@ const getServiceOrders = async (req, res) => {
       'Data service order berhasil dimuat',
     );
   } catch (error) {
-    return jsonError(res, 500, 'Gagal memuat service order', error.message);
+    console.error('[serviceOrderController.getServiceOrders] Error:', error);
+    console.error('Query params:', { status: req.query?.status });
+    return jsonError(
+      res,
+      500,
+      error.message || 'Gagal memuat service order',
+    );
   } finally {
     client.release();
   }
@@ -261,7 +293,16 @@ const updateServiceStatus = async (req, res) => {
       'Status service order berhasil diperbarui',
     );
   } catch (error) {
-    return jsonError(res, 500, 'Gagal memperbarui status service order', error.message);
+    console.error('[serviceOrderController.updateServiceStatus] Error:', error);
+    console.error('Request params:', {
+      id: req.params?.id,
+      newStatus: req.body?.status,
+    });
+    return jsonError(
+      res,
+      500,
+      error.message || 'Gagal memperbarui status service order',
+    );
   } finally {
     client.release();
   }
