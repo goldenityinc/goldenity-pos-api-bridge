@@ -3,70 +3,411 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider     = "postgresql"
+  url          = env("DATABASE_URL")
+  relationMode = "prisma"
 }
 
-enum PettyCashDirection {
-  IN
-  OUT
+enum UserRole {
+  SUPER_ADMIN
+  TENANT_ADMIN
+  CRM_MANAGER
+  CRM_STAFF
+  READ_ONLY
 }
 
-/// The `tenants` table is OWNED by goldenity-admin-core-api.
-/// @@ignore tells Prisma: "table exists in DB, do NOT manage or drop it from bridge."
+enum SubscriptionTier {
+  Standard
+  Professional
+  Enterprise
+  Custom
+}
+
+enum AppInstanceStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum AppRole {
+  OWNER
+  ADMIN
+  MANAGER
+  STAFF
+  VIEWER
+}
+
+enum SyncMode {
+  CLOUD_FIRST
+  LOCAL_FIRST
+  LOCAL_SERVER
+}
+
 model Tenant {
-  id   String  @id
-  slug String? @unique
+  id                  String            @id
+  name                String
+  slug                String            @unique
+  email               String?
+  phone               String?
+  address             String?
+  isActive            Boolean           @default(true) @map("isActive")
+  createdAt           DateTime          @default(now()) @map("createdAt")
+  updatedAt           DateTime          @map("updatedAt")
+  city                String?
+  country             String?
+  bridgeApiUrl        String?           @map("bridge_api_url")
+  logoUrl             String?           @map("logo_url")
+  logoObjectKey       String?           @map("logo_object_key")
+  showInventoryImages Boolean           @default(true) @map("show_inventory_images")
+
+  products            Product[]
+  categories          Category[]
+  transactions        Transaction[]
+  salesRecords        SalesRecord[]
+  customers           Customer[]
+  suppliers           Supplier[]
+  expenses            Expense[]
+  cashBons            CashBon[]
+  customRoles         CustomRole[]
+  appUsers            AppUser[]
+  orderHistories      OrderHistory[]
+  orderHistoryItems   OrderHistoryItem[]
+  restockHistories    RestockHistory[]
+  storeSettings       StoreSetting[]
+  dailyCashRows       DailyCash[]
+  pettyCashLogs       PettyCashLog[]
+  usersByTenantColumn User[]            @relation("UsersTenantSnake")
 
   @@map("tenants")
-  @@ignore
 }
 
 model Product {
-  id            String    @id @default(cuid())
-  tenantId      String    @map("tenant_id")
+  id            String    @id
+  tenantId      String?   @map("tenant_id")
   name          String
   barcode       String?
   category      String?
-  price         Float     @default(0)
+  price         Float?    @default(0)
   purchasePrice Float?    @map("purchase_price")
-  stock         Int       @default(0)
-  isService     Boolean   @default(false) @map("is_service")
+  stock         Int?      @default(0)
+  isService     Boolean?  @default(false) @map("is_service")
   supplierName  String?   @map("supplier_name")
   imageUrl      String?   @map("image_url")
   isActive      Boolean?  @default(true) @map("is_active")
   createdAt     DateTime? @default(now()) @map("created_at")
-  updatedAt     DateTime? @updatedAt @map("updated_at")
+  updatedAt     DateTime? @default(now()) @map("updated_at")
+  referenceId   String?   @map("reference_id")
+
+  tenant        Tenant?   @relation(fields: [tenantId], references: [id])
 
   @@index([tenantId])
   @@map("products")
 }
 
+model Category {
+  id        BigInt    @id @default(autoincrement())
+  tenantId  String?   @map("tenant_id")
+  name      String
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @default(now()) @map("updated_at")
+
+  tenant    Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("categories")
+}
+
+model Transaction {
+  id        BigInt    @id @default(autoincrement())
+  tenantId  String?   @map("tenant_id")
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @default(now()) @map("updated_at")
+
+  tenant    Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("transactions")
+}
+
+model SalesRecord {
+  id                 BigInt    @id @default(autoincrement())
+  tenantId           String?   @map("tenant_id")
+  referenceId        String?   @map("reference_id")
+  paymentMethod      String?   @map("payment_method")
+  paymentType        String?   @map("payment_type")
+  totalPrice         Decimal?  @map("total_price")
+  totalAmount        Decimal?  @map("total_amount")
+  remainingBalance   Decimal?  @map("remaining_balance")
+  outstandingBalance Decimal?  @map("outstanding_balance")
+  createdAt          DateTime? @default(now()) @map("created_at")
+  updatedAt          DateTime? @default(now()) @map("updated_at")
+
+  tenant             Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([referenceId])
+  @@map("sales_records")
+}
+
 model Customer {
   id         Int       @id @default(autoincrement())
-  tenantId   String    @map("tenant_id")
+  tenantId   String?   @map("tenant_id")
   name       String
   phone      String?
-  totalSpent Float     @default(0) @map("total_spent")
+  totalSpent Float?    @default(0) @map("total_spent")
   createdAt  DateTime? @default(now()) @map("created_at")
-  updatedAt  DateTime? @updatedAt @map("updated_at")
+  updatedAt  DateTime? @default(now()) @map("updated_at")
+
+  tenant     Tenant?   @relation(fields: [tenantId], references: [id])
 
   @@index([tenantId])
   @@map("customers")
 }
 
-/// Petty cash logs per tenant. tenantId stored as scalar (no FK to tenants table
-/// since tenants table is managed by admin-core, not bridge).
-model PettyCashLog {
-  id        String             @id @default(uuid()) @db.Uuid
-  tenantId  String             @map("tenant_id")
-  userId    String?            @map("user_id")
-  amount    Int
-  type      PettyCashDirection @default(IN)
-  notes     String?            @db.Text
-  createdAt DateTime           @default(now()) @map("created_at")
+model Supplier {
+  id        BigInt    @id @default(autoincrement())
+  tenantId  String?   @map("tenant_id")
+  name      String
+  phone     String?
+  address   String?
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @default(now()) @map("updated_at")
 
+  tenant    Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("suppliers")
+}
+
+model Expense {
+  id        BigInt    @id @default(autoincrement())
+  tenantId  String?   @map("tenant_id")
+  amount    Decimal?
+  notes     String?
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @default(now()) @map("updated_at")
+
+  tenant    Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("expenses")
+}
+
+model CashBon {
+  id        BigInt    @id @default(autoincrement())
+  tenantId  String?   @map("tenant_id")
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @default(now()) @map("updated_at")
+
+  tenant    Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("kas_bon")
+}
+
+model CustomRole {
+  id          String   @id
+  tenantId    String   @map("tenant_id")
+  name        String
+  description String?
+  permissions Json
+  isDefault   Boolean  @default(false) @map("is_default")
+  createdAt   DateTime @default(now()) @map("createdAt")
+  updatedAt   DateTime @map("updatedAt")
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@unique([tenantId, name])
+  @@map("custom_roles")
+}
+
+model AppUser {
+  id           BigInt    @id @default(autoincrement())
+  tenantId     String?   @map("tenant_id")
+  username     String
+  password     String?
+  name         String?
+  role         String?
+  customRoleId String?   @map("custom_role_id")
+  isActive     Boolean?  @default(true) @map("is_active")
+  createdAt    DateTime? @default(now()) @map("created_at")
+  updatedAt    DateTime? @default(now()) @map("updated_at")
+
+  tenant       Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([username])
+  @@map("app_users")
+}
+
+model User {
+  id            String          @id
+  firebaseUid   String?         @map("firebaseUid")
+  email         String?
+  name          String
+  role          UserRole        @default(CRM_STAFF)
+  tenantId      String          @map("tenantId")
+  isActive      Boolean         @default(true) @map("isActive")
+  createdAt     DateTime        @default(now()) @map("createdAt")
+  updatedAt     DateTime        @map("updatedAt")
+  passwordHash  String?         @map("passwordHash")
+  username      String?
+  customRoleId  String?         @map("custom_role_id")
+  tenantIdSnake String?         @map("tenant_id")
+
+  tenant        Tenant?         @relation("UsersTenantSnake", fields: [tenantIdSnake], references: [id])
+  appAccesses   UserAppAccess[]
+
+  @@index([tenantIdSnake])
+  @@index([tenantId])
+  @@index([username])
+  @@index([email])
+  @@map("users")
+}
+
+model OrderHistory {
+  id           BigInt    @id @default(autoincrement())
+  tenantId     String?   @map("tenant_id")
+  supplierName String    @map("supplier_name")
+  supplierPhone String?  @map("supplier_phone")
+  messageBody  String?   @map("message_body")
+  createdAt    DateTime? @default(now()) @map("created_at")
+
+  tenant       Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("order_history")
+}
+
+model OrderHistoryItem {
+  id                    BigInt    @id @default(autoincrement())
+  tenantId              String?   @map("tenant_id")
+  orderHistoryId        BigInt?   @map("order_history_id")
+  isManual              Boolean?  @default(false) @map("is_manual")
+  productId             BigInt?   @map("product_id")
+  manualItemId          BigInt?   @map("manual_item_id")
+  itemName              String    @map("item_name")
+  qty                   Int?      @default(1)
+  notes                 String?
+  supplierName          String?   @map("supplier_name")
+  orderedAt             DateTime? @default(now()) @map("ordered_at")
+  isArchived            Boolean?  @default(false) @map("is_archived")
+  isReceived            Boolean?  @default(false) @map("is_received")
+  receivedAt            DateTime? @map("received_at")
+  receivedQty           Int?      @map("received_qty")
+  receivedPurchasePrice Int?      @map("received_purchase_price")
+  createdAt             DateTime? @default(now()) @map("created_at")
+
+  tenant                Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([orderHistoryId])
+  @@map("order_history_items")
+}
+
+model RestockHistory {
+  id        BigInt    @id @default(autoincrement())
+  tenantId  String?   @map("tenant_id")
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @default(now()) @map("updated_at")
+
+  tenant    Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("restock_history")
+}
+
+model StoreSetting {
+  id        BigInt    @id @default(autoincrement())
+  tenantId  String?   @map("tenant_id")
+  key       String?
+  value     String?
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @default(now()) @map("updated_at")
+
+  tenant    Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("store_settings")
+}
+
+model DailyCash {
+  id        BigInt    @id @default(autoincrement())
+  tenantId  String?   @map("tenant_id")
+  amount    Decimal?
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @default(now()) @map("updated_at")
+
+  tenant    Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("daily_cash")
+}
+
+model PettyCashLog {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId  String?   @map("tenant_id")
+  userId    String?   @map("user_id")
+  amount    Int?
+  type      String?
+  notes     String?
+  createdAt DateTime? @default(now()) @map("created_at")
+
+  tenant    Tenant?   @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
   @@index([tenantId, createdAt])
   @@index([userId])
   @@map("petty_cash_logs")
+}
+
+model Solution {
+  id          String        @id
+  name        String
+  code        String        @unique
+  description String?
+  isActive    Boolean       @default(true) @map("isActive")
+  createdAt   DateTime      @default(now()) @map("createdAt")
+  updatedAt   DateTime      @map("updatedAt")
+
+  appInstances AppInstance[]
+
+  @@map("solutions")
+}
+
+model AppInstance {
+  id                 String            @id
+  tenantId           String            @map("tenantId")
+  solutionId         String            @map("solutionId")
+  tier               SubscriptionTier
+  status             AppInstanceStatus @default(ACTIVE)
+  dbConnectionString String?
+  appUrl             String?
+  createdAt          DateTime          @default(now()) @map("createdAt")
+  updatedAt          DateTime          @map("updatedAt")
+  endDate            DateTime?         @map("end_date")
+  syncMode           SyncMode          @default(CLOUD_FIRST) @map("sync_mode")
+
+  solution           Solution          @relation(fields: [solutionId], references: [id])
+  userAccesses       UserAppAccess[]
+
+  @@index([tenantId])
+  @@index([solutionId])
+  @@map("app_instances")
+}
+
+model UserAppAccess {
+  id            String     @id
+  userId        String     @map("userId")
+  appInstanceId String     @map("appInstanceId")
+  role          AppRole    @default(STAFF)
+  isActive      Boolean    @default(true) @map("isActive")
+  createdAt     DateTime   @default(now()) @map("createdAt")
+  updatedAt     DateTime   @map("updatedAt")
+
+  user          User       @relation(fields: [userId], references: [id])
+  appInstance   AppInstance @relation(fields: [appInstanceId], references: [id])
+
+  @@index([appInstanceId])
+  @@map("user_app_accesses")
 }
