@@ -93,6 +93,15 @@ const ensureCustomRolesInfra = async (pool) => {
     'ALTER TABLE custom_roles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()',
   );
 
+  // Prisma-created tables use camelCase column names ("createdAt", "updatedAt").
+  // If those columns exist but lack a DEFAULT, INSERTs that omit them violate NOT NULL.
+  // Safely add defaults on both naming conventions so the controller INSERT works
+  // regardless of which naming convention was used when the table was created.
+  await pool.query('ALTER TABLE custom_roles ALTER COLUMN created_at SET DEFAULT NOW()').catch(() => {});
+  await pool.query('ALTER TABLE custom_roles ALTER COLUMN updated_at SET DEFAULT NOW()').catch(() => {});
+  await pool.query('ALTER TABLE custom_roles ALTER COLUMN "createdAt" SET DEFAULT NOW()').catch(() => {});
+  await pool.query('ALTER TABLE custom_roles ALTER COLUMN "updatedAt" SET DEFAULT NOW()').catch(() => {});
+
   await pool.query(
     'ALTER TABLE custom_roles ALTER COLUMN tenant_id SET NOT NULL',
   ).catch(() => {});
