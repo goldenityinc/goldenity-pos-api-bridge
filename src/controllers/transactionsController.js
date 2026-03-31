@@ -527,6 +527,9 @@ const createTransaction = async (req, res) => {
 
       const nextStock = currentStock - item.qty;
       if (nextStock < 0) {
+        console.warn(
+          `⚠️ STOCK INSUFFICIENT: Product=${currentProduct.name}, ID=${item.productId}, Current=${currentStock}, Requested=${item.qty}, Tenant=${tenantId}`,
+        );
         throw new Error(`Stok produk ${currentProduct.name || item.productId} tidak mencukupi`);
       }
 
@@ -586,6 +589,15 @@ const createTransaction = async (req, res) => {
     return jsonOk(res, savedTransaction, 'Transaction saved', 201);
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
+
+    console.error(
+      `❌ Transaction Creation Error [Tenant=${tenantId}, Ref=${referenceId}]: ${error.message}`,
+      {
+        code: error?.code,
+        constraint: error?.constraint,
+        stack: error?.stack,
+      },
+    );
 
     if (error?.code === '23505' && referenceId) {
       try {

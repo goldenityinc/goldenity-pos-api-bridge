@@ -19,6 +19,102 @@ const normalizeStatus = (value) => (value ?? '')
   .trim()
   .toUpperCase();
 
+const parseJsonField = (value) => {
+  if (value == null) return null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+      return JSON.parse(trimmed);
+    } catch (_) {
+      return value;
+    }
+  }
+  return value;
+};
+
+const normalizeServiceDetails = (rawValue) => {
+  if (rawValue === undefined) {
+    return { hasValue: false, value: null, error: null };
+  }
+
+  if (rawValue === null || rawValue === '') {
+    return { hasValue: true, value: null, error: null };
+  }
+
+  let parsed = rawValue;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch (error) {
+      return {
+        hasValue: true,
+        value: null,
+        error: 'serviceDetails harus berupa JSON array valid',
+      };
+    }
+  }
+
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    parsed = parsed.items ?? parsed.details ?? parsed.serviceDetails ?? parsed.data;
+  }
+
+  if (!Array.isArray(parsed)) {
+    return {
+      hasValue: true,
+      value: null,
+      error: 'serviceDetails harus berupa array item biaya',
+    };
+  }
+
+  const normalizedItems = [];
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+
+    const itemName = (item.itemName ?? item.item_name ?? '')
+      .toString()
+      .trim();
+    const priceRaw = item.price ?? item.amount ?? item.cost;
+    const price = Number(priceRaw ?? 0);
+
+    if (!itemName) {
+      return {
+        hasValue: true,
+        value: null,
+        error: 'serviceDetails.itemName tidak boleh kosong',
+      };
+    }
+    if (!Number.isFinite(price) || price < 0) {
+      return {
+        hasValue: true,
+        value: null,
+        error: 'serviceDetails.price harus berupa angka >= 0',
+      };
+    }
+
+    normalizedItems.push({
+      itemName,
+      price,
+    });
+  }
+
+  return {
+    hasValue: true,
+    value: normalizedItems,
+    error: null,
+  };
+};
+
+const sumServiceDetails = (serviceDetails) => {
+  if (!Array.isArray(serviceDetails)) return 0;
+  return serviceDetails.reduce((sum, item) => {
+    const price = Number(item?.price ?? 0);
+    return Number.isFinite(price) ? sum + price : sum;
+  }, 0);
+};
+
 const ensureServiceOrdersTable = async (client) => {
   // Create table if not exists with proper defaults
   await client.query(`
@@ -34,6 +130,7 @@ const ensureServiceOrdersTable = async (client) => {
       status TEXT NOT NULL DEFAULT 'PENDING',
       estimated_cost NUMERIC(14,2),
       technician_notes TEXT,
+      service_details JSONB,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -46,6 +143,15 @@ const ensureServiceOrdersTable = async (client) => {
     `);
   } catch (err) {
     console.warn('[ensureServiceOrdersTable] technician_notes ALTER warning:', err.message);
+  }
+
+  try {
+    await client.query(`
+      ALTER TABLE service_orders
+      ADD COLUMN IF NOT EXISTS service_details JSONB
+    `);
+  } catch (err) {
+    console.warn('[ensureServiceOrdersTable] service_details ALTER warning:', err.message);
   }
 
   // Fix existing table schema if needed - ensure timestamp columns have defaults
@@ -112,6 +218,8 @@ const mapRow = (row = {}) => ({
   estimated_cost: row.estimated_cost === null ? null : Number(row.estimated_cost),
   technicianNotes: row.technician_notes,
   technician_notes: row.technician_notes,
+  serviceDetails: parseJsonField(row.service_details),
+  service_details: parseJsonField(row.service_details),
   createdAt: row.created_at,
   created_at: row.created_at,
   updatedAt: row.updated_at,
@@ -155,13 +263,25 @@ const createServiceOrder = async (req, res) => {
     const technicianNotes = safeStringField(
       req.body?.technicianNotes ?? req.body?.technician_notes,
     );
+    const serviceDetailsRaw = req.body?.serviceDetails
+      ?? req.body?.service_details
+      ?? req.body?.serviceDetailsJson
+      ?? req.body?.service_details_json;
+    const serviceDetailsInput = normalizeServiceDetails(serviceDetailsRaw);
+    if (serviceDetailsInput.error) {
+      return jsonError(res, 400, serviceDetailsInput.error);
+    }
 
     // Numeric optional field
     const estimatedCostRaw = req.body?.estimatedCost ?? req.body?.estimated_cost;
-    const estimatedCost =
+    let estimatedCost =
       estimatedCostRaw === undefined || estimatedCostRaw === null || estimatedCostRaw === ''
         ? null
         : Number(estimatedCostRaw);
+
+    if (estimatedCost === null && serviceDetailsInput.hasValue && Array.isArray(serviceDetailsInput.value)) {
+      estimatedCost = sumServiceDetails(serviceDetailsInput.value);
+    }
 
     if (!customerName) {
       return jsonError(res, 400, 'customerName wajib diisi');
@@ -190,7 +310,8 @@ const createServiceOrder = async (req, res) => {
          complaint,
          status,
          estimated_cost,
-         technician_notes
+         technician_notes,
+         service_details
        ) VALUES (
          COALESCE($1, gen_random_uuid()::text),
          $2,
@@ -202,7 +323,8 @@ const createServiceOrder = async (req, res) => {
          $8,
          'PENDING',
          $9,
-         $10
+         $10,
+         $11
        )
        RETURNING *`,
       [
@@ -216,6 +338,7 @@ const createServiceOrder = async (req, res) => {
         complaint,
         estimatedCost,
         technicianNotes,
+        serviceDetailsInput.hasValue ? serviceDetailsInput.value : null,
       ],
     );
 
@@ -236,6 +359,7 @@ const createServiceOrder = async (req, res) => {
       complaint: req.body?.complaint,
       estimatedCost: req.body?.estimatedCost,
       technicianNotes: req.body?.technicianNotes,
+      serviceDetails: req.body?.serviceDetails,
     });
     return jsonError(
       res,
@@ -304,10 +428,18 @@ const updateServiceOrder = async (req, res) => {
     const id = (req.params?.id ?? '').toString().trim();
     const nextStatusRaw = req.body?.status;
     const nextStatus = nextStatusRaw == null ? null : normalizeStatus(nextStatusRaw);
-    const estimatedCostRaw = req.body?.estimatedCost ?? req.body?.estimated_cost;
+    let estimatedCostRaw = req.body?.estimatedCost ?? req.body?.estimated_cost;
     const technicianNotes = safeStringField(
       req.body?.technicianNotes ?? req.body?.technician_notes,
     );
+    const serviceDetailsRaw = req.body?.serviceDetails
+      ?? req.body?.service_details
+      ?? req.body?.serviceDetailsJson
+      ?? req.body?.service_details_json;
+    const serviceDetailsInput = normalizeServiceDetails(serviceDetailsRaw);
+    if (serviceDetailsInput.error) {
+      return jsonError(res, 400, serviceDetailsInput.error);
+    }
 
     if (!tenantId) {
       return jsonError(res, 401, 'Tenant tidak valid');
@@ -324,6 +456,12 @@ const updateServiceOrder = async (req, res) => {
     }
 
     let estimatedCost;
+    if (estimatedCostRaw === undefined && serviceDetailsInput.hasValue) {
+      estimatedCostRaw = serviceDetailsInput.value === null
+        ? null
+        : sumServiceDetails(serviceDetailsInput.value);
+    }
+
     if (
       estimatedCostRaw === undefined ||
       estimatedCostRaw === null ||
@@ -358,11 +496,16 @@ const updateServiceOrder = async (req, res) => {
       fields.push(`technician_notes = $${params.length}`);
     }
 
+    if (serviceDetailsInput.hasValue) {
+      params.push(serviceDetailsInput.value);
+      fields.push(`service_details = $${params.length}`);
+    }
+
     if (!fields.length) {
       return jsonError(
         res,
         400,
-        'Minimal satu field harus diupdate: status, estimatedCost, atau technicianNotes',
+        'Minimal satu field harus diupdate: status, estimatedCost, technicianNotes, atau serviceDetails',
       );
     }
 
@@ -394,6 +537,7 @@ const updateServiceOrder = async (req, res) => {
       status: req.body?.status,
       estimatedCost: req.body?.estimatedCost,
       technicianNotes: req.body?.technicianNotes,
+      serviceDetails: req.body?.serviceDetails,
     });
     return jsonError(
       res,
