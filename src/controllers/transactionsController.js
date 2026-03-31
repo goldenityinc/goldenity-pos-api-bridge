@@ -73,6 +73,13 @@ const ensureSalesRecordsCashierColumns = async (client) => {
   `);
 };
 
+const ensureSalesRecordsCustomerColumn = async (client) => {
+  await client.query(`
+    ALTER TABLE sales_records
+    ADD COLUMN IF NOT EXISTS customer_name TEXT;
+  `);
+};
+
 const ensureSalesRecordsKasBonColumns = async (client) => {
   await client.query(`
     ALTER TABLE sales_records
@@ -393,6 +400,7 @@ const listActiveKasBon = async (req, res) => {
   try {
     const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     await ensureTenantScopedTable(client, 'sales_records', tenantId);
+    await ensureSalesRecordsCustomerColumn(client);
     const columnsResult = await client.query(
       `SELECT column_name
        FROM information_schema.columns
@@ -511,6 +519,7 @@ const createTransaction = async (req, res) => {
     await ensureSalesRecordsReferenceIdColumn(client);
     await ensureSalesRecordsReceiptNumberColumn(client);
     await ensureSalesRecordsCashierColumns(client);
+    await ensureSalesRecordsCustomerColumn(client);
     await ensureSalesRecordsKasBonColumns(client);
     await ensureSalesRecordsItemsColumn(client);
     await ensureSalesRecordItemsTable(client);
