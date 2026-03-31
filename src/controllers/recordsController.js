@@ -285,6 +285,86 @@ const hasMutationFields = (payload) => {
 
 const resolveTenantId = (req) => normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
 
+const normalizeSalesRecordId = (value) => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const parseItemsFromJsonField = (value) => {
+  if (!value) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  return [];
+};
+
+const loadSalesRecordItemsMap = async (tenantDb, rows, tenantId) => {
+  const ids = rows
+    .map((row) => normalizeSalesRecordId(row?.id))
+    .filter((id) => id !== null);
+
+  if (ids.length === 0) {
+    return new Map();
+  }
+
+  try {
+    const normalizedTenantId = normalizeTenantId(tenantId);
+    const result = await tenantDb.query(
+      normalizedTenantId
+        ? `SELECT sales_record_id, product_id, product_name, qty, custom_price, note, is_service
+           FROM sales_record_items
+           WHERE tenant_id = $1
+             AND sales_record_id = ANY($2::bigint[])
+           ORDER BY id ASC`
+        : `SELECT sales_record_id, product_id, product_name, qty, custom_price, note, is_service
+           FROM sales_record_items
+           WHERE sales_record_id = ANY($1::bigint[])
+           ORDER BY id ASC`,
+      normalizedTenantId ? [normalizedTenantId, ids] : [ids],
+    );
+
+    const grouped = new Map();
+    for (const row of result.rows || []) {
+      const key = Number(row.sales_record_id);
+      if (!grouped.has(key)) {
+        grouped.set(key, []);
+      }
+      grouped.get(key).push({
+        product_id: row.product_id || null,
+        product_name: row.product_name || '',
+        qty: Number(row.qty || 0),
+        custom_price: row.custom_price === null ? null : Number(row.custom_price),
+        note: (row.note || '').toString(),
+        is_service: row.is_service === true,
+      });
+    }
+
+    return grouped;
+  } catch (_) {
+    return new Map();
+  }
+};
+
 const listRecords = async (req, res) => {
   try {
     const table = req.params.table;
@@ -310,7 +390,26 @@ const listRecords = async (req, res) => {
         }))
         : rows;
 
-      return jsonOk(res, normalizedRows);
+      const itemsMap = await loadSalesRecordItemsMap(
+        req.tenantDb,
+        Array.isArray(normalizedRows) ? normalizedRows : [],
+        tenantId,
+      );
+
+      const hydratedRows = Array.isArray(normalizedRows)
+        ? normalizedRows.map((row) => {
+          const rowId = normalizeSalesRecordId(row?.id);
+          const relationItems = rowId !== null ? itemsMap.get(rowId) || [] : [];
+          return {
+            ...row,
+            items: relationItems.length > 0
+              ? relationItems
+              : parseItemsFromJsonField(row?.items_json ?? row?.items),
+          };
+        })
+        : normalizedRows;
+
+      return jsonOk(res, hydratedRows);
     }
 
     const rows = await runWithCustomersTableRetry(

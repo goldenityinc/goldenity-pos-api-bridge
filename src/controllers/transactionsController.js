@@ -143,6 +143,211 @@ const normalizeTransactionItems = (items) => {
     .filter(Boolean);
 };
 
+const normalizeTransactionItemsWithNotes = (items) => {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return null;
+      }
+
+      const product = item.product && typeof item.product === 'object'
+        ? item.product
+        : {};
+      const productId = (
+        item.product_id ?? item.productId ?? product.id ?? ''
+      ).toString().trim();
+      const productName = (
+        item.product_name ?? item.productName ?? product.name ?? ''
+      ).toString().trim();
+      const note = (item.note ?? item.item_note ?? item.product_note ?? '')
+        .toString()
+        .trim();
+      const customPrice = toNumber(
+        item.custom_price ?? item.customPrice ?? item.price ?? item.unit_price ?? 0,
+      );
+      const qty = toPositiveInteger(item.qty ?? item.quantity);
+      if (qty === null) {
+        return null;
+      }
+
+      const isService =
+        item.is_service === true ||
+        item.isService === true ||
+        item.is_custom_item === true ||
+        item.isCustomItem === true ||
+        product.is_service === true ||
+        product.isService === true ||
+        product.is_custom_item === true ||
+        product.isCustomItem === true;
+
+      if (!productId && !isService) {
+        return null;
+      }
+
+      return {
+        productId,
+        productName,
+        qty,
+        customPrice: Number.isFinite(customPrice) && customPrice > 0 ? customPrice : undefined,
+        note,
+        isService,
+      };
+    })
+    .filter(Boolean);
+};
+
+const ensureSalesRecordsItemsColumn = async (client) => {
+  await client.query(`
+    ALTER TABLE sales_records
+    ADD COLUMN IF NOT EXISTS items_json JSONB;
+  `);
+};
+
+const ensureSalesRecordItemsTable = async (client) => {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS sales_record_items (
+      id BIGSERIAL PRIMARY KEY,
+      tenant_id TEXT,
+      sales_record_id BIGINT NOT NULL,
+      product_id TEXT,
+      product_name TEXT,
+      qty INTEGER NOT NULL DEFAULT 1,
+      custom_price NUMERIC(14,2),
+      note TEXT,
+      is_service BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS idx_sales_record_items_sales_record_id
+    ON sales_record_items (sales_record_id);
+  `);
+
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS idx_sales_record_items_tenant_id
+    ON sales_record_items (tenant_id);
+  `);
+};
+
+const toStoredSalesRecordItems = (items) => {
+  return normalizeTransactionItemsWithNotes(items).map((item) => ({
+    product_id: item.productId || null,
+    product_name: item.productName || null,
+    qty: item.qty,
+    custom_price: Number.isFinite(item.customPrice) ? item.customPrice : null,
+    note: item.note || null,
+    is_service: item.isService === true,
+  }));
+};
+
+const parseItemsFromJsonField = (value) => {
+  if (!value) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  return [];
+};
+
+const loadSalesRecordItems = async (client, salesRecordId, tenantId = '') => {
+  const normalizedTenantId = normalizeTenantId(tenantId);
+  try {
+    await ensureSalesRecordItemsTable(client);
+    const result = await client.query(
+      normalizedTenantId
+        ? `SELECT product_id, product_name, qty, custom_price, note, is_service
+           FROM sales_record_items
+           WHERE sales_record_id = $1
+             AND tenant_id = $2
+           ORDER BY id ASC`
+        : `SELECT product_id, product_name, qty, custom_price, note, is_service
+           FROM sales_record_items
+           WHERE sales_record_id = $1
+           ORDER BY id ASC`,
+      normalizedTenantId ? [salesRecordId, normalizedTenantId] : [salesRecordId],
+    );
+
+    return (result.rows || []).map((row) => ({
+      product_id: row.product_id || null,
+      product_name: row.product_name || '',
+      qty: Number(row.qty || 0),
+      custom_price: row.custom_price === null ? null : Number(row.custom_price),
+      note: (row.note || '').toString(),
+      is_service: row.is_service === true,
+    }));
+  } catch (_) {
+    return [];
+  }
+};
+
+const syncSalesRecordItems = async (client, salesRecordId, tenantId, items) => {
+  const normalizedTenantId = normalizeTenantId(tenantId);
+  if (!Number.isFinite(Number(salesRecordId))) {
+    return;
+  }
+
+  await ensureSalesRecordItemsTable(client);
+
+  await client.query(
+    normalizedTenantId
+      ? 'DELETE FROM sales_record_items WHERE sales_record_id = $1 AND tenant_id = $2'
+      : 'DELETE FROM sales_record_items WHERE sales_record_id = $1',
+    normalizedTenantId ? [salesRecordId, normalizedTenantId] : [salesRecordId],
+  );
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return;
+  }
+
+  for (const item of items) {
+    await client.query(
+      `INSERT INTO sales_record_items (
+         tenant_id,
+         sales_record_id,
+         product_id,
+         product_name,
+         qty,
+         custom_price,
+         note,
+         is_service,
+         updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+      [
+        normalizedTenantId || null,
+        salesRecordId,
+        item.product_id || null,
+        item.product_name || null,
+        Number.isInteger(Number(item.qty)) ? Number(item.qty) : 1,
+        Number.isFinite(Number(item.custom_price)) ? Number(item.custom_price) : null,
+        item.note || null,
+        item.is_service === true,
+      ],
+    );
+  }
+};
+
 const ensureKasBonHistoryTable = async (client) => {
   await client.query(`
     CREATE TABLE IF NOT EXISTS kas_bon_payment_history (
@@ -263,12 +468,15 @@ const createTransaction = async (req, res) => {
     }
     const inventoryUpdates = [];
     const transactionItems = normalizeTransactionItems(payload.items);
+    const storedItems = toStoredSalesRecordItems(payload.items);
 
     await client.query('BEGIN');
     await ensureSalesRecordsReferenceIdColumn(client);
     await ensureSalesRecordsReceiptNumberColumn(client);
     await ensureSalesRecordsCashierColumns(client);
     await ensureSalesRecordsKasBonColumns(client);
+    await ensureSalesRecordsItemsColumn(client);
+    await ensureSalesRecordItemsTable(client);
     await ensureTenantScopedTable(client, 'sales_records', tenantId);
     await ensureTenantScopedTable(client, 'products', tenantId);
     const salesRecordColumnDefinitions = await getTableColumnDefinitions(client, 'sales_records');
@@ -336,15 +544,35 @@ const createTransaction = async (req, res) => {
     const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, salesRecordColumnDefinitions);
     const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, salesRecordColumnDefinitions);
 
+    if (storedItems.length > 0) {
+      filteredPayload.items_json = JSON.stringify(storedItems);
+    }
+
     if (Object.keys(filteredPayload).length === 0) {
       throw new Error('Payload transaksi tidak cocok dengan schema sales_records tenant');
     }
 
     const { sql, values } = buildInsertQuery('sales_records', filteredPayload);
     const result = await client.query(sql, values);
+
+    const insertedSalesRecordId = result.rows?.[0]?.id;
+    if (insertedSalesRecordId !== undefined && insertedSalesRecordId !== null) {
+      await syncSalesRecordItems(client, insertedSalesRecordId, tenantId, storedItems);
+    }
+
     await client.query('COMMIT');
 
     const savedTransaction = result.rows[0] || null;
+    if (savedTransaction) {
+      const hydratedItems = await loadSalesRecordItems(
+        req.tenantDb,
+        savedTransaction.id,
+        tenantId,
+      );
+      savedTransaction.items = hydratedItems.length > 0
+        ? hydratedItems
+        : parseItemsFromJsonField(savedTransaction.items_json);
+    }
     emitTransactionCreated(req, savedTransaction, {
       inventoryUpdates,
     });
@@ -369,7 +597,18 @@ const createTransaction = async (req, res) => {
         );
 
         if ((existingResult.rowCount || 0) > 0) {
-          return jsonOk(res, existingResult.rows[0] || null, 'Transaction already exists');
+          const existingRow = existingResult.rows[0] || null;
+          if (existingRow) {
+            const hydratedItems = await loadSalesRecordItems(
+              req.tenantDb,
+              existingRow.id,
+              tenantId,
+            );
+            existingRow.items = hydratedItems.length > 0
+              ? hydratedItems
+              : parseItemsFromJsonField(existingRow.items_json);
+          }
+          return jsonOk(res, existingRow, 'Transaction already exists');
         }
       } catch (_) {}
     }

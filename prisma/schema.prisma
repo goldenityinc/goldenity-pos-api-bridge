@@ -63,6 +63,7 @@ model Tenant {
   categories          Category[]
   transactions        Transaction[]
   salesRecords        SalesRecord[]
+  salesRecordItems    SalesRecordItem[]
   customers           Customer[]
   suppliers           Supplier[]
   expenses            Expense[]
@@ -133,8 +134,12 @@ model SalesRecord {
   id                 BigInt    @id @default(autoincrement())
   tenantId           String?   @map("tenant_id")
   referenceId        String?   @map("reference_id")
+  receiptNumber      String?   @map("receipt_number")
   paymentMethod      String?   @map("payment_method")
+  paymentStatus      String?   @map("payment_status")
   paymentType        String?   @map("payment_type")
+  cashierId          String?   @map("cashier_id")
+  cashierName        String?   @map("cashier_name")
   totalPrice         Decimal?  @map("total_price")
   totalAmount        Decimal?  @map("total_amount")
   remainingBalance   Decimal?  @map("remaining_balance")
@@ -143,10 +148,32 @@ model SalesRecord {
   updatedAt          DateTime? @default(now()) @map("updated_at")
 
   tenant             Tenant?   @relation(fields: [tenantId], references: [id])
+  items              SalesRecordItem[]
 
   @@index([tenantId])
   @@index([referenceId])
   @@map("sales_records")
+}
+
+model SalesRecordItem {
+  id            BigInt      @id @default(autoincrement())
+  tenantId      String?     @map("tenant_id")
+  salesRecordId BigInt      @map("sales_record_id")
+  productId     String?     @map("product_id")
+  productName   String?     @map("product_name")
+  qty           Int         @default(1)
+  customPrice   Decimal?    @map("custom_price") @db.Decimal(14, 2)
+  note          String?
+  isService     Boolean     @default(false) @map("is_service")
+  createdAt     DateTime?   @default(now()) @map("created_at")
+  updatedAt     DateTime?   @default(now()) @map("updated_at")
+
+  tenant        Tenant?     @relation(fields: [tenantId], references: [id])
+  salesRecord   SalesRecord @relation(fields: [salesRecordId], references: [id])
+
+  @@index([tenantId])
+  @@index([salesRecordId])
+  @@map("sales_record_items")
 }
 
 model Customer {
@@ -374,6 +401,7 @@ model ServiceOrder {
   status        String   @default("PENDING")
   estimatedCost Decimal? @map("estimated_cost") @db.Decimal(14, 2)
   technicianNotes String? @map("technician_notes")
+  serviceDetails Json?   @map("service_details")
   createdAt     DateTime @default(now()) @map("created_at")
   updatedAt     DateTime @updatedAt @map("updated_at")
 

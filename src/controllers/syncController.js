@@ -132,6 +132,178 @@ const hasMutationFields = (payload) => {
 
 const resolveTenantId = (req) => normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
 
+const toNumber = (value) => {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : NaN;
+};
+
+const toPositiveInteger = (value) => {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+};
+
+const parseItemsFromUnknown = (value) => {
+  if (!value) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  return [];
+};
+
+const normalizeSalesRecordItems = (items) => {
+  return parseItemsFromUnknown(items)
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return null;
+      }
+
+      const product = item.product && typeof item.product === 'object'
+        ? item.product
+        : {};
+
+      const productId = (
+        item.product_id ?? item.productId ?? product.id ?? ''
+      ).toString().trim();
+      const productName = (
+        item.product_name ?? item.productName ?? item.name ?? product.name ?? ''
+      ).toString().trim();
+      const qty = toPositiveInteger(item.qty ?? item.quantity);
+      if (qty === null) {
+        return null;
+      }
+
+      const isService =
+        item.is_service === true ||
+        item.isService === true ||
+        item.is_custom_item === true ||
+        item.isCustomItem === true ||
+        product.is_service === true ||
+        product.isService === true ||
+        product.is_custom_item === true ||
+        product.isCustomItem === true;
+
+      if (!productId && !isService) {
+        return null;
+      }
+
+      const customPrice = toNumber(
+        item.custom_price ?? item.customPrice ?? item.price ?? item.unit_price ?? 0,
+      );
+
+      return {
+        product_id: productId || null,
+        product_name: productName || null,
+        qty,
+        custom_price: Number.isFinite(customPrice) && customPrice > 0 ? customPrice : null,
+        note: (item.note ?? item.item_note ?? item.description ?? '').toString().trim() || null,
+        is_service: isService,
+      };
+    })
+    .filter(Boolean);
+};
+
+const ensureSalesRecordsItemsColumn = async (tenantDb, table) => {
+  if (table !== 'sales_records') return;
+  await tenantDb.query(`
+    ALTER TABLE sales_records
+    ADD COLUMN IF NOT EXISTS items_json JSONB;
+  `);
+};
+
+const ensureSalesRecordItemsTable = async (tenantDb, table) => {
+  if (table !== 'sales_records') return;
+  await tenantDb.query(`
+    CREATE TABLE IF NOT EXISTS sales_record_items (
+      id BIGSERIAL PRIMARY KEY,
+      tenant_id TEXT,
+      sales_record_id BIGINT NOT NULL,
+      product_id TEXT,
+      product_name TEXT,
+      qty INTEGER NOT NULL DEFAULT 1,
+      custom_price NUMERIC(14,2),
+      note TEXT,
+      is_service BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await tenantDb.query(`
+    CREATE INDEX IF NOT EXISTS idx_sales_record_items_sales_record_id
+    ON sales_record_items (sales_record_id);
+  `);
+
+  await tenantDb.query(`
+    CREATE INDEX IF NOT EXISTS idx_sales_record_items_tenant_id
+    ON sales_record_items (tenant_id);
+  `);
+};
+
+const syncSalesRecordItems = async (tenantDb, tenantId, salesRecordId, items) => {
+  if (!Number.isFinite(Number(salesRecordId))) {
+    return;
+  }
+
+  const normalizedTenantId = normalizeTenantId(tenantId);
+
+  await tenantDb.query(
+    normalizedTenantId
+      ? 'DELETE FROM sales_record_items WHERE sales_record_id = $1 AND tenant_id = $2'
+      : 'DELETE FROM sales_record_items WHERE sales_record_id = $1',
+    normalizedTenantId ? [salesRecordId, normalizedTenantId] : [salesRecordId],
+  );
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return;
+  }
+
+  for (const item of items) {
+    await tenantDb.query(
+      `INSERT INTO sales_record_items (
+         tenant_id,
+         sales_record_id,
+         product_id,
+         product_name,
+         qty,
+         custom_price,
+         note,
+         is_service,
+         updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+      [
+        normalizedTenantId || null,
+        salesRecordId,
+        item.product_id || null,
+        item.product_name || null,
+        Number.isInteger(Number(item.qty)) ? Number(item.qty) : 1,
+        Number.isFinite(Number(item.custom_price)) ? Number(item.custom_price) : null,
+        item.note || null,
+        item.is_service === true,
+      ],
+    );
+  }
+};
+
 const runSync = async (req, res) => {
   try {
     const { table, action, data, id } = req.body || {};
@@ -142,9 +314,18 @@ const runSync = async (req, res) => {
     }
 
     await prepareTableSchema(req.tenantDb, table);
+    await ensureSalesRecordsItemsColumn(req.tenantDb, table);
+    await ensureSalesRecordItemsTable(req.tenantDb, table);
 
     if (action === 'INSERT') {
       const payload = normalizePayloadForTable(table, { ...(data || {}) }, { isCreate: true });
+      const normalizedItems = table === 'sales_records'
+        ? normalizeSalesRecordItems(payload.items ?? payload.items_json)
+        : [];
+      if (table === 'sales_records' && normalizedItems.length > 0) {
+        payload.items_json = normalizedItems;
+      }
+      delete payload.items;
 
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
@@ -165,6 +346,15 @@ const runSync = async (req, res) => {
 
       const { sql, values } = buildInsertQuery(table, filteredPayload);
       const result = await req.tenantDb.query(sql, values);
+      if (table === 'sales_records' && (result.rows?.[0]?.id !== undefined)) {
+        await syncSalesRecordItems(
+          req.tenantDb,
+          tenantId,
+          result.rows[0].id,
+          normalizedItems,
+        );
+        result.rows[0].items = normalizedItems;
+      }
       for (const row of result.rows) {
         emitTableMutation(req, {
           table,
@@ -177,6 +367,13 @@ const runSync = async (req, res) => {
 
     if (action === 'UPDATE') {
       const payload = normalizePayloadForTable(table, data || {}, { isCreate: false });
+      const normalizedItems = table === 'sales_records'
+        ? normalizeSalesRecordItems(payload.items ?? payload.items_json)
+        : [];
+      if (table === 'sales_records' && (payload.items !== undefined || payload.items_json !== undefined)) {
+        payload.items_json = normalizedItems;
+      }
+      delete payload.items;
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
       const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
@@ -196,6 +393,12 @@ const runSync = async (req, res) => {
         { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
       );
       const result = await req.tenantDb.query(sql, values);
+      if (table === 'sales_records' && (payload.items_json !== undefined)) {
+        await syncSalesRecordItems(req.tenantDb, tenantId, id, normalizedItems);
+        if (result.rows?.[0]) {
+          result.rows[0].items = normalizedItems;
+        }
+      }
       emitTableMutation(req, {
         table,
         action: 'UPDATE',
