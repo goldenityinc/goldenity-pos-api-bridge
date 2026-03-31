@@ -1,5 +1,4 @@
 const { jsonOk, jsonError } = require('../utils/http');
-const { randomUUID } = require('crypto');
 const {
   buildInsertQuery,
   buildUpdateQuery,
@@ -13,15 +12,100 @@ const {
 } = require('../utils/sqlHelpers');
 const { emitTableMutation } = require('../services/realtimeEmitter');
 
+const isIntegerColumnDefinition = (columnDefinition = {}) => {
+  const dataType = `${columnDefinition.dataType || ''}`.toLowerCase();
+  const udtName = `${columnDefinition.udtName || ''}`.toLowerCase();
+
+  return (
+    dataType === 'smallint' ||
+    dataType === 'integer' ||
+    dataType === 'bigint' ||
+    udtName === 'int2' ||
+    udtName === 'int4' ||
+    udtName === 'int8'
+  );
+};
+
+const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions) => {
+  if (!(columnDefinitions instanceof Map) || !isIntegerColumnDefinition(columnDefinitions.get('id'))) {
+    return payload;
+  }
+
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return payload;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(payload, 'id')) {
+    return payload;
+  }
+
+  const rawId = payload.id;
+  if (rawId === undefined || rawId === null) {
+    return payload;
+  }
+
+  const idText = rawId.toString().trim();
+  if (!idText || /^\d+$/.test(idText)) {
+    return payload;
+  }
+
+  const next = { ...payload };
+  const referenceId = (
+    next.reference_id ?? next.referenceId ?? next.local_id ?? next.localId ?? ''
+  )
+    .toString()
+    .trim();
+
+  if (!referenceId) {
+    next.reference_id = idText;
+  }
+
+  delete next.id;
+  return next;
+};
+
+const resolveProductMutationTarget = async ({ tenantDb, table, idValue, payload, tenantId }) => {
+  if (table !== 'products') {
+    return { idField: 'id', idValue };
+  }
+
+  const normalizedId = (idValue ?? '').toString().trim();
+  if (/^\d+$/.test(normalizedId)) {
+    return { idField: 'id', idValue: normalizedId };
+  }
+
+  const referenceId = (
+    payload?.reference_id ??
+    payload?.referenceId ??
+    payload?.local_id ??
+    payload?.localId ??
+    normalizedId
+  )
+    .toString()
+    .trim();
+
+  if (!referenceId) {
+    return { idField: 'id', idValue: normalizedId };
+  }
+
+  const existing = await runSelect(tenantDb, table, {
+    eq__reference_id: referenceId,
+    maybeSingle: true,
+  }, { tenantId });
+
+  const existingId = (existing?.id ?? '').toString().trim();
+  if (/^\d+$/.test(existingId)) {
+    return { idField: 'id', idValue: existingId };
+  }
+
+  return { idField: 'reference_id', idValue: referenceId };
+};
+
 const normalizeProductPayload = (payload = {}, { isCreate = false } = {}) => {
   const next = { ...payload };
 
   if (next.imageUrl !== undefined && next.image_url === undefined) {
     next.image_url = next.imageUrl;
-  }
-
-  if (isCreate && (next.id === undefined || next.id === null || `${next.id}`.trim() === '')) {
-    next.id = randomUUID();
   }
 
   delete next.imageUrl;
@@ -328,7 +412,8 @@ const runSync = async (req, res) => {
       delete payload.items;
 
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-      const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+      const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
+      const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
       const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
       if (!hasMutationFields(filteredPayload)) {
         return jsonError(res, 400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
@@ -375,11 +460,19 @@ const runSync = async (req, res) => {
       }
       delete payload.items;
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-      const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+      const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
+      const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
       const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
+      const resolvedTarget = await resolveProductMutationTarget({
+        tenantDb: req.tenantDb,
+        table,
+        idValue: id,
+        payload: filteredPayload,
+        tenantId,
+      });
       if (!hasMutationFields(filteredPayload)) {
         const existing = await runSelect(req.tenantDb, table, {
-          eq__id: id,
+          [`eq__${resolvedTarget.idField}`]: resolvedTarget.idValue,
           maybeSingle: true,
         }, { tenantId });
         return jsonOk(res, existing ? [existing] : [], 'Sync update skipped');
@@ -388,8 +481,8 @@ const runSync = async (req, res) => {
       const { sql, values } = buildUpdateQuery(
         table,
         filteredPayload,
-        'id',
-        id,
+        resolvedTarget.idField,
+        resolvedTarget.idValue,
         { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
       );
       const result = await req.tenantDb.query(sql, values);
@@ -409,11 +502,18 @@ const runSync = async (req, res) => {
     }
 
     if (action === 'DELETE') {
+      const resolvedTarget = await resolveProductMutationTarget({
+        tenantDb: req.tenantDb,
+        table,
+        idValue: id,
+        payload: data || {},
+        tenantId,
+      });
       const columnSet = await getTableColumnSet(req.tenantDb, table);
       const { sql, values } = buildDeleteQuery(
         table,
-        'id',
-        id,
+        resolvedTarget.idField,
+        resolvedTarget.idValue,
         { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
       );
       const result = await req.tenantDb.query(sql, values);

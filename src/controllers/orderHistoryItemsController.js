@@ -36,6 +36,30 @@ const ensureSelectedColumn = (selectValue, columnName) => {
   return `${columns.join(',')},${columnName}`;
 };
 
+const removeSelectedColumn = (selectValue, columnName) => {
+  if (!selectValue || selectValue === '*') {
+    return selectValue;
+  }
+
+  const columns = selectValue
+    .toString()
+    .split(',')
+    .map((column) => column.trim())
+    .filter(Boolean)
+    .filter((column) => column.toLowerCase() !== columnName.toLowerCase());
+
+  return columns.length > 0 ? columns.join(',') : '*';
+};
+
+const normalizeCompletionStatus = (row = {}) => {
+  const rawStatus = (row.status ?? '').toString().trim().toLowerCase();
+  if (!rawStatus) {
+    return false;
+  }
+
+  return ['completed', 'selesai', 'done', 'received'].includes(rawStatus);
+};
+
 const parseBool = (value) => {
   if (typeof value === 'boolean') return value;
   const normalized = (value ?? '').toString().trim().toLowerCase();
@@ -236,12 +260,32 @@ const completeItemWithinTransaction = async ({
 const getOrderHistoryItems = async (req, res) => {
   try {
     const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const columnSet = await getTableColumnSet(req.tenantDb, 'order_history_items');
     const query = {
       ...req.query,
       select: ensureSelectedColumn(req.query?.select, 'id'),
     };
+    if (!columnSet.has('is_completed')) {
+      delete query.eq__is_completed;
+      delete query.neq__is_completed;
+      delete query.gte__is_completed;
+      delete query.lte__is_completed;
+      delete query.ilike__is_completed;
+      delete query.in__is_completed;
+      query.select = removeSelectedColumn(query.select, 'is_completed');
+    }
     const rows = await runSelect(req.tenantDb, 'order_history_items', query, { tenantId });
-    return jsonOk(res, rows);
+    const normalizedRows = (rows || []).map((row) => {
+      if (columnSet.has('is_completed')) {
+        return row;
+      }
+
+      return {
+        ...row,
+        is_completed: normalizeCompletionStatus(row),
+      };
+    });
+    return jsonOk(res, normalizedRows);
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
   }

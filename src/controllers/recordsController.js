@@ -1,5 +1,4 @@
 const { jsonOk, jsonError } = require('../utils/http');
-const { randomUUID } = require('crypto');
 const {
   normalizeArray,
   parseBodyArray,
@@ -23,6 +22,110 @@ const createHttpError = (statusCode, message) => {
   const error = new Error(message);
   error.statusCode = statusCode;
   return error;
+};
+
+const isIntegerColumnDefinition = (columnDefinition = {}) => {
+  const dataType = `${columnDefinition.dataType || ''}`.toLowerCase();
+  const udtName = `${columnDefinition.udtName || ''}`.toLowerCase();
+
+  return (
+    dataType === 'smallint' ||
+    dataType === 'integer' ||
+    dataType === 'bigint' ||
+    udtName === 'int2' ||
+    udtName === 'int4' ||
+    udtName === 'int8'
+  );
+};
+
+const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions) => {
+  if (!(columnDefinitions instanceof Map) || !isIntegerColumnDefinition(columnDefinitions.get('id'))) {
+    return payload;
+  }
+
+  const sanitizeRow = (row) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      return row;
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(row, 'id')) {
+      return row;
+    }
+
+    const rawId = row.id;
+    if (rawId === undefined || rawId === null) {
+      return row;
+    }
+
+    const idText = rawId.toString().trim();
+    if (!idText || /^\d+$/.test(idText)) {
+      return row;
+    }
+
+    const next = { ...row };
+    const referenceId = (
+      next.reference_id ?? next.referenceId ?? next.local_id ?? next.localId ?? ''
+    )
+      .toString()
+      .trim();
+
+    if (!referenceId) {
+      next.reference_id = idText;
+    }
+
+    delete next.id;
+    return next;
+  };
+
+  if (Array.isArray(payload)) {
+    return payload.map(sanitizeRow);
+  }
+
+  return sanitizeRow(payload);
+};
+
+const resolveProductMutationTarget = async ({
+  tenantDb,
+  table,
+  idField,
+  idValue,
+  payload,
+  tenantId,
+}) => {
+  if (table !== 'products' || idField !== 'id') {
+    return { idField, idValue };
+  }
+
+  const normalizedId = (idValue ?? '').toString().trim();
+  if (/^\d+$/.test(normalizedId)) {
+    return { idField, idValue: normalizedId };
+  }
+
+  const referenceId = (
+    payload?.reference_id ??
+    payload?.referenceId ??
+    payload?.local_id ??
+    payload?.localId ??
+    normalizedId
+  )
+    .toString()
+    .trim();
+
+  if (!referenceId) {
+    return { idField, idValue: normalizedId };
+  }
+
+  const existing = await runSelect(tenantDb, table, {
+    eq__reference_id: referenceId,
+    maybeSingle: true,
+  }, { tenantId });
+
+  const existingId = (existing?.id ?? '').toString().trim();
+  if (/^\d+$/.test(existingId)) {
+    return { idField: 'id', idValue: existingId };
+  }
+
+  return { idField: 'reference_id', idValue: referenceId };
 };
 
 const parseMoneyValue = (value) => {
@@ -85,10 +188,6 @@ const normalizeProductPayload = (payload = {}, { isCreate = false } = {}) => {
 
   if (next.imageUrl !== undefined && next.image_url === undefined) {
     next.image_url = next.imageUrl;
-  }
-
-  if (isCreate && (next.id === undefined || next.id === null || `${next.id}`.trim() === '')) {
-    next.id = randomUUID();
   }
 
   delete next.imageUrl;
@@ -292,6 +391,18 @@ const hasMutationFields = (payload) => {
   return !!payload && typeof payload === 'object' && Object.keys(payload).length > 0;
 };
 
+const hasValidIntegerId = (payload) => {
+  const rows = Array.isArray(payload) ? payload : [payload];
+  return rows.every((row) => {
+    if (!row || typeof row !== 'object') {
+      return false;
+    }
+
+    const idText = (row.id ?? '').toString().trim();
+    return /^\d+$/.test(idText);
+  });
+};
+
 const resolveTenantId = (req) => normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
 const AGGREGATION_TABLES = new Set(['sales_records', 'expenses', 'daily_cash', 'petty_cash_logs']);
 
@@ -489,7 +600,8 @@ const createRecords = async (req, res) => {
           { isCreate: true },
         );
         const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-        const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+        const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
+        const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
         const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
         if (!hasMutationFields(filteredPayload)) {
           throw createHttpError(400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
@@ -552,7 +664,8 @@ const upsertRecords = async (req, res) => {
           { isCreate: true },
         );
         const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-        const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+        const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
+        const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
         const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
         if (!hasMutationFields(filteredPayload)) {
           throw createHttpError(400, `Tidak ada kolom yang cocok untuk tabel ${table}`);
@@ -578,6 +691,12 @@ const upsertRecords = async (req, res) => {
         if (filteredOnConflict.length === 0) {
           throw createHttpError(400, 'onConflict tidak cocok dengan schema tabel');
         }
+
+        if (table === 'products' && !hasValidIntegerId(filteredPayload)) {
+          const { sql, values } = buildInsertQuery(table, filteredPayload);
+          return req.tenantDb.query(sql, values);
+        }
+
         const { sql, values } = buildUpsertQuery(
           table,
           filteredPayload,
@@ -622,9 +741,10 @@ const updateRecordById = async (req, res) => {
           { isCreate: false },
         );
         const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-        const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+        const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
+        const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
         const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
-        await validateProductUpdatePayload({
+        const resolvedTarget = await resolveProductMutationTarget({
           tenantDb: req.tenantDb,
           table,
           idField,
@@ -632,9 +752,17 @@ const updateRecordById = async (req, res) => {
           payload: filteredPayload,
           tenantId,
         });
+        await validateProductUpdatePayload({
+          tenantDb: req.tenantDb,
+          table,
+          idField: resolvedTarget.idField,
+          idValue: resolvedTarget.idValue,
+          payload: filteredPayload,
+          tenantId,
+        });
         if (!hasMutationFields(filteredPayload)) {
           const existing = await runSelect(req.tenantDb, table, {
-            [`eq__${idField}`]: req.params.id,
+            [`eq__${resolvedTarget.idField}`]: resolvedTarget.idValue,
             maybeSingle: true,
           }, { tenantId });
           return {
@@ -646,8 +774,8 @@ const updateRecordById = async (req, res) => {
         const { sql, values } = buildUpdateQuery(
           table,
           filteredPayload,
-          idField,
-          req.params.id,
+          resolvedTarget.idField,
+          resolvedTarget.idValue,
           { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
         );
         return req.tenantDb.query(sql, values);

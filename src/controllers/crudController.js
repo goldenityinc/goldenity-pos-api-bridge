@@ -32,6 +32,66 @@ class BadRequestError extends Error {
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+const isIntegerColumnDefinition = (columnDefinition = {}) => {
+  const dataType = `${columnDefinition.dataType || ''}`.toLowerCase();
+  const udtName = `${columnDefinition.udtName || ''}`.toLowerCase();
+
+  return (
+    dataType === 'smallint' ||
+    dataType === 'integer' ||
+    dataType === 'bigint' ||
+    udtName === 'int2' ||
+    udtName === 'int4' ||
+    udtName === 'int8'
+  );
+};
+
+const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions) => {
+  if (!(columnDefinitions instanceof Map) || !isIntegerColumnDefinition(columnDefinitions.get('id'))) {
+    return payload;
+  }
+
+  const sanitizeRow = (row) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      return row;
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(row, 'id')) {
+      return row;
+    }
+
+    const rawId = row.id;
+    if (rawId === undefined || rawId === null) {
+      return row;
+    }
+
+    const idText = rawId.toString().trim();
+    if (!idText || /^\d+$/.test(idText)) {
+      return row;
+    }
+
+    const next = { ...row };
+    const referenceId = (
+      next.reference_id ?? next.referenceId ?? next.local_id ?? next.localId ?? ''
+    )
+      .toString()
+      .trim();
+
+    if (!referenceId) {
+      next.reference_id = idText;
+    }
+
+    delete next.id;
+    return next;
+  };
+
+  if (Array.isArray(payload)) {
+    return payload.map(sanitizeRow);
+  }
+
+  return sanitizeRow(payload);
+};
+
 const normalizeSupplierPayloadObject = (payload = {}) => {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return payload;
@@ -200,7 +260,8 @@ const createCrudController = (table) => ({
       const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
       await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-      const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
+      const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
+      const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
       const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
       const hasFields = Array.isArray(filteredPayload)
         ? filteredPayload.some((row) => row && typeof row === 'object' && Object.keys(row).length > 0)
