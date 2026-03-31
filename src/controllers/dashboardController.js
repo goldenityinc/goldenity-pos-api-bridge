@@ -72,6 +72,9 @@ const getTodayDashboardSummary = async (req, res) => {
       ? 'payment_method'
       : (salesColumns.has('payment_type') ? 'payment_type' : null);
     const salesStatusColumn = salesColumns.has('status') ? 'status' : null;
+    const salesPaymentStatusColumn = salesColumns.has('payment_status')
+      ? 'payment_status'
+      : null;
     const salesCreatedAtColumn = salesColumns.has('created_at') ? 'created_at' : null;
 
     const salesFilters = ['tenant_id = $1'];
@@ -107,6 +110,29 @@ const getTodayDashboardSummary = async (req, res) => {
          END), 0)::numeric AS total_income_non_cash
        FROM sales_records
        WHERE ${salesWhereClause}`,
+      salesParams,
+    );
+
+    const settledStatusFilters = [...salesFilters];
+    const settledStatusPredicates = [];
+    if (salesStatusColumn) {
+      settledStatusPredicates.push(
+        `REPLACE(REPLACE(REPLACE(UPPER(COALESCE(${salesStatusColumn}::text, '')), ' ', ''), '-', ''), '_', '') IN ('SUCCESS', 'PAID', 'LUNAS', 'COMPLETED', 'SELESAI')`,
+      );
+    }
+    if (salesPaymentStatusColumn) {
+      settledStatusPredicates.push(
+        `REPLACE(REPLACE(REPLACE(UPPER(COALESCE(${salesPaymentStatusColumn}::text, '')), ' ', ''), '-', ''), '_', '') IN ('SUCCESS', 'PAID', 'LUNAS', 'COMPLETED', 'SELESAI')`,
+      );
+    }
+    if (settledStatusPredicates.length > 0) {
+      settledStatusFilters.push(`(${settledStatusPredicates.join(' OR ')})`);
+    }
+
+    const settledRevenueResult = await client.query(
+      `SELECT COALESCE(SUM(${salesAmountColumn}), 0)::numeric AS total_revenue
+       FROM sales_records
+       WHERE ${settledStatusFilters.join(' AND ')}`,
       salesParams,
     );
 
@@ -218,6 +244,7 @@ const getTodayDashboardSummary = async (req, res) => {
     }
 
     const totalSales = toInt(salesResult.rows?.[0]?.total_sales || 0);
+    const totalRevenue = toInt(settledRevenueResult.rows?.[0]?.total_revenue || 0);
     const totalTransactions = toInt(salesResult.rows?.[0]?.total_transactions || 0);
     const totalIncomeCash = toInt(salesResult.rows?.[0]?.total_income_cash || 0);
     const totalIncomeNonCash = toInt(salesResult.rows?.[0]?.total_income_non_cash || 0);
@@ -234,6 +261,8 @@ const getTodayDashboardSummary = async (req, res) => {
         time_zone: WIB_TIME_ZONE,
         summary_date: wibDate,
         total_sales: totalSales,
+        total_revenue: totalRevenue,
+        gross_profit: totalRevenue,
         total_transactions: totalTransactions,
         total_void_transactions: totalVoidTransactions,
         total_expenses: totalExpenses,

@@ -352,6 +352,7 @@ const ensureKasBonHistoryTable = async (client) => {
   await client.query(`
     CREATE TABLE IF NOT EXISTS kas_bon_payment_history (
       id BIGSERIAL PRIMARY KEY,
+      tenant_id TEXT,
       sales_record_id BIGINT NOT NULL,
       paid_amount NUMERIC(14,2) NOT NULL,
       previous_balance NUMERIC(14,2) NOT NULL,
@@ -363,6 +364,26 @@ const ensureKasBonHistoryTable = async (client) => {
   await client.query(`
     CREATE INDEX IF NOT EXISTS idx_kas_bon_payment_history_sales_record_id
     ON kas_bon_payment_history (sales_record_id);
+  `);
+
+  await client.query(`
+    ALTER TABLE kas_bon_payment_history
+    ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+  `);
+
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS idx_kas_bon_payment_history_tenant_id
+    ON kas_bon_payment_history (tenant_id);
+  `);
+
+  // Backfill historis lama agar tenant isolation tetap konsisten.
+  await client.query(`
+    UPDATE kas_bon_payment_history h
+    SET tenant_id = sr.tenant_id
+    FROM sales_records sr
+    WHERE h.tenant_id IS NULL
+      AND sr.id = h.sales_record_id
+      AND sr.tenant_id IS NOT NULL;
   `);
 };
 
@@ -398,7 +419,8 @@ const listActiveKasBon = async (req, res) => {
     const filters = [`${normalizedPaymentExpression} = 'KASBON'`];
     filters.push('tenant_id = $1');
     if (columns.has('payment_status')) {
-      filters.push(`UPPER(COALESCE(payment_status::text, 'BELUM LUNAS')) <> 'LUNAS'`);
+      const normalizedStatusExpression = "REPLACE(REPLACE(REPLACE(UPPER(COALESCE(payment_status::text, 'BELUM LUNAS')), ' ', ''), '-', ''), '_', '')";
+      filters.push(`${normalizedStatusExpression} IN ('BELUMLUNAS', 'UNPAID', 'PARTIAL', 'PARTIALLYPAID', 'OPEN', 'PENDING', '')`);
     }
 
     const balanceExpression = remainingColumn
@@ -636,6 +658,7 @@ const settleKasBon = async (req, res) => {
   try {
     const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     await ensureTenantScopedTable(client, 'sales_records', tenantId);
+    await ensureSalesRecordsKasBonColumns(client);
     const id = req.params.id;
     const paidAmount = toNumber(req.body?.paid_amount ?? req.body?.amount);
 
@@ -733,15 +756,17 @@ const settleKasBon = async (req, res) => {
     const normalizedBalance = isLunas ? 0 : nextBalance;
 
     await ensureKasBonHistoryTable(client);
+    await ensureTenantScopedTable(client, 'kas_bon_payment_history', tenantId);
 
     await client.query(
       `INSERT INTO kas_bon_payment_history (
+         tenant_id,
          sales_record_id,
          paid_amount,
          previous_balance,
          remaining_balance
-       ) VALUES ($1, $2, $3, $4)`,
-      [id, paidAmount, currentBalance, normalizedBalance],
+       ) VALUES ($1, $2, $3, $4, $5)`,
+      [tenantId, id, paidAmount, currentBalance, normalizedBalance],
     );
 
     const updateClauses = ['remaining_balance = $1'];
