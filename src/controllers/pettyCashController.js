@@ -116,7 +116,13 @@ const getTodayPettyCashLogs = async (req, res) => {
   try {
     await ensurePettyCashLogsTable(client);
 
-    const tenantId = (req?.tenant?.tenantId ?? '').toString().trim();
+    const tenantId = (req?.tenant?.tenantId ?? req?.auth?.tenantId ?? '')
+      .toString()
+      .trim();
+
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
 
     const result = await client.query(
       `SELECT l.id, l.tenant_id, l.user_id, l.amount, l.type, l.notes, l.created_at,
@@ -154,7 +160,9 @@ const createPettyCashLog = async (req, res) => {
   const client = await req.tenantDb.connect();
 
   try {
-    const tenantId = (req?.tenant?.tenantId ?? '').toString().trim();
+    const tenantId = (req?.tenant?.tenantId ?? req?.auth?.tenantId ?? '')
+      .toString()
+      .trim();
     const userId = resolveUserIdFromRequest(req);
     const userName = resolveUsernameFromRequest(req);
     const amount = toIntegerAmount(req.body?.amount);
