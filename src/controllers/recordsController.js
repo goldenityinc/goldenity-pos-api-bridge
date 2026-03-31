@@ -447,16 +447,13 @@ const listRecords = async (req, res) => {
         'phone',
         'address',
         'points',
-        'total_spent',
-        'created_at',
-        'updated_at',
       ].filter((column) => customerColumns.has(column));
 
       if (preferredColumns.length > 0) {
         effectiveQuery.select = preferredColumns.join(',');
       }
       if (!effectiveQuery.limit) {
-        effectiveQuery.limit = 500;
+        effectiveQuery.limit = 200;
       }
     }
 

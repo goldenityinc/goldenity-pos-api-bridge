@@ -49,6 +49,12 @@ const parsePositiveInt = (value) => {
   return normalized > 0 ? normalized : null;
 };
 
+const parsePositiveNumber = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+};
+
 const resolveReceivedQty = (item, payload = {}) => {
   const fromPayload =
     parsePositiveInt(payload.received_qty) ??
@@ -102,21 +108,46 @@ const completeItemWithinTransaction = async ({
 
   let productUpdate = null;
   if (!isManual && productId && !alreadyReceived && !alreadyCompleted) {
+    const receivedPurchasePrice =
+      parsePositiveNumber(payload.received_purchase_price) ??
+      parsePositiveNumber(payload.receivedPurchasePrice);
+
+    const productSetClauses = [
+      'stock = COALESCE(stock, 0) + $1',
+      'updated_at = NOW()',
+    ];
+
+    if (productsColumnSet.has('purchase_price') && receivedPurchasePrice !== null) {
+      productSetClauses.push(
+        `purchase_price = CASE
+          WHEN (COALESCE(stock, 0) + $1) > 0
+            THEN ROUND((((COALESCE(stock, 0) * COALESCE(purchase_price, 0)) + ($1 * $2)) / (COALESCE(stock, 0) + $1))::numeric, 0)
+          ELSE COALESCE(purchase_price, 0)
+        END`,
+      );
+    }
+
+    const productUpdateValues = [receivedQty];
+    if (productsColumnSet.has('purchase_price') && receivedPurchasePrice !== null) {
+      productUpdateValues.push(receivedPurchasePrice);
+    }
+    productUpdateValues.push(productId);
+    if (hasProductsTenant) {
+      productUpdateValues.push(tenantId);
+    }
+
     const productUpdateResult = await client.query(
       hasProductsTenant
         ? `UPDATE products
-           SET stock = COALESCE(stock, 0) + $1,
-               updated_at = COALESCE(updated_at, NOW())
-           WHERE id = $2 AND tenant_id = $3
+           SET ${productSetClauses.join(', ')}
+           WHERE id = $${productsColumnSet.has('purchase_price') && receivedPurchasePrice !== null ? 3 : 2}
+             AND tenant_id = $${productsColumnSet.has('purchase_price') && receivedPurchasePrice !== null ? 4 : 3}
            RETURNING *`
         : `UPDATE products
-           SET stock = COALESCE(stock, 0) + $1,
-               updated_at = COALESCE(updated_at, NOW())
-           WHERE id = $2
+           SET ${productSetClauses.join(', ')}
+           WHERE id = $${productsColumnSet.has('purchase_price') && receivedPurchasePrice !== null ? 3 : 2}
            RETURNING *`,
-      hasProductsTenant
-        ? [receivedQty, productId, tenantId]
-        : [receivedQty, productId],
+      productUpdateValues,
     );
 
     if ((productUpdateResult.rowCount || 0) === 0) {
