@@ -107,18 +107,51 @@ const listRoles = async (req, res) => {
     const pool = req.db;
     const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
     await ensureCustomRolesInfra(pool);
-    const result = await pool.query(
-      `
-      SELECT id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
-      FROM custom_roles
-      WHERE tenant_id = $1
-      ORDER BY created_at ASC
-      `,
-      [tenantId],
+
+    const columnsResult = await pool.query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = ANY(current_schemas(false))
+         AND table_name = 'custom_roles'`,
     );
+    const columns = new Set(columnsResult.rows.map((row) => row.column_name));
+    const hasTenantColumn = columns.has('tenant_id');
+
+    let result;
+    if (hasTenantColumn) {
+      if (tenantId) {
+        result = await pool.query(
+          `
+          SELECT id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
+          FROM custom_roles
+          WHERE tenant_id = $1 OR tenant_id IS NULL
+          ORDER BY COALESCE(is_default, false) DESC, created_at ASC
+          `,
+          [tenantId],
+        );
+      } else {
+        result = await pool.query(
+          `
+          SELECT id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
+          FROM custom_roles
+          WHERE tenant_id IS NULL
+          ORDER BY COALESCE(is_default, false) DESC, created_at ASC
+          `,
+        );
+      }
+    } else {
+      result = await pool.query(
+        `
+        SELECT id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
+        FROM custom_roles
+        ORDER BY COALESCE(is_default, false) DESC, created_at ASC
+        `,
+      );
+    }
 
     return jsonOk(res, result.rows.map(normalizeRoleRow));
   } catch (error) {
+    console.error('Role Fetch Error:', error);
     return jsonError(res, 500, 'Gagal mengambil daftar role', error.message);
   }
 };

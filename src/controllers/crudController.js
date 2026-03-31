@@ -8,7 +8,6 @@ const {
   buildUpdateQuery,
   buildDeleteQuery,
   getTableColumnDefinitions,
-  getTableColumnSet,
   normalizePayloadByColumnDefinitions,
   enforceTenantIdOnPayload,
   normalizeTenantId,
@@ -29,6 +28,109 @@ class BadRequestError extends Error {
     this.statusCode = 400;
   }
 }
+
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const normalizeSupplierPayloadObject = (payload = {}) => {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return payload;
+  }
+
+  const next = { ...payload };
+  const normalizedName = (next.name ?? next.nama_toko ?? '').toString().trim();
+  const normalizedPhone = (next.phone ?? next.kontak ?? '').toString().trim();
+  const normalizedAddress = (next.address ?? next.alamat ?? '').toString().trim();
+
+  if (normalizedName) {
+    next.name = normalizedName;
+    next.nama_toko = normalizedName;
+  }
+  if (normalizedPhone || Object.prototype.hasOwnProperty.call(next, 'phone') || Object.prototype.hasOwnProperty.call(next, 'kontak')) {
+    next.phone = normalizedPhone;
+    next.kontak = normalizedPhone;
+  }
+  if (normalizedAddress || Object.prototype.hasOwnProperty.call(next, 'address') || Object.prototype.hasOwnProperty.call(next, 'alamat')) {
+    next.address = normalizedAddress;
+    next.alamat = normalizedAddress;
+  }
+
+  return next;
+};
+
+const normalizeCategoryPayloadObject = (payload = {}) => {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return payload;
+  }
+
+  const next = { ...payload };
+  const rawType = (next.category_type ?? next.type ?? '').toString().trim().toLowerCase();
+  if (!rawType) {
+    return next;
+  }
+
+  const normalizedType =
+    rawType === 'expense' || rawType === 'pengeluaran' ? 'EXPENSE' : 'PRODUCT';
+  next.category_type = normalizedType;
+  next.type = normalizedType;
+  return next;
+};
+
+const normalizePayloadByTable = (table, payload) => {
+  const normalizeRow = (row) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      return row;
+    }
+
+    if (table === 'suppliers') {
+      return normalizeSupplierPayloadObject(row);
+    }
+
+    if (table === 'categories') {
+      return normalizeCategoryPayloadObject(row);
+    }
+
+    return row;
+  };
+
+  if (Array.isArray(payload)) {
+    return payload.map(normalizeRow);
+  }
+
+  return normalizeRow(payload);
+};
+
+const validateIdValueForTable = (columnDefinitions, idField, rawId) => {
+  if (!(columnDefinitions instanceof Map) || !columnDefinitions.has(idField)) {
+    return;
+  }
+
+  const idValue = (rawId ?? '').toString().trim();
+  if (!idValue) {
+    throw new BadRequestError('ID wajib diisi');
+  }
+
+  const idColumn = columnDefinitions.get(idField) || {};
+  const dataType = `${idColumn.dataType || ''}`.toLowerCase();
+  const udtName = `${idColumn.udtName || ''}`.toLowerCase();
+
+  const isIntegerId =
+    dataType === 'smallint' ||
+    dataType === 'integer' ||
+    dataType === 'bigint' ||
+    udtName === 'int2' ||
+    udtName === 'int4' ||
+    udtName === 'int8';
+
+  if (isIntegerId && !/^\d+$/.test(idValue)) {
+    throw new BadRequestError(`ID ${idField} harus numerik`);
+  }
+
+  const isUuidId = dataType === 'uuid' || udtName === 'uuid';
+  if (isUuidId && !UUID_REGEX.test(idValue)) {
+    throw new BadRequestError(`ID ${idField} harus UUID valid`);
+  }
+};
 
 async function normalizeUserPassword(table, payload, options = {}) {
   if (table !== 'app_users') {
@@ -87,11 +189,14 @@ const createCrudController = (table) => ({
       }
 
       const arrayPayload = parseBodyArray(req.body);
+      const normalizedIncomingPayload = arrayPayload
+        ? normalizePayloadByTable(table, arrayPayload)
+        : normalizePayloadByTable(table, parseBodyObject(req.body));
       const payload = arrayPayload
         ? await Promise.all(
-            arrayPayload.map((item) => normalizeUserPassword(table, item, { isCreate: true })),
+            normalizedIncomingPayload.map((item) => normalizeUserPassword(table, item, { isCreate: true })),
           )
-        : await normalizeUserPassword(table, parseBodyObject(req.body), { isCreate: true });
+        : await normalizeUserPassword(table, normalizedIncomingPayload, { isCreate: true });
       const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
       await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
@@ -126,10 +231,15 @@ const createCrudController = (table) => ({
   updateById: async (req, res) => {
     try {
       const idField = req.query.idField || 'id';
-      const payload = await normalizeUserPassword(table, parseBodyObject(req.body));
+      const normalizedIncomingPayload = normalizePayloadByTable(
+        table,
+        parseBodyObject(req.body),
+      );
+      const payload = await normalizeUserPassword(table, normalizedIncomingPayload);
       const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
       await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
+      validateIdValueForTable(columnDefinitions, idField, req.params.id);
       const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, columnDefinitions);
       const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
       const hasFields = !!filteredPayload && typeof filteredPayload === 'object' && Object.keys(filteredPayload).length > 0;
@@ -169,7 +279,9 @@ const createCrudController = (table) => ({
       const idField = req.query.idField || 'id';
       const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
       await ensureTenantScopedTable(req.tenantDb, table, tenantId);
-      const columnSet = await getTableColumnSet(req.tenantDb, table);
+      const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
+      validateIdValueForTable(columnDefinitions, idField, req.params.id);
+      const columnSet = new Set(columnDefinitions.keys());
       const { sql, values } = buildDeleteQuery(
         table,
         idField,

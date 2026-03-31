@@ -7,7 +7,14 @@ const normalizeCategoriesQuery = (query = {}) => {
   // sqlHelpers mengenali filter via prefix eq__, bukan field polos.
   const typeRaw = normalized.category_type ?? normalized.type;
   if (typeRaw !== undefined && typeRaw !== null && typeRaw !== '') {
-    normalized.eq__category_type = typeRaw;
+    const resolvedType = typeRaw
+      .toString()
+      .trim()
+      .toLowerCase();
+    const isExpense = resolvedType === 'expense' || resolvedType === 'pengeluaran';
+    normalized.in__category_type = isExpense
+      ? 'EXPENSE,expense'
+      : 'PRODUCT,product';
   }
 
   delete normalized.category_type;
