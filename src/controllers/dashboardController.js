@@ -56,6 +56,7 @@ const getTodayDashboardSummary = async (req, res) => {
     await ensureTenantScopedTable(client, 'sales_records', tenantId);
     await ensureTenantScopedTable(client, 'expenses', tenantId);
     await ensureTenantScopedTable(client, 'daily_cash', tenantId);
+    await ensureTenantScopedTable(client, 'products', tenantId);
     await ensurePettyCashLogsTable(client);
     await ensureTenantScopedTable(client, 'petty_cash_logs', tenantId);
 
@@ -64,6 +65,7 @@ const getTodayDashboardSummary = async (req, res) => {
     const salesColumns = await getTableColumnSet(client, 'sales_records');
     const expensesColumns = await getTableColumnSet(client, 'expenses');
     const dailyCashColumns = await getTableColumnSet(client, 'daily_cash');
+    const productColumns = await getTableColumnSet(client, 'products');
 
     const salesAmountColumn = salesColumns.has('total_price')
       ? 'total_price'
@@ -255,6 +257,18 @@ const getTodayDashboardSummary = async (req, res) => {
     const totalDailyCashOpeningSafe = toInt(totalDailyCashOpening || 0);
     const totalPettyCash = Math.max(totalPettyCashLogs, totalDailyCashOpeningSafe);
 
+    const productFilters = ['tenant_id = $1'];
+    if (productColumns.has('is_active')) {
+      productFilters.push('COALESCE(is_active, true) = true');
+    }
+    const productCountResult = await client.query(
+      `SELECT COUNT(*)::int AS total_products
+       FROM products
+       WHERE ${productFilters.join(' AND ')}`,
+      [tenantId],
+    );
+    const totalProducts = toInt(productCountResult.rows?.[0]?.total_products || 0);
+
     return jsonOk(
       res,
       {
@@ -271,6 +285,7 @@ const getTodayDashboardSummary = async (req, res) => {
         total_income_cash: totalIncomeCash,
         total_income_non_cash: totalIncomeNonCash,
         total_petty_cash: totalPettyCash,
+        total_products: totalProducts,
         petty_cash_logs_total: totalPettyCashLogs,
         daily_cash_opening_total: totalDailyCashOpeningSafe,
         cash_drawer_income: totalIncomeCash + totalPettyCash,
