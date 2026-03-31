@@ -86,6 +86,14 @@ const ensureCustomRolesInfra = async (pool) => {
   );
 
   await pool.query(
+    'ALTER TABLE custom_roles ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()',
+  );
+
+  await pool.query(
+    'ALTER TABLE custom_roles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()',
+  );
+
+  await pool.query(
     'ALTER TABLE custom_roles ALTER COLUMN tenant_id SET NOT NULL',
   ).catch(() => {});
 

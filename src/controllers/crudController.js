@@ -250,7 +250,7 @@ const createCrudController = (table) => ({
         }, { tenantId });
         return jsonOk(res, existing || null, 'Updated');
       }
-      const columnSet = await getTableColumnSet(req.tenantDb, table);
+      const columnSet = new Set(columnDefinitions.keys());
       const { sql, values } = buildUpdateQuery(
         table,
         filteredPayload,
