@@ -394,9 +394,8 @@ const listActiveKasBon = async (req, res) => {
       return jsonError(res, 500, 'Kolom kas bon sales_records tidak lengkap');
     }
 
-    const filters = [
-      `UPPER(COALESCE(${paymentColumn}::text, '')) = 'KAS BON'`,
-    ];
+    const normalizedPaymentExpression = `REPLACE(REPLACE(REPLACE(UPPER(COALESCE(${paymentColumn}::text, '')), ' ', ''), '-', ''), '_', '')`;
+    const filters = [`${normalizedPaymentExpression} = 'KASBON'`];
     filters.push('tenant_id = $1');
     if (columns.has('payment_status')) {
       filters.push(`UPPER(COALESCE(payment_status::text, 'BELUM LUNAS')) <> 'LUNAS'`);

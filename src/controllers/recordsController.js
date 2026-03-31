@@ -14,7 +14,9 @@ const {
   enforceTenantIdOnPayload,
   normalizeTenantId,
   runSelect,
+  isTenantScopedTable,
 } = require('../utils/sqlHelpers');
+const { ensureTenantScopedTable } = require('../utils/tenantScope');
 const { emitTableMutation } = require('../services/realtimeEmitter');
 
 const createHttpError = (statusCode, message) => {
@@ -217,7 +219,11 @@ const isUndefinedCustomersTableError = (error, table) => {
   return error?.code === '42P01' || message.includes('relation "customers" does not exist');
 };
 
-const runWithCustomersTableRetry = async (tenantDb, table, operation) => {
+const runWithCustomersTableRetry = async (tenantDb, table, tenantId, operation) => {
+  if (isTenantScopedTable(table)) {
+    await ensureTenantScopedTable(tenantDb, table, tenantId);
+  }
+
   await ensureCustomersTable(tenantDb, table);
   await ensureProductsTableColumns(tenantDb, table);
 
@@ -229,6 +235,9 @@ const runWithCustomersTableRetry = async (tenantDb, table, operation) => {
     }
 
     // Handle first-run race/legacy schema: create table then retry once.
+    if (isTenantScopedTable(table)) {
+      await ensureTenantScopedTable(tenantDb, table, tenantId);
+    }
     await ensureCustomersTable(tenantDb, table);
     await ensureProductsTableColumns(tenantDb, table);
     return operation();
@@ -413,10 +422,33 @@ const listRecords = async (req, res) => {
       return jsonOk(res, hydratedRows);
     }
 
+    let effectiveQuery = { ...req.query };
+    if (table === 'customers' && !effectiveQuery.select) {
+      const customerColumns = await getTableColumnSet(req.tenantDb, table);
+      const preferredColumns = [
+        'id',
+        'name',
+        'phone',
+        'address',
+        'points',
+        'total_spent',
+        'created_at',
+        'updated_at',
+      ].filter((column) => customerColumns.has(column));
+
+      if (preferredColumns.length > 0) {
+        effectiveQuery.select = preferredColumns.join(',');
+      }
+      if (!effectiveQuery.limit) {
+        effectiveQuery.limit = 500;
+      }
+    }
+
     const rows = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
-      () => runSelect(req.tenantDb, table, req.query, { tenantId }),
+      tenantId,
+      () => runSelect(req.tenantDb, table, effectiveQuery, { tenantId }),
     );
     return jsonOk(res, rows);
   } catch (error) {
@@ -435,6 +467,7 @@ const createRecords = async (req, res) => {
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
+      tenantId,
       async () => {
         const arrayPayload = parseBodyArray(req.body);
         const payload = normalizePayloadForTable(
@@ -498,6 +531,7 @@ const upsertRecords = async (req, res) => {
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
+      tenantId,
       async () => {
         const payload = normalizePayloadForTable(
           table,
@@ -566,6 +600,7 @@ const updateRecordById = async (req, res) => {
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
+      tenantId,
       async () => {
         const idField = req.query.idField || 'id';
         const payload = normalizePayloadForTable(
@@ -633,6 +668,7 @@ const deleteRecordById = async (req, res) => {
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
+      tenantId,
       async () => {
         const idField = req.query.idField || 'id';
         const columnSet = await getTableColumnSet(req.tenantDb, table);
