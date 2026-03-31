@@ -21,6 +21,26 @@ const toInt = (value) => {
   return Number.isFinite(parsed) ? Math.round(parsed) : 0;
 };
 
+const getWibDayUtcRange = () => {
+  const nowWib = new Date().toLocaleString('sv-SE', {
+    timeZone: WIB_TIME_ZONE,
+    hour12: false,
+  });
+  const [datePart] = nowWib.split(' ');
+  const [year, month, day] = datePart.split('-').map((value) => Number(value));
+
+  const startUtc = new Date(Date.UTC(year, month - 1, day, -7, 0, 0));
+  const endUtc = new Date(Date.UTC(year, month - 1, day + 1, -7, 0, 0));
+
+  return {
+    wibDate: `${year.toString().padStart(4, '0')}-${month
+      .toString()
+      .padStart(2, '0')}-${day.toString().padStart(2, '0')}`,
+    startUtcIso: startUtc.toISOString(),
+    endUtcIso: endUtc.toISOString(),
+  };
+};
+
 const getTodayDashboardSummary = async (req, res) => {
   const client = await req.tenantDb.connect();
 
@@ -39,6 +59,8 @@ const getTodayDashboardSummary = async (req, res) => {
     await ensurePettyCashLogsTable(client);
     await ensureTenantScopedTable(client, 'petty_cash_logs', tenantId);
 
+    const { startUtcIso, endUtcIso, wibDate } = getWibDayUtcRange();
+
     const salesColumns = await getTableColumnSet(client, 'sales_records');
     const expensesColumns = await getTableColumnSet(client, 'expenses');
     const dailyCashColumns = await getTableColumnSet(client, 'daily_cash');
@@ -53,10 +75,12 @@ const getTodayDashboardSummary = async (req, res) => {
     const salesCreatedAtColumn = salesColumns.has('created_at') ? 'created_at' : null;
 
     const salesFilters = ['tenant_id = $1'];
+    const salesParams = [tenantId];
     if (salesCreatedAtColumn) {
       salesFilters.push(
-        `((${salesCreatedAtColumn} AT TIME ZONE '${WIB_TIME_ZONE}')::date = (CURRENT_TIMESTAMP AT TIME ZONE '${WIB_TIME_ZONE}')::date)`,
+        `(${salesCreatedAtColumn} >= $2::timestamptz AND ${salesCreatedAtColumn} < $3::timestamptz)`,
       );
+      salesParams.push(startUtcIso, endUtcIso);
     }
     if (salesStatusColumn) {
       salesFilters.push(`COALESCE(LOWER(${salesStatusColumn}::text), '') <> 'void'`);
@@ -83,16 +107,18 @@ const getTodayDashboardSummary = async (req, res) => {
          END), 0)::numeric AS total_income_non_cash
        FROM sales_records
        WHERE ${salesWhereClause}`,
-      [tenantId],
+      salesParams,
     );
 
     let totalVoidTransactions = 0;
     if (salesStatusColumn) {
       const voidFilters = ['tenant_id = $1'];
+      const voidParams = [tenantId];
       if (salesCreatedAtColumn) {
         voidFilters.push(
-          `((${salesCreatedAtColumn} AT TIME ZONE '${WIB_TIME_ZONE}')::date = (CURRENT_TIMESTAMP AT TIME ZONE '${WIB_TIME_ZONE}')::date)`,
+          `(${salesCreatedAtColumn} >= $2::timestamptz AND ${salesCreatedAtColumn} < $3::timestamptz)`,
         );
+        voidParams.push(startUtcIso, endUtcIso);
       }
       voidFilters.push(`COALESCE(LOWER(${salesStatusColumn}::text), '') = 'void'`);
 
@@ -100,7 +126,7 @@ const getTodayDashboardSummary = async (req, res) => {
         `SELECT COUNT(*)::int AS total_void_transactions
          FROM sales_records
          WHERE ${voidFilters.join(' AND ')}`,
-        [tenantId],
+        voidParams,
       );
       totalVoidTransactions = toInt(voidResult.rows?.[0]?.total_void_transactions);
     }
@@ -117,10 +143,18 @@ const getTodayDashboardSummary = async (req, res) => {
       : (expensesColumns.has('expense_date') ? 'expense_date' : null);
 
     const expenseFilters = ['tenant_id = $1'];
+    const expenseParams = [tenantId];
     if (expenseDateColumn) {
-      expenseFilters.push(
-        `((${expenseDateColumn} AT TIME ZONE '${WIB_TIME_ZONE}')::date = (CURRENT_TIMESTAMP AT TIME ZONE '${WIB_TIME_ZONE}')::date)`,
-      );
+      if (expenseDateColumn === 'created_at') {
+        expenseFilters.push(
+          `(${expenseDateColumn} >= $2::timestamptz AND ${expenseDateColumn} < $3::timestamptz)`,
+        );
+        expenseParams.push(startUtcIso, endUtcIso);
+      } else {
+        expenseFilters.push(
+          `((${expenseDateColumn} AT TIME ZONE '${WIB_TIME_ZONE}')::date = (CURRENT_TIMESTAMP AT TIME ZONE '${WIB_TIME_ZONE}')::date)`,
+        );
+      }
     }
     if (expenseStatusColumn) {
       expenseFilters.push(`COALESCE(LOWER(${expenseStatusColumn}::text), '') <> 'void'`);
@@ -145,7 +179,7 @@ const getTodayDashboardSummary = async (req, res) => {
          END), 0)::numeric AS total_expenses_non_cash
        FROM expenses
        WHERE ${expenseFilters.join(' AND ')}`,
-      [tenantId],
+      expenseParams,
     );
 
     const pettyCashLogsResult = await client.query(
@@ -156,8 +190,8 @@ const getTodayDashboardSummary = async (req, res) => {
          END), 0)::numeric AS total_petty_cash_logs
        FROM petty_cash_logs
        WHERE tenant_id = $1
-         AND ((created_at AT TIME ZONE '${WIB_TIME_ZONE}')::date = (CURRENT_TIMESTAMP AT TIME ZONE '${WIB_TIME_ZONE}')::date)`,
-      [tenantId],
+         AND (created_at >= $2::timestamptz AND created_at < $3::timestamptz)`,
+      [tenantId, startUtcIso, endUtcIso],
     );
 
     let totalDailyCashOpening = 0;
@@ -176,28 +210,29 @@ const getTodayDashboardSummary = async (req, res) => {
           `SELECT COALESCE(MAX(modal_awal), 0)::numeric AS total_daily_cash_opening
            FROM daily_cash
            WHERE tenant_id = $1
-             AND ((created_at AT TIME ZONE '${WIB_TIME_ZONE}')::date = (CURRENT_TIMESTAMP AT TIME ZONE '${WIB_TIME_ZONE}')::date)`,
-          [tenantId],
+             AND (created_at >= $2::timestamptz AND created_at < $3::timestamptz)`,
+          [tenantId, startUtcIso, endUtcIso],
         );
         totalDailyCashOpening = toInt(dailyCashResult.rows?.[0]?.total_daily_cash_opening);
       }
     }
 
-    const totalSales = toInt(salesResult.rows?.[0]?.total_sales);
-    const totalTransactions = toInt(salesResult.rows?.[0]?.total_transactions);
-    const totalIncomeCash = toInt(salesResult.rows?.[0]?.total_income_cash);
-    const totalIncomeNonCash = toInt(salesResult.rows?.[0]?.total_income_non_cash);
-    const totalExpenses = toInt(expensesResult.rows?.[0]?.total_expenses);
-    const totalExpensesCash = toInt(expensesResult.rows?.[0]?.total_expenses_cash);
-    const totalExpensesNonCash = toInt(expensesResult.rows?.[0]?.total_expenses_non_cash);
-    const totalPettyCashLogs = toInt(pettyCashLogsResult.rows?.[0]?.total_petty_cash_logs);
-    const totalPettyCash = Math.max(totalPettyCashLogs, totalDailyCashOpening);
+    const totalSales = toInt(salesResult.rows?.[0]?.total_sales || 0);
+    const totalTransactions = toInt(salesResult.rows?.[0]?.total_transactions || 0);
+    const totalIncomeCash = toInt(salesResult.rows?.[0]?.total_income_cash || 0);
+    const totalIncomeNonCash = toInt(salesResult.rows?.[0]?.total_income_non_cash || 0);
+    const totalExpenses = toInt(expensesResult.rows?.[0]?.total_expenses || 0);
+    const totalExpensesCash = toInt(expensesResult.rows?.[0]?.total_expenses_cash || 0);
+    const totalExpensesNonCash = toInt(expensesResult.rows?.[0]?.total_expenses_non_cash || 0);
+    const totalPettyCashLogs = toInt(pettyCashLogsResult.rows?.[0]?.total_petty_cash_logs || 0);
+    const totalDailyCashOpeningSafe = toInt(totalDailyCashOpening || 0);
+    const totalPettyCash = Math.max(totalPettyCashLogs, totalDailyCashOpeningSafe);
 
     return jsonOk(
       res,
       {
         time_zone: WIB_TIME_ZONE,
-        summary_date: new Date().toLocaleDateString('en-CA', { timeZone: WIB_TIME_ZONE }),
+        summary_date: wibDate,
         total_sales: totalSales,
         total_transactions: totalTransactions,
         total_void_transactions: totalVoidTransactions,
@@ -208,7 +243,7 @@ const getTodayDashboardSummary = async (req, res) => {
         total_income_non_cash: totalIncomeNonCash,
         total_petty_cash: totalPettyCash,
         petty_cash_logs_total: totalPettyCashLogs,
-        daily_cash_opening_total: totalDailyCashOpening,
+        daily_cash_opening_total: totalDailyCashOpeningSafe,
         cash_drawer_income: totalIncomeCash + totalPettyCash,
       },
       'Dashboard ringkasan hari ini berhasil dimuat',
