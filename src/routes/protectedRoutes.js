@@ -10,6 +10,7 @@ const storageRoutes = require('./storageRoutes');
 const pettyCashRoutes = require('./pettyCashRoutes');
 const roleRoutes = require('./roleRoutes');
 const serviceOrderRoutes = require('./serviceOrderRoutes');
+const { getTodayDashboardSummary } = require('../controllers/dashboardController');
 const { createCrudTableRoutes } = require('./crudTableRoutes');
 const {
 	listActiveKasBon,
@@ -32,6 +33,7 @@ router.use('/storage', storageRoutes);
 router.use('/petty-cash', pettyCashRoutes);
 router.use('/api/service-orders', serviceOrderRoutes);
 router.use('/service-orders', serviceOrderRoutes);
+router.get('/dashboard/summary', getTodayDashboardSummary);
 router.use('/api/roles', roleRoutes);
 router.use('/roles', roleRoutes);
 router.get('/kas-bon', listActiveKasBon);
