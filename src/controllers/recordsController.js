@@ -390,6 +390,7 @@ const listRecords = async (req, res) => {
       const rows = await runWithCustomersTableRetry(
         req.tenantDb,
         table,
+        tenantId,
         () => runSelect(req.tenantDb, table, query, { tenantId }),
       );
 
@@ -423,6 +424,21 @@ const listRecords = async (req, res) => {
     }
 
     let effectiveQuery = { ...req.query };
+    if (effectiveQuery.orderBy) {
+      const currentColumns = await getTableColumnSet(req.tenantDb, table);
+      const requestedOrderBy = (effectiveQuery.orderBy || '').toString().trim();
+      if (requestedOrderBy && !currentColumns.has(requestedOrderBy)) {
+        if (currentColumns.has('created_at')) {
+          effectiveQuery.orderBy = 'created_at';
+        } else if (currentColumns.has('updated_at')) {
+          effectiveQuery.orderBy = 'updated_at';
+        } else if (currentColumns.has('id')) {
+          effectiveQuery.orderBy = 'id';
+        } else {
+          delete effectiveQuery.orderBy;
+        }
+      }
+    }
     if (table === 'customers' && !effectiveQuery.select) {
       const customerColumns = await getTableColumnSet(req.tenantDb, table);
       const preferredColumns = [
