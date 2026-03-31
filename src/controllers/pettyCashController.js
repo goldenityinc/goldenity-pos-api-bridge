@@ -138,6 +138,7 @@ const getTodayPettyCashLogs = async (req, res) => {
       'Petty cash hari ini berhasil dimuat',
     );
   } catch (error) {
+    console.error('Dashboard Aggregation Error:', error);
     return jsonError(
       res,
       500,
@@ -193,6 +194,7 @@ const createPettyCashLog = async (req, res) => {
 
     return jsonOk(res, createdLog, 'Petty cash berhasil disimpan', 201);
   } catch (error) {
+    console.error('Dashboard Aggregation Error:', error);
     return jsonError(
       res,
       500,

@@ -284,6 +284,7 @@ const hasMutationFields = (payload) => {
 };
 
 const resolveTenantId = (req) => normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+const AGGREGATION_TABLES = new Set(['sales_records', 'expenses', 'daily_cash', 'petty_cash_logs']);
 
 const normalizeSalesRecordId = (value) => {
   if (value === null || value === undefined) {
@@ -419,6 +420,10 @@ const listRecords = async (req, res) => {
     );
     return jsonOk(res, rows);
   } catch (error) {
+    const table = (req?.params?.table || '').toString().trim().toLowerCase();
+    if (AGGREGATION_TABLES.has(table)) {
+      console.error('Dashboard Aggregation Error:', error);
+    }
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
   }
 };
