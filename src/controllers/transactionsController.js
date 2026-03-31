@@ -437,7 +437,23 @@ const listActiveKasBon = async (req, res) => {
       columns.has('tenant_id') ? [tenantId] : [],
     );
 
-    return jsonOk(res, rowsResult.rows || [], 'Kas bon aktif berhasil dimuat');
+    const normalizedRows = (rowsResult.rows || []).map((row) => {
+      const totalAmount = toNumber(row[amountColumn] ?? row.total_price ?? row.total_amount);
+      const remainingBalance = toNumber(
+        row[remainingColumn] ?? row.remaining_balance ?? row.outstanding_balance ?? row[amountColumn],
+      );
+
+      return {
+        ...row,
+        total_price: Number.isFinite(totalAmount) ? totalAmount : 0,
+        total_amount: Number.isFinite(totalAmount) ? totalAmount : 0,
+        remaining_balance: Number.isFinite(remainingBalance) ? remainingBalance : 0,
+        outstanding_balance: Number.isFinite(remainingBalance) ? remainingBalance : 0,
+        payment_status: (row.payment_status ?? '').toString().trim(),
+      };
+    });
+
+    return jsonOk(res, normalizedRows, 'Kas bon aktif berhasil dimuat');
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
   } finally {
