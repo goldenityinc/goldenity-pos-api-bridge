@@ -4,6 +4,17 @@ const { ensurePettyCashLogsTable } = require('./pettyCashController');
 
 const WIB_TIME_ZONE = 'Asia/Jakarta';
 
+const resolveTenantIdFromRequest = (req) => (
+  req?.user?.tenantId
+  ?? req?.user?.tenant_id
+  ?? req?.tenant?.tenantId
+  ?? req?.auth?.tenantId
+  ?? req?.auth?.tenant_id
+  ?? ''
+)
+  .toString()
+  .trim();
+
 const getTableColumnSet = async (client, table) => {
   const result = await client.query(
     `SELECT column_name
@@ -45,9 +56,7 @@ const getTodayDashboardSummary = async (req, res) => {
   const client = await req.tenantDb.connect();
 
   try {
-    const tenantId = (req?.tenant?.tenantId ?? req?.auth?.tenantId ?? '')
-      .toString()
-      .trim();
+    const tenantId = resolveTenantIdFromRequest(req);
 
     if (!tenantId) {
       return jsonError(res, 401, 'Tenant tidak valid');

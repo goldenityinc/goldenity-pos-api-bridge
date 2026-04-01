@@ -1,7 +1,12 @@
 const { emitToTenant } = require('./socketServer');
 
 const resolveTenantIdFromRequest = (req) => {
-  return (req?.tenant?.tenantId ?? req?.auth?.tenantId ?? req?.auth?.tenant_id ?? '')
+  return (req?.user?.tenantId
+    ?? req?.user?.tenant_id
+    ?? req?.tenant?.tenantId
+    ?? req?.auth?.tenantId
+    ?? req?.auth?.tenant_id
+    ?? '')
     .toString()
     .trim();
 };
