@@ -38,6 +38,73 @@ const parseJsonField = (value) => {
   return value;
 };
 
+const parseJsonFieldLenient = (value) => {
+  if (typeof value !== 'string') {
+    return value;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return value;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch (_) {
+    return value;
+  }
+};
+
+const sanitizeServiceOrderPayload = (rawBody) => {
+  if (!rawBody || typeof rawBody !== 'object' || Array.isArray(rawBody)) {
+    return {};
+  }
+
+  const body = { ...rawBody };
+  const jsonCandidateFields = [
+    'serviceDetails',
+    'service_details',
+    'serviceDetailsJson',
+    'service_details_json',
+    'cost_details',
+    'costDetails',
+    'spare_parts',
+    'spareParts',
+    'rincian_biaya',
+    'rincianBiaya',
+    'items',
+  ];
+
+  for (const fieldName of jsonCandidateFields) {
+    if (!Object.prototype.hasOwnProperty.call(body, fieldName)) {
+      continue;
+    }
+    body[fieldName] = parseJsonFieldLenient(body[fieldName]);
+  }
+
+  const hasPrimaryServiceDetails =
+    body.serviceDetails !== undefined ||
+    body.service_details !== undefined ||
+    body.serviceDetailsJson !== undefined ||
+    body.service_details_json !== undefined;
+
+  if (!hasPrimaryServiceDetails) {
+    const fallbackServiceDetails =
+      body.cost_details ??
+      body.costDetails ??
+      body.rincian_biaya ??
+      body.rincianBiaya ??
+      body.spare_parts ??
+      body.spareParts ??
+      body.items;
+
+    if (fallbackServiceDetails !== undefined) {
+      body.serviceDetails = fallbackServiceDetails;
+    }
+  }
+
+  return body;
+};
+
 const normalizeServiceDetails = (rawValue) => {
   if (rawValue === undefined) {
     return { hasValue: false, value: null, error: null };
@@ -382,6 +449,8 @@ const updateServiceOrder = async (req, res) => {
   const client = await req.tenantDb.connect();
 
   try {
+    req.body = sanitizeServiceOrderPayload(req.body);
+
     const tenantId = normalizeTenantId(req);
     const id = (req.params?.id ?? '').toString().trim();
     const nextStatusRaw = req.body?.status;
