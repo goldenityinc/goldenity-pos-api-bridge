@@ -242,6 +242,7 @@ const normalizeExpensePayloadObject = (payload = {}, { isCreate = false } = {}) 
 
   const normalizedTitle = (
     next.title ??
+    next.judul ??
     next.expense_title ??
     next.name ??
     ''
@@ -269,6 +270,7 @@ const normalizeExpensePayloadObject = (payload = {}, { isCreate = false } = {}) 
   const normalizedAttachmentUrl = (
     next.attachment_url ??
     next.attachmentUrl ??
+    next.attachment ??
     next.receipt_url ??
     next.receiptUrl ??
     next.file_path ??
@@ -314,6 +316,7 @@ const normalizeExpensePayloadObject = (payload = {}, { isCreate = false } = {}) 
   ) {
     next.attachment_url = normalizedAttachmentUrl;
     next.attachmentUrl = normalizedAttachmentUrl;
+    next.attachment = normalizedAttachmentUrl;
   }
 
   if (normalizedExpenseNumber) {
