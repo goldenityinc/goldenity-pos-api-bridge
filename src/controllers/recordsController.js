@@ -622,6 +622,30 @@ const listRecords = async (req, res) => {
       }
     }
 
+    if (table === 'expenses' && !effectiveQuery.select) {
+      const expenseColumns = await getTableColumnSet(req.tenantDb, table);
+      const preferredColumns = [
+        'id',
+        'tenant_id',
+        'expense_number',
+        'title',
+        'description',
+        'notes',
+        'attachment_url',
+        'category',
+        'amount',
+        'payment_method',
+        'status',
+        'expense_date',
+        'created_at',
+        'updated_at',
+      ].filter((column) => expenseColumns.has(column));
+
+      if (preferredColumns.length > 0) {
+        effectiveQuery.select = preferredColumns.join(',');
+      }
+    }
+
     const rows = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
