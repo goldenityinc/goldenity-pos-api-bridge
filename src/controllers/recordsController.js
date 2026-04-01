@@ -183,6 +183,54 @@ const validateProductCreateOrUpsertPayload = (table, payload) => {
   }
 };
 
+const normalizeSupplierPayloadObject = (payload = {}) => {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return payload;
+  }
+
+  const next = { ...payload };
+  const normalizedName = (
+    next.name ?? next.nama_toko ?? next.namaToko ?? next.store_name ?? ''
+  )
+    .toString()
+    .trim();
+  const normalizedPhone = (
+    next.phone ?? next.kontak ?? next.contact ?? ''
+  )
+    .toString()
+    .trim();
+  const normalizedAddress = (
+    next.address ?? next.alamat ?? next.store_address ?? ''
+  )
+    .toString()
+    .trim();
+
+  if (normalizedName) {
+    next.name = normalizedName;
+    next.nama_toko = normalizedName;
+  }
+  if (
+    normalizedPhone ||
+    Object.prototype.hasOwnProperty.call(next, 'phone') ||
+    Object.prototype.hasOwnProperty.call(next, 'kontak') ||
+    Object.prototype.hasOwnProperty.call(next, 'contact')
+  ) {
+    next.phone = normalizedPhone;
+    next.kontak = normalizedPhone;
+  }
+  if (
+    normalizedAddress ||
+    Object.prototype.hasOwnProperty.call(next, 'address') ||
+    Object.prototype.hasOwnProperty.call(next, 'alamat') ||
+    Object.prototype.hasOwnProperty.call(next, 'store_address')
+  ) {
+    next.address = normalizedAddress;
+    next.alamat = normalizedAddress;
+  }
+
+  return next;
+};
+
 const normalizeProductPayload = (payload = {}, { isCreate = false } = {}) => {
   const next = { ...payload };
 
@@ -222,6 +270,10 @@ const normalizePayloadForTable = (table, payload, options = {}) => {
 
   if (table === 'customers') {
     return normalizeCustomerPayload(payload, options);
+  }
+
+  if (table === 'suppliers') {
+    return normalizeSupplierPayloadObject(payload);
   }
 
   return payload;
@@ -676,6 +728,41 @@ const upsertRecords = async (req, res) => {
           filteredPayload,
           tenantId,
         );
+        if (table === 'products') {
+          if (existingRecord) {
+            const updatePayload = { ...filteredPayload };
+            delete updatePayload.id;
+
+            if (!hasMutationFields(updatePayload)) {
+              return {
+                rows: [existingRecord],
+                rowCount: 1,
+                idempotentHit: true,
+              };
+            }
+
+            const columnSet = await getTableColumnSet(req.tenantDb, table);
+            const hasTenantColumn = columnSet.has('tenant_id');
+            const existingId = (existingRecord.id ?? '').toString().trim();
+            const updateTargetId = /^\d+$/.test(existingId)
+              ? existingId
+              : (existingRecord.reference_id ?? filteredPayload.reference_id ?? '').toString().trim();
+            const updateTargetField = /^\d+$/.test(existingId) ? 'id' : 'reference_id';
+            const { sql, values } = buildUpdateQuery(
+              table,
+              updatePayload,
+              updateTargetField,
+              updateTargetId,
+              { tenantId, hasTenantColumn },
+            );
+            return req.tenantDb.query(sql, values);
+          }
+
+          validateProductCreateOrUpsertPayload(table, filteredPayload);
+          const { sql, values } = buildInsertQuery(table, filteredPayload);
+          return req.tenantDb.query(sql, values);
+        }
+
         if (existingRecord) {
           return {
             rows: [existingRecord],

@@ -127,19 +127,41 @@ const normalizeSupplierPayloadObject = (payload = {}) => {
   }
 
   const next = { ...payload };
-  const normalizedName = (next.name ?? next.nama_toko ?? '').toString().trim();
-  const normalizedPhone = (next.phone ?? next.kontak ?? '').toString().trim();
-  const normalizedAddress = (next.address ?? next.alamat ?? '').toString().trim();
+  const normalizedName = (
+    next.name ?? next.nama_toko ?? next.namaToko ?? next.store_name ?? ''
+  )
+    .toString()
+    .trim();
+  const normalizedPhone = (
+    next.phone ?? next.kontak ?? next.contact ?? ''
+  )
+    .toString()
+    .trim();
+  const normalizedAddress = (
+    next.address ?? next.alamat ?? next.store_address ?? ''
+  )
+    .toString()
+    .trim();
 
   if (normalizedName) {
     next.name = normalizedName;
     next.nama_toko = normalizedName;
   }
-  if (normalizedPhone || Object.prototype.hasOwnProperty.call(next, 'phone') || Object.prototype.hasOwnProperty.call(next, 'kontak')) {
+  if (
+    normalizedPhone ||
+    Object.prototype.hasOwnProperty.call(next, 'phone') ||
+    Object.prototype.hasOwnProperty.call(next, 'kontak') ||
+    Object.prototype.hasOwnProperty.call(next, 'contact')
+  ) {
     next.phone = normalizedPhone;
     next.kontak = normalizedPhone;
   }
-  if (normalizedAddress || Object.prototype.hasOwnProperty.call(next, 'address') || Object.prototype.hasOwnProperty.call(next, 'alamat')) {
+  if (
+    normalizedAddress ||
+    Object.prototype.hasOwnProperty.call(next, 'address') ||
+    Object.prototype.hasOwnProperty.call(next, 'alamat') ||
+    Object.prototype.hasOwnProperty.call(next, 'store_address')
+  ) {
     next.address = normalizedAddress;
     next.alamat = normalizedAddress;
   }
