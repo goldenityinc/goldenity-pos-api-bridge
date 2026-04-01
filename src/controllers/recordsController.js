@@ -348,6 +348,33 @@ const normalizeExpensePayloadObject = (payload = {}, { isCreate = false } = {}) 
     .toString()
     .trim();
 
+  const normalizedStatus = (
+    next.status ??
+    next.expense_status ??
+    next.state ??
+    ''
+  )
+    .toString()
+    .trim()
+    .toLowerCase();
+
+  const normalizedVoidReason = (
+    next.void_reason ??
+    next.voidReason ??
+    next.cancel_reason ??
+    ''
+  )
+    .toString()
+    .trim();
+
+  const normalizedVoidedAt = (
+    next.voided_at ??
+    next.voidedAt ??
+    ''
+  )
+    .toString()
+    .trim();
+
   if (normalizedTitle || isCreate) {
     next.title = normalizedTitle || 'Pengeluaran';
     next.expense_title = next.title;
@@ -385,7 +412,56 @@ const normalizeExpensePayloadObject = (payload = {}, { isCreate = false } = {}) 
     next.transaction_number = generated;
   }
 
+  if (normalizedStatus || Object.prototype.hasOwnProperty.call(next, 'status')) {
+    next.status = normalizedStatus || 'active';
+  }
+
+  if (normalizedVoidReason || Object.prototype.hasOwnProperty.call(next, 'void_reason')) {
+    next.void_reason = normalizedVoidReason;
+  }
+
+  if (normalizedVoidedAt || Object.prototype.hasOwnProperty.call(next, 'voided_at')) {
+    next.voided_at = normalizedVoidedAt || null;
+  }
+
   return next;
+};
+
+const ensureExpenseVoidColumns = async (tenantDb) => {
+  await tenantDb.query(
+    `ALTER TABLE expenses
+       ADD COLUMN IF NOT EXISTS status TEXT,
+       ADD COLUMN IF NOT EXISTS void_reason TEXT,
+       ADD COLUMN IF NOT EXISTS voided_at TIMESTAMPTZ`,
+  );
+};
+
+const buildExpenseLegacyFallbackPayload = ({ payload, columnDefinitions }) => {
+  if (!(columnDefinitions instanceof Map)) {
+    return {};
+  }
+
+  const fallback = {};
+  const rawStatus = (payload?.status ?? '').toString().trim().toLowerCase();
+  const isVoidLike = rawStatus === 'void' || rawStatus === 'cancelled';
+
+  if (columnDefinitions.has('status') && rawStatus) {
+    fallback.status = rawStatus;
+  }
+  if (columnDefinitions.has('void_reason') && payload?.void_reason !== undefined) {
+    fallback.void_reason = payload.void_reason;
+  }
+  if (columnDefinitions.has('voided_at') && payload?.voided_at !== undefined) {
+    fallback.voided_at = payload.voided_at;
+  }
+
+  // Legacy schema fallback: if status column doesn't exist but is_active does,
+  // map void/cancelled status into is_active=false.
+  if (!columnDefinitions.has('status') && columnDefinitions.has('is_active') && isVoidLike) {
+    fallback.is_active = false;
+  }
+
+  return fallback;
 };
 
 const normalizeProductPayload = (payload = {}, { isCreate = false } = {}) => {
@@ -1229,16 +1305,29 @@ const updateRecordById = async (req, res) => {
           payload: basePayload,
           req,
         });
+        if (table === 'expenses') {
+          await ensureExpenseVoidColumns(req.tenantDb);
+        }
         const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
         const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
         const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
         const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
+        const expenseFallbackPayload = table === 'expenses'
+          ? buildExpenseLegacyFallbackPayload({
+            payload: tenantScopedPayload,
+            columnDefinitions,
+          })
+          : {};
+        const effectivePayload = {
+          ...filteredPayload,
+          ...expenseFallbackPayload,
+        };
         const resolvedTarget = await resolveProductMutationTarget({
           tenantDb: req.tenantDb,
           table,
           idField,
           idValue: req.params.id,
-          payload: filteredPayload,
+          payload: effectivePayload,
           tenantId,
         });
         await validateProductUpdatePayload({
@@ -1246,10 +1335,10 @@ const updateRecordById = async (req, res) => {
           table,
           idField: resolvedTarget.idField,
           idValue: resolvedTarget.idValue,
-          payload: filteredPayload,
+          payload: effectivePayload,
           tenantId,
         });
-        if (!hasMutationFields(filteredPayload)) {
+        if (!hasMutationFields(effectivePayload)) {
           const existing = await runSelect(req.tenantDb, table, {
             [`eq__${resolvedTarget.idField}`]: resolvedTarget.idValue,
             maybeSingle: true,
@@ -1262,7 +1351,7 @@ const updateRecordById = async (req, res) => {
         const columnSet = await getTableColumnSet(req.tenantDb, table);
         const { sql, values } = buildUpdateQuery(
           table,
-          filteredPayload,
+          effectivePayload,
           resolvedTarget.idField,
           resolvedTarget.idValue,
           { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
