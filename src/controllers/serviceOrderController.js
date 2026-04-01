@@ -187,6 +187,20 @@ const sumServiceDetails = (serviceDetails) => {
   }, 0);
 };
 
+const toJsonColumnValue = (value) => {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch (_) {
+    return null;
+  }
+};
+
 const assertColumnsExist = async (client, table, columns = []) => {
   const result = await client.query(
     `SELECT column_name
@@ -296,6 +310,9 @@ const createServiceOrder = async (req, res) => {
     if (serviceDetailsInput.error) {
       return jsonError(res, 400, serviceDetailsInput.error);
     }
+    const serviceDetailsDbValue = serviceDetailsInput.hasValue
+      ? toJsonColumnValue(serviceDetailsInput.value)
+      : null;
 
     // Numeric optional field
     const estimatedCostRaw = req.body?.estimatedCost ?? req.body?.estimated_cost;
@@ -363,7 +380,7 @@ const createServiceOrder = async (req, res) => {
         complaint,
         estimatedCost,
         technicianNotes,
-        serviceDetailsInput.hasValue ? serviceDetailsInput.value : null,
+        serviceDetailsDbValue,
       ],
     );
 
@@ -467,6 +484,9 @@ const updateServiceOrder = async (req, res) => {
     if (serviceDetailsInput.error) {
       return jsonError(res, 400, serviceDetailsInput.error);
     }
+    const serviceDetailsDbValue = serviceDetailsInput.hasValue
+      ? toJsonColumnValue(serviceDetailsInput.value)
+      : null;
 
     if (!tenantId) {
       return jsonError(res, 401, 'Tenant tidak valid');
@@ -524,7 +544,7 @@ const updateServiceOrder = async (req, res) => {
     }
 
     if (serviceDetailsInput.hasValue) {
-      params.push(serviceDetailsInput.value);
+      params.push(serviceDetailsDbValue);
       fields.push(`service_details = $${params.length}`);
     }
 
