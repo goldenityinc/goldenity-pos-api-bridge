@@ -426,9 +426,8 @@ const listActiveKasBon = async (req, res) => {
     const normalizedPaymentExpression = `REPLACE(REPLACE(REPLACE(UPPER(COALESCE(${paymentColumn}::text, '')), ' ', ''), '-', ''), '_', '')`;
     const filters = [`${normalizedPaymentExpression} = 'KASBON'`];
     filters.push('tenant_id = $1');
-    const paymentStatusColumn = columns.has('payment_status')
-      ? 'payment_status'
-      : (columns.has('status') ? 'status' : null);
+    // Only use payment_status column if it explicitly exists
+    const paymentStatusColumn = columns.has('payment_status') ? 'payment_status' : null;
     if (paymentStatusColumn) {
       const normalizedStatusExpression = `REPLACE(REPLACE(REPLACE(UPPER(COALESCE(${paymentStatusColumn}::text, 'BELUM LUNAS')), ' ', ''), '-', ''), '_', '')`;
       filters.push(`${normalizedStatusExpression} IN ('BELUMLUNAS', 'UNPAID', 'PARTIAL', 'PARTIALLYPAID', 'OPEN', 'PENDING', '')`);

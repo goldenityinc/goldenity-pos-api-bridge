@@ -261,6 +261,8 @@ const createCrudController = (table) => ({
       await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
+      // Note: sanitizeClientGeneratedPrimaryKey removes non-integer IDs (UUID from client) to prevent ON CONFLICT errors
+      // These are automatically stored in reference_id column for products
       const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
       const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
       const hasFields = Array.isArray(filteredPayload)

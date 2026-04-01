@@ -52,13 +52,12 @@ const removeSelectedColumn = (selectValue, columnName) => {
 };
 
 const normalizeCompletionStatus = (row = {}) => {
-  const rawStatus = (row.status ?? '').toString().trim().toLowerCase();
-  if (!rawStatus) {
-    return false;
-  }
-
-  return ['completed', 'selesai', 'done', 'received'].includes(rawStatus);
-};
+  // Use is_received as the completion indicator (is_completed column doesn't exist)
+  const isReceived = parseBool(row.is_received);
+  const receivedQty = Number(row.received_qty || 0);
+  
+  // Item is completed if it's marked as received and has a received quantity > 0
+  return isReceived && receivedQty > 0;
 
 const parseBool = (value) => {
   if (typeof value === 'boolean') return value;
@@ -188,9 +187,7 @@ const completeItemWithinTransaction = async ({
     updateClauses.push(`${column} = $${updateValues.length}`);
   };
 
-  if (orderItemsColumnSet.has('is_completed')) {
-    pushUpdate('is_completed', true);
-  }
+  // Note: is_completed column does not exist in schema, only is_received
   if (orderItemsColumnSet.has('is_received')) {
     pushUpdate('is_received', true);
   }

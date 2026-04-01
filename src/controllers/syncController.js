@@ -413,6 +413,8 @@ const runSync = async (req, res) => {
 
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
+      // Note: sanitizeClientGeneratedPrimaryKey removes non-integer IDs to prevent ON CONFLICT errors
+      // Products without valid integer IDs will use reference_id instead and rely on regular INSERT
       const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
       const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
       if (!hasMutationFields(filteredPayload)) {
@@ -461,6 +463,8 @@ const runSync = async (req, res) => {
       delete payload.items;
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
+      // Note: sanitizeClientGeneratedPrimaryKey removes non-integer IDs to prevent ON CONFLICT errors
+      // Products without valid integer IDs will use reference_id instead for lookups
       const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
       const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
       const resolvedTarget = await resolveProductMutationTarget({
