@@ -58,6 +58,7 @@ const normalizeCompletionStatus = (row = {}) => {
   
   // Item is completed if it's marked as received and has a received quantity > 0
   return isReceived && receivedQty > 0;
+};
 
 const parseBool = (value) => {
   if (typeof value === 'boolean') return value;
