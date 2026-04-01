@@ -231,6 +231,105 @@ const normalizeSupplierPayloadObject = (payload = {}) => {
   return next;
 };
 
+const generateExpenseNumber = () => `EXP-${Date.now()}`;
+
+const normalizeExpensePayloadObject = (payload = {}, { isCreate = false } = {}) => {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return payload;
+  }
+
+  const next = { ...payload };
+
+  const normalizedTitle = (
+    next.title ??
+    next.expense_title ??
+    next.name ??
+    ''
+  )
+    .toString()
+    .trim();
+
+  const normalizedDescription = (
+    next.description ??
+    next.keterangan ??
+    next.desc ??
+    ''
+  )
+    .toString()
+    .trim();
+
+  const normalizedNotes = (
+    next.notes ??
+    next.catatan ??
+    normalizedDescription
+  )
+    .toString()
+    .trim();
+
+  const normalizedAttachmentUrl = (
+    next.attachment_url ??
+    next.attachmentUrl ??
+    next.receipt_url ??
+    next.receiptUrl ??
+    next.file_path ??
+    next.filePath ??
+    ''
+  )
+    .toString()
+    .trim();
+
+  const normalizedExpenseNumber = (
+    next.expense_number ??
+    next.expenseNumber ??
+    next.receipt_number ??
+    next.receiptNumber ??
+    next.transaction_number ??
+    next.transactionNumber ??
+    next.nomor_transaksi ??
+    ''
+  )
+    .toString()
+    .trim();
+
+  if (normalizedTitle || isCreate) {
+    next.title = normalizedTitle || 'Pengeluaran';
+    next.expense_title = next.title;
+    next.name = next.title;
+  }
+
+  if (normalizedDescription || Object.prototype.hasOwnProperty.call(next, 'description')) {
+    next.description = normalizedDescription;
+    next.keterangan = normalizedDescription;
+  }
+
+  if (normalizedNotes || Object.prototype.hasOwnProperty.call(next, 'notes')) {
+    next.notes = normalizedNotes;
+    next.catatan = normalizedNotes;
+  }
+
+  if (
+    normalizedAttachmentUrl ||
+    Object.prototype.hasOwnProperty.call(next, 'attachment_url') ||
+    Object.prototype.hasOwnProperty.call(next, 'attachmentUrl')
+  ) {
+    next.attachment_url = normalizedAttachmentUrl;
+    next.attachmentUrl = normalizedAttachmentUrl;
+  }
+
+  if (normalizedExpenseNumber) {
+    next.expense_number = normalizedExpenseNumber;
+    next.receipt_number = normalizedExpenseNumber;
+    next.transaction_number = normalizedExpenseNumber;
+  } else if (isCreate) {
+    const generated = generateExpenseNumber();
+    next.expense_number = generated;
+    next.receipt_number = generated;
+    next.transaction_number = generated;
+  }
+
+  return next;
+};
+
 const normalizeProductPayload = (payload = {}, { isCreate = false } = {}) => {
   const next = { ...payload };
 
@@ -274,6 +373,10 @@ const normalizePayloadForTable = (table, payload, options = {}) => {
 
   if (table === 'suppliers') {
     return normalizeSupplierPayloadObject(payload);
+  }
+
+  if (table === 'expenses') {
+    return normalizeExpensePayloadObject(payload, options);
   }
 
   return payload;
