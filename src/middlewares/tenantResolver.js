@@ -22,6 +22,15 @@ const getAuthToken = (req) => {
 
 const getSharedPool = () => global.__goldenitySharedPool || createSharedPool();
 
+const resolveTenantFromToken = (payload = {}) => {
+  const tenantId = (payload.tenantId ?? payload.tenant_id ?? '').toString().trim();
+  const tenantSlug = (payload.tenantSlug ?? payload.tenant_slug ?? '').toString().trim();
+  return {
+    tenantId,
+    tenantSlug,
+  };
+};
+
 const tenantResolver = async (req, res, next) => {
   try {
     const jwtSecret = process.env.JWT_SECRET;
@@ -36,9 +45,8 @@ const tenantResolver = async (req, res, next) => {
     const token = getAuthToken(req);
     const payload = jwt.verify(token, jwtSecret);
 
-    const tenantId = payload?.tenantId || payload?.tenant_id;
-
-    if (!tenantId || typeof tenantId !== 'string') {
+    const { tenantId, tenantSlug } = resolveTenantFromToken(payload);
+    if (!tenantId && !tenantSlug) {
       return res.status(401).json({
         success: false,
         message: 'tenantId tidak ditemukan di token',
@@ -47,10 +55,50 @@ const tenantResolver = async (req, res, next) => {
     }
 
     const pool = getSharedPool();
-    await pool.query('SELECT 1');
+    const tenantLookup = await pool.query(
+      `SELECT id, slug, is_active
+       FROM tenants
+       WHERE (id = $1 OR slug = $2)
+       LIMIT 1`,
+      [tenantId || null, tenantSlug || null],
+    );
+
+    const tenantRow = tenantLookup.rows?.[0] || null;
+    if (!tenantRow) {
+      return res.status(401).json({
+        success: false,
+        message: 'Tenant tidak ditemukan',
+        error: null,
+      });
+    }
+
+    if (tenantRow.is_active === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'Tenant tidak aktif',
+        error: null,
+      });
+    }
+
+    const lockedTenantId = (tenantRow.id ?? '').toString().trim();
+    const lockedTenantSlug = (tenantRow.slug ?? '').toString().trim();
+    if (!lockedTenantId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Tenant ID tidak valid',
+        error: null,
+      });
+    }
 
     req.auth = payload;
-    req.tenant = { tenantId };
+    req.user = Object.freeze({
+      ...payload,
+      tenantId: lockedTenantId,
+      tenant_id: lockedTenantId,
+      tenantSlug: lockedTenantSlug,
+      tenant_slug: lockedTenantSlug,
+    });
+    req.tenant = { tenantId: lockedTenantId, slug: lockedTenantSlug };
     req.tenantDb = pool;
     req.db = pool;
 

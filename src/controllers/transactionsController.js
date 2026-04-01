@@ -45,49 +45,54 @@ const normalizeReferenceId = (payload = {}, fallbackValue = '') => {
     .trim();
 };
 
-const ensureSalesRecordsReferenceIdColumn = async (client) => {
-  await client.query(`
-    ALTER TABLE sales_records
-    ADD COLUMN IF NOT EXISTS reference_id TEXT;
-  `);
+const resolveTenantIdFromRequest = (req) => normalizeTenantId(
+  req?.user?.tenantId ||
+  req?.user?.tenant_id ||
+  req?.tenant?.tenantId ||
+  req?.auth?.tenantId ||
+  req?.auth?.tenant_id,
+);
 
-  await client.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_records_reference_id_unique
-    ON sales_records (reference_id)
-    WHERE reference_id IS NOT NULL;
-  `);
+const assertColumnsExist = async (client, table, columns = []) => {
+  const result = await client.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = ANY(current_schemas(false))
+       AND table_name = $1`,
+    [table],
+  );
+  const existingColumns = new Set((result.rows || []).map((row) => row.column_name));
+  const missingColumns = columns.filter((column) => !existingColumns.has(column));
+  if (missingColumns.length > 0) {
+    throw new Error(
+      `Schema guard: tabel ${table} belum memiliki kolom wajib: ${missingColumns.join(', ')}. Jalankan migrasi di core service.`,
+    );
+  }
+};
+
+const ensureSalesRecordsReferenceIdColumn = async (client) => {
+  await assertColumnsExist(client, 'sales_records', ['reference_id']);
 };
 
 const ensureSalesRecordsReceiptNumberColumn = async (client) => {
-  await client.query(`
-    ALTER TABLE sales_records
-    ADD COLUMN IF NOT EXISTS receipt_number TEXT;
-  `);
+  await assertColumnsExist(client, 'sales_records', ['receipt_number']);
 };
 
 const ensureSalesRecordsCashierColumns = async (client) => {
-  await client.query(`
-    ALTER TABLE sales_records
-    ADD COLUMN IF NOT EXISTS cashier_id TEXT,
-    ADD COLUMN IF NOT EXISTS cashier_name TEXT;
-  `);
+  await assertColumnsExist(client, 'sales_records', ['cashier_id', 'cashier_name']);
 };
 
 const ensureSalesRecordsCustomerColumn = async (client) => {
-  await client.query(`
-    ALTER TABLE sales_records
-    ADD COLUMN IF NOT EXISTS customer_name TEXT;
-  `);
+  await assertColumnsExist(client, 'sales_records', ['customer_name']);
 };
 
 const ensureSalesRecordsKasBonColumns = async (client) => {
-  await client.query(`
-    ALTER TABLE sales_records
-    ADD COLUMN IF NOT EXISTS payment_method TEXT,
-    ADD COLUMN IF NOT EXISTS payment_status TEXT,
-    ADD COLUMN IF NOT EXISTS remaining_balance NUMERIC(14,2) DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS outstanding_balance NUMERIC(14,2) DEFAULT 0;
-  `);
+  await assertColumnsExist(client, 'sales_records', [
+    'payment_method',
+    'payment_status',
+    'remaining_balance',
+    'outstanding_balance',
+  ]);
 };
 
 const hasMeaningfulValue = (value) => {
@@ -208,38 +213,16 @@ const normalizeTransactionItemsWithNotes = (items) => {
 };
 
 const ensureSalesRecordsItemsColumn = async (client) => {
-  await client.query(`
-    ALTER TABLE sales_records
-    ADD COLUMN IF NOT EXISTS items_json JSONB;
-  `);
+  await assertColumnsExist(client, 'sales_records', ['items_json']);
 };
 
 const ensureSalesRecordItemsTable = async (client) => {
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS sales_record_items (
-      id BIGSERIAL PRIMARY KEY,
-      tenant_id TEXT,
-      sales_record_id BIGINT NOT NULL,
-      product_id TEXT,
-      product_name TEXT,
-      qty INTEGER NOT NULL DEFAULT 1,
-      custom_price NUMERIC(14,2),
-      note TEXT,
-      is_service BOOLEAN NOT NULL DEFAULT FALSE,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_sales_record_items_sales_record_id
-    ON sales_record_items (sales_record_id);
-  `);
-
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_sales_record_items_tenant_id
-    ON sales_record_items (tenant_id);
-  `);
+  await assertColumnsExist(client, 'sales_record_items', [
+    'sales_record_id',
+    'tenant_id',
+    'product_id',
+    'qty',
+  ]);
 };
 
 const toStoredSalesRecordItems = (items) => {
@@ -356,49 +339,19 @@ const syncSalesRecordItems = async (client, salesRecordId, tenantId, items) => {
 };
 
 const ensureKasBonHistoryTable = async (client) => {
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS kas_bon_payment_history (
-      id BIGSERIAL PRIMARY KEY,
-      tenant_id TEXT,
-      sales_record_id BIGINT NOT NULL,
-      paid_amount NUMERIC(14,2) NOT NULL,
-      previous_balance NUMERIC(14,2) NOT NULL,
-      remaining_balance NUMERIC(14,2) NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_kas_bon_payment_history_sales_record_id
-    ON kas_bon_payment_history (sales_record_id);
-  `);
-
-  await client.query(`
-    ALTER TABLE kas_bon_payment_history
-    ADD COLUMN IF NOT EXISTS tenant_id TEXT;
-  `);
-
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_kas_bon_payment_history_tenant_id
-    ON kas_bon_payment_history (tenant_id);
-  `);
-
-  // Backfill historis lama agar tenant isolation tetap konsisten.
-  await client.query(`
-    UPDATE kas_bon_payment_history h
-    SET tenant_id = sr.tenant_id
-    FROM sales_records sr
-    WHERE h.tenant_id IS NULL
-      AND sr.id = h.sales_record_id
-      AND sr.tenant_id IS NOT NULL;
-  `);
+  await assertColumnsExist(client, 'kas_bon_payment_history', [
+    'sales_record_id',
+    'tenant_id',
+    'paid_amount',
+    'remaining_balance',
+  ]);
 };
 
 const listActiveKasBon = async (req, res) => {
   const client = await req.tenantDb.connect();
 
   try {
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
     await ensureTenantScopedTable(client, 'sales_records', tenantId);
     await ensureSalesRecordsCustomerColumn(client);
     const columnsResult = await client.query(
@@ -478,7 +431,7 @@ const createTransaction = async (req, res) => {
   let hasSalesTenantColumn = false;
 
   try {
-    tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    tenantId = resolveTenantIdFromRequest(req);
     const payload = { ...req.body };
     const clientProvidedId = typeof payload.id === 'string'
       ? payload.id.trim()
@@ -683,7 +636,7 @@ const settleKasBon = async (req, res) => {
   const client = await req.tenantDb.connect();
 
   try {
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
     await ensureTenantScopedTable(client, 'sales_records', tenantId);
     await ensureSalesRecordsKasBonColumns(client);
     const id = req.params.id;

@@ -3,6 +3,14 @@ const { getTableColumnSet, normalizeTenantId } = require('../utils/sqlHelpers');
 const { ensureTenantScopedTable } = require('../utils/tenantScope');
 const { emitInventoryUpdated } = require('../services/realtimeEmitter');
 
+const resolveTenantIdFromRequest = (req) => normalizeTenantId(
+  req?.user?.tenantId ||
+  req?.user?.tenant_id ||
+  req?.tenant?.tenantId ||
+  req?.auth?.tenantId ||
+  req?.auth?.tenant_id,
+);
+
 const normalizePositiveInteger = (value, fallback, { min = 0, max = 1000 } = {}) => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
@@ -67,7 +75,10 @@ const resolveProductsSyncExpressions = async (tenantDb) => {
 
 const getProducts = async (req, res) => {
   try {
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     await ensureTenantScopedTable(req.tenantDb, 'products', tenantId);
     const limit = normalizePositiveInteger(req.query?.limit, 500, {
       min: 1,
@@ -139,7 +150,10 @@ const getProducts = async (req, res) => {
 
 const reduceStock = async (req, res) => {
   try {
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     await ensureTenantScopedTable(req.tenantDb, 'products', tenantId);
     const productId = req.params.id;
     const qty = Number(req.body?.qty);

@@ -65,34 +65,47 @@ const resolveUsernameFromRequest = (req) => {
     .trim();
 };
 
-const ensurePettyCashLogsTable = async (client) => {
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS petty_cash_logs (
-      id UUID PRIMARY KEY,
-      tenant_id TEXT NOT NULL,
-      user_id TEXT,
-      user_name TEXT,
-      amount INTEGER NOT NULL,
-      type VARCHAR(3) NOT NULL DEFAULT 'IN',
-      notes TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+const resolveTenantIdFromRequest = (req) => {
+  return (
+    req?.user?.tenantId ??
+    req?.user?.tenant_id ??
+    req?.tenant?.tenantId ??
+    req?.auth?.tenantId ??
+    req?.auth?.tenant_id ??
+    ''
+  )
+    .toString()
+    .trim();
+};
+
+const assertColumnsExist = async (client, table, columns = []) => {
+  const result = await client.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = ANY(current_schemas(false))
+       AND table_name = $1`,
+    [table],
+  );
+  const existingColumns = new Set((result.rows || []).map((row) => row.column_name));
+  const missingColumns = columns.filter((column) => !existingColumns.has(column));
+  if (missingColumns.length > 0) {
+    throw new Error(
+      `Schema guard: tabel ${table} belum memiliki kolom wajib: ${missingColumns.join(', ')}. Jalankan migrasi di core service.`,
     );
-  `);
+  }
+};
 
-  await client.query(`
-    ALTER TABLE petty_cash_logs
-    ADD COLUMN IF NOT EXISTS user_name TEXT;
-  `);
-
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_petty_cash_logs_created_at
-    ON petty_cash_logs (created_at DESC);
-  `);
-
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_petty_cash_logs_tenant_created_at
-    ON petty_cash_logs (tenant_id, created_at DESC);
-  `);
+const ensurePettyCashLogsTable = async (client) => {
+  await assertColumnsExist(client, 'petty_cash_logs', [
+    'id',
+    'tenant_id',
+    'user_id',
+    'user_name',
+    'amount',
+    'type',
+    'notes',
+    'created_at',
+  ]);
 };
 
 const mapPettyCashRow = (row = {}) => ({
@@ -116,9 +129,7 @@ const getTodayPettyCashLogs = async (req, res) => {
   try {
     await ensurePettyCashLogsTable(client);
 
-    const tenantId = (req?.tenant?.tenantId ?? req?.auth?.tenantId ?? '')
-      .toString()
-      .trim();
+    const tenantId = resolveTenantIdFromRequest(req);
 
     if (!tenantId) {
       return jsonError(res, 401, 'Tenant tidak valid');
@@ -160,9 +171,7 @@ const createPettyCashLog = async (req, res) => {
   const client = await req.tenantDb.connect();
 
   try {
-    const tenantId = (req?.tenant?.tenantId ?? req?.auth?.tenantId ?? '')
-      .toString()
-      .trim();
+    const tenantId = resolveTenantIdFromRequest(req);
     const userId = resolveUserIdFromRequest(req);
     const userName = resolveUsernameFromRequest(req);
     const amount = toIntegerAmount(req.body?.amount);

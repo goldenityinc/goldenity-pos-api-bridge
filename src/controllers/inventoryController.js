@@ -4,6 +4,14 @@ const { emitTableMutation } = require('../services/realtimeEmitter');
 const { getTableColumnSet, normalizeTenantId } = require('../utils/sqlHelpers');
 const { ensureTenantScopedTable } = require('../utils/tenantScope');
 
+const resolveTenantIdFromRequest = (req) => normalizeTenantId(
+  req?.user?.tenantId ||
+  req?.user?.tenant_id ||
+  req?.tenant?.tenantId ||
+  req?.auth?.tenantId ||
+  req?.auth?.tenant_id,
+);
+
 const INVENTORY_CSV_HEADERS = [
   'Nama',
   'Barcode',
@@ -105,7 +113,10 @@ const downloadInventoryTemplate = async (_req, res) => {
 
 const exportInventoryCsv = async (req, res) => {
   try {
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     await ensureTenantScopedTable(req.tenantDb, 'products', tenantId);
     const columnSet = await getTableColumnSet(req.tenantDb, 'products');
     const hasTenantColumn = columnSet.has('tenant_id');
@@ -145,7 +156,10 @@ const importInventoryCsv = async (req, res) => {
   }
 
   try {
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     await ensureTenantScopedTable(req.tenantDb, 'products', tenantId);
     const columnSet = await getTableColumnSet(req.tenantDb, 'products');
     const hasTenantColumn = columnSet.has('tenant_id');

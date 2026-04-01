@@ -17,6 +17,14 @@ const {
   storeResponse,
 } = require('../utils/idempotencyCache');
 
+const resolveTenantIdFromRequest = (req) => normalizeTenantId(
+  req?.user?.tenantId ||
+  req?.user?.tenant_id ||
+  req?.tenant?.tenantId ||
+  req?.auth?.tenantId ||
+  req?.auth?.tenant_id,
+);
+
 const ensureSelectedColumn = (selectValue, columnName) => {
   if (!selectValue || selectValue === '*') {
     return selectValue;
@@ -257,7 +265,10 @@ const completeItemWithinTransaction = async ({
 //   ?limit=N, ?orderBy=col, ?ascending=true/false, ?select=col1,col2
 const getOrderHistoryItems = async (req, res) => {
   try {
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     const columnSet = await getTableColumnSet(req.tenantDb, 'order_history_items');
     const query = {
       ...req.query,
@@ -291,7 +302,10 @@ const getOrderHistoryItems = async (req, res) => {
 
 const createOrderHistoryItems = async (req, res) => {
   try {
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     const cachedResponse = getCachedResponse(req, 'order_history_items');
     if (cachedResponse !== null) {
       return jsonOk(res, cachedResponse, 'Created (idempotent)', 200);
@@ -323,7 +337,10 @@ const completeOrderHistoryItem = async (req, res) => {
   const client = await req.tenantDb.connect();
   try {
     const { id } = req.params;
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     await ensureTenantScopedTable(client, 'order_history_items', tenantId);
     await ensureTenantScopedTable(client, 'products', tenantId);
 
@@ -360,7 +377,10 @@ const completeOrderHistoryItem = async (req, res) => {
 const completeOrderHistoryBatch = async (req, res) => {
   const client = await req.tenantDb.connect();
   try {
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     await ensureTenantScopedTable(client, 'order_history_items', tenantId);
     await ensureTenantScopedTable(client, 'products', tenantId);
 

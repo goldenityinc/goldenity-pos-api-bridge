@@ -46,18 +46,8 @@ const isIntegerColumnDefinition = (columnDefinition = {}) => {
   );
 };
 
-const generateNumericPrimaryKey = (() => {
-  let lastGeneratedId = 0;
-
-  return () => {
-    const nextId = Date.now();
-    lastGeneratedId = nextId > lastGeneratedId ? nextId : lastGeneratedId + 1;
-    return lastGeneratedId;
-  };
-})();
-
 const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions, options = {}) => {
-  const { table, isCreate = false } = options;
+  const { table } = options;
   if (!(columnDefinitions instanceof Map) || !isIntegerColumnDefinition(columnDefinitions.get('id'))) {
     return payload;
   }
@@ -69,27 +59,23 @@ const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions, options =
 
     const hasOwnId = Object.prototype.hasOwnProperty.call(row, 'id');
     if (!hasOwnId) {
-      if (table === 'products' && isCreate) {
-        return {
-          ...row,
-          id: generateNumericPrimaryKey(),
-        };
-      }
       return row;
     }
 
     const rawId = row.id;
     if (rawId === undefined || rawId === null) {
-      if (table === 'products' && isCreate) {
-        return {
-          ...row,
-          id: generateNumericPrimaryKey(),
-        };
-      }
-      return row;
+      const next = { ...row };
+      delete next.id;
+      return next;
     }
 
     const idText = rawId.toString().trim();
+    if (!idText) {
+      const next = { ...row };
+      delete next.id;
+      return next;
+    }
+
     if (/^\d+$/.test(idText)) {
       return row;
     }
@@ -103,11 +89,6 @@ const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions, options =
 
     if (!referenceId) {
       next.reference_id = idText;
-    }
-
-    if (table === 'products' && isCreate) {
-      next.id = generateNumericPrimaryKey();
-      return next;
     }
 
     delete next.id;
@@ -211,6 +192,16 @@ const normalizePayloadByTable = (table, payload) => {
   return normalizeRow(payload);
 };
 
+const resolveTenantIdFromRequest = (req) => {
+  return normalizeTenantId(
+    req?.user?.tenantId ||
+      req?.user?.tenant_id ||
+      req?.tenant?.tenantId ||
+      req?.auth?.tenantId ||
+      req?.auth?.tenant_id,
+  );
+};
+
 const validateIdValueForTable = (columnDefinitions, idField, rawId) => {
   if (!(columnDefinitions instanceof Map) || !columnDefinitions.has(idField)) {
     return;
@@ -283,7 +274,7 @@ async function normalizeUserPassword(table, payload, options = {}) {
 const createCrudController = (table) => ({
   list: async (req, res) => {
     try {
-      const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+      const tenantId = resolveTenantIdFromRequest(req);
       await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const rows = await runSelect(req.tenantDb, table, req.query, { tenantId });
       return jsonOk(res, rows);
@@ -308,7 +299,7 @@ const createCrudController = (table) => ({
             normalizedIncomingPayload.map((item) => normalizeUserPassword(table, item, { isCreate: true })),
           )
         : await normalizeUserPassword(table, normalizedIncomingPayload, { isCreate: true });
-      const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+      const tenantId = resolveTenantIdFromRequest(req);
       await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions, {
@@ -352,7 +343,7 @@ const createCrudController = (table) => ({
         parseBodyObject(req.body),
       );
       const payload = await normalizeUserPassword(table, normalizedIncomingPayload);
-      const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+      const tenantId = resolveTenantIdFromRequest(req);
       await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       validateIdValueForTable(columnDefinitions, idField, req.params.id);
@@ -393,7 +384,7 @@ const createCrudController = (table) => ({
   deleteById: async (req, res) => {
     try {
       const idField = req.query.idField || 'id';
-      const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+      const tenantId = resolveTenantIdFromRequest(req);
       await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       validateIdValueForTable(columnDefinitions, idField, req.params.id);

@@ -1,6 +1,14 @@
 const { jsonOk, jsonError } = require('../utils/http');
 const { runSelect, normalizeTenantId } = require('../utils/sqlHelpers');
 
+const resolveTenantIdFromRequest = (req) => normalizeTenantId(
+  req?.user?.tenantId ||
+  req?.user?.tenant_id ||
+  req?.tenant?.tenantId ||
+  req?.auth?.tenantId ||
+  req?.auth?.tenant_id,
+);
+
 const normalizeCategoriesQuery = (query = {}) => {
   const normalized = { ...query };
 
@@ -25,7 +33,10 @@ const normalizeCategoriesQuery = (query = {}) => {
 
 const getCategories = async (req, res) => {
   try {
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     const rows = await runSelect(
       req.tenantDb,
       'categories',

@@ -61,110 +61,62 @@ const defaultRolePayloads = () => {
   ];
 };
 
+const resolveTenantIdFromRequest = (req) => normalizeTenantId(
+  req?.user?.tenantId ||
+  req?.user?.tenant_id ||
+  req?.tenant?.tenantId ||
+  req?.auth?.tenantId ||
+  req?.auth?.tenant_id,
+);
+
+const assertColumnsExist = async (pool, table, columns = []) => {
+  const result = await pool.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = ANY(current_schemas(false))
+       AND table_name = $1`,
+    [table],
+  );
+  const existingColumns = new Set((result.rows || []).map((row) => row.column_name));
+  const missingColumns = columns.filter((column) => !existingColumns.has(column));
+  if (missingColumns.length > 0) {
+    throw new Error(
+      `Schema guard: tabel ${table} belum memiliki kolom wajib: ${missingColumns.join(', ')}. Jalankan migrasi di core service.`,
+    );
+  }
+};
+
 const ensureCustomRolesInfra = async (pool) => {
-  // Self-healing guard: tenant DB lama mungkin belum menjalankan migrasi custom_roles.
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS custom_roles (
-      id          UUID PRIMARY KEY,
-      tenant_id   TEXT NOT NULL,
-      name        VARCHAR(80) NOT NULL,
-      description TEXT,
-      is_default  BOOLEAN NOT NULL DEFAULT false,
-      permissions JSONB NOT NULL DEFAULT '{}',
-      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE(tenant_id, name)
-    )
-  `);
-
-  await pool.query(
-    'ALTER TABLE custom_roles ADD COLUMN IF NOT EXISTS tenant_id TEXT',
-  );
-
-  await pool.query(
-    'ALTER TABLE custom_roles ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT false',
-  );
-
-  await pool.query(
-    'ALTER TABLE custom_roles ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()',
-  );
-
-  await pool.query(
-    'ALTER TABLE custom_roles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()',
-  );
-
-  // Prisma-created tables use camelCase column names ("createdAt", "updatedAt").
-  // If those columns exist but lack a DEFAULT, INSERTs that omit them violate NOT NULL.
-  // Safely add defaults on both naming conventions so the controller INSERT works
-  // regardless of which naming convention was used when the table was created.
-  await pool.query('ALTER TABLE custom_roles ALTER COLUMN created_at SET DEFAULT NOW()').catch(() => {});
-  await pool.query('ALTER TABLE custom_roles ALTER COLUMN updated_at SET DEFAULT NOW()').catch(() => {});
-  await pool.query('ALTER TABLE custom_roles ALTER COLUMN "createdAt" SET DEFAULT NOW()').catch(() => {});
-  await pool.query('ALTER TABLE custom_roles ALTER COLUMN "updatedAt" SET DEFAULT NOW()').catch(() => {});
-
-  await pool.query(
-    'ALTER TABLE custom_roles ALTER COLUMN tenant_id SET NOT NULL',
-  ).catch(() => {});
-
-  await pool.query(
-    'CREATE INDEX IF NOT EXISTS idx_custom_roles_is_default ON custom_roles(is_default)',
-  );
-  await pool.query(
-    'CREATE INDEX IF NOT EXISTS idx_custom_roles_tenant_id ON custom_roles(tenant_id)',
-  );
-
-  await pool.query(`
-    ALTER TABLE app_users
-    ADD COLUMN IF NOT EXISTS custom_role_id UUID REFERENCES custom_roles(id) ON DELETE SET NULL
-  `);
+  await assertColumnsExist(pool, 'custom_roles', [
+    'id',
+    'tenant_id',
+    'name',
+    'permissions',
+    'is_default',
+    'created_at',
+    'updated_at',
+  ]);
+  await assertColumnsExist(pool, 'app_users', ['id', 'tenant_id', 'custom_role_id']);
 };
 
 const listRoles = async (req, res) => {
   try {
     const pool = req.db;
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     await ensureCustomRolesInfra(pool);
 
-    const columnsResult = await pool.query(
-      `SELECT column_name
-       FROM information_schema.columns
-       WHERE table_schema = ANY(current_schemas(false))
-         AND table_name = 'custom_roles'`,
+    const result = await pool.query(
+      `
+      SELECT id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
+      FROM custom_roles
+      WHERE tenant_id = $1
+      ORDER BY COALESCE(is_default, false) DESC, created_at ASC
+      `,
+      [tenantId],
     );
-    const columns = new Set(columnsResult.rows.map((row) => row.column_name));
-    const hasTenantColumn = columns.has('tenant_id');
-
-    let result;
-    if (hasTenantColumn) {
-      if (tenantId) {
-        result = await pool.query(
-          `
-          SELECT id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
-          FROM custom_roles
-          WHERE tenant_id = $1 OR tenant_id IS NULL
-          ORDER BY COALESCE(is_default, false) DESC, created_at ASC
-          `,
-          [tenantId],
-        );
-      } else {
-        result = await pool.query(
-          `
-          SELECT id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
-          FROM custom_roles
-          WHERE tenant_id IS NULL
-          ORDER BY COALESCE(is_default, false) DESC, created_at ASC
-          `,
-        );
-      }
-    } else {
-      result = await pool.query(
-        `
-        SELECT id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
-        FROM custom_roles
-        ORDER BY COALESCE(is_default, false) DESC, created_at ASC
-        `,
-      );
-    }
 
     return jsonOk(res, result.rows.map(normalizeRoleRow));
   } catch (error) {
@@ -176,7 +128,10 @@ const listRoles = async (req, res) => {
 const createRole = async (req, res) => {
   try {
     const pool = req.db;
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     await ensureCustomRolesInfra(pool);
     const { name, description = null, permissions } = req.body || {};
 
@@ -208,7 +163,10 @@ const createRole = async (req, res) => {
 const updateRole = async (req, res) => {
   try {
     const pool = req.db;
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     await ensureCustomRolesInfra(pool);
     const { id } = req.params;
     const { name, description, permissions } = req.body || {};
@@ -282,7 +240,10 @@ const updateRole = async (req, res) => {
 const deleteRole = async (req, res) => {
   try {
     const pool = req.db;
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     await ensureCustomRolesInfra(pool);
     const { id } = req.params;
 
@@ -310,7 +271,10 @@ const deleteRole = async (req, res) => {
 const seedDefaultRoles = async (req, res) => {
   try {
     const pool = req.db;
-    const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+    const tenantId = resolveTenantIdFromRequest(req);
+    if (!tenantId) {
+      return jsonError(res, 401, 'Tenant tidak valid');
+    }
     await ensureCustomRolesInfra(pool);
 
     for (const role of defaultRolePayloads()) {

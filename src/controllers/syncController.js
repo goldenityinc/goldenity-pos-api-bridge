@@ -26,18 +26,8 @@ const isIntegerColumnDefinition = (columnDefinition = {}) => {
   );
 };
 
-const generateNumericPrimaryKey = (() => {
-  let lastGeneratedId = 0;
-
-  return () => {
-    const nextId = Date.now();
-    lastGeneratedId = nextId > lastGeneratedId ? nextId : lastGeneratedId + 1;
-    return lastGeneratedId;
-  };
-})();
-
 const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions, options = {}) => {
-  const { table, isCreate = false } = options;
+  const { table } = options;
   if (!(columnDefinitions instanceof Map) || !isIntegerColumnDefinition(columnDefinitions.get('id'))) {
     return payload;
   }
@@ -47,27 +37,23 @@ const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions, options =
   }
 
   if (!Object.prototype.hasOwnProperty.call(payload, 'id')) {
-    if (table === 'products' && isCreate) {
-      return {
-        ...payload,
-        id: generateNumericPrimaryKey(),
-      };
-    }
     return payload;
   }
 
   const rawId = payload.id;
   if (rawId === undefined || rawId === null) {
-    if (table === 'products' && isCreate) {
-      return {
-        ...payload,
-        id: generateNumericPrimaryKey(),
-      };
-    }
-    return payload;
+    const next = { ...payload };
+    delete next.id;
+    return next;
   }
 
   const idText = rawId.toString().trim();
+  if (!idText) {
+    const next = { ...payload };
+    delete next.id;
+    return next;
+  }
+
   if (/^\d+$/.test(idText)) {
     return payload;
   }
@@ -79,13 +65,8 @@ const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions, options =
     .toString()
     .trim();
 
-  if (!referenceId) {
+  if (!referenceId && table === 'products') {
     next.reference_id = idText;
-  }
-
-  if (table === 'products' && isCreate) {
-    next.id = generateNumericPrimaryKey();
-    return next;
   }
 
   delete next.id;
@@ -169,48 +150,52 @@ const normalizePayloadForTable = (table, payload, options = {}) => {
   return payload;
 };
 
+const assertTableExists = async (tenantDb, table) => {
+  const result = await tenantDb.query(
+    `SELECT 1
+     FROM information_schema.tables
+     WHERE table_schema = ANY(current_schemas(false))
+       AND table_name = $1
+     LIMIT 1`,
+    [table],
+  );
+
+  if ((result.rowCount || 0) === 0) {
+    throw new Error(`Schema guard: tabel ${table} tidak ditemukan. Jalankan migrasi di core service.`);
+  }
+};
+
+const assertColumnsExist = async (tenantDb, table, columns = []) => {
+  if (!Array.isArray(columns) || columns.length === 0) {
+    return;
+  }
+
+  const result = await tenantDb.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = ANY(current_schemas(false))
+       AND table_name = $1`,
+    [table],
+  );
+  const existingColumns = new Set((result.rows || []).map((row) => row.column_name));
+  const missingColumns = columns.filter((column) => !existingColumns.has(column));
+  if (missingColumns.length > 0) {
+    throw new Error(
+      `Schema guard: tabel ${table} belum memiliki kolom wajib: ${missingColumns.join(', ')}. Jalankan migrasi di core service.`,
+    );
+  }
+};
+
 const ensureCustomersTable = async (tenantDb, table) => {
   if (table !== 'customers') return;
-
-  await tenantDb.query(`
-    CREATE TABLE IF NOT EXISTS customers (
-      id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      phone TEXT,
-      total_spent DOUBLE PRECISION DEFAULT 0,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-
-  await tenantDb.query(`
-    ALTER TABLE customers
-    ADD COLUMN IF NOT EXISTS total_spent DOUBLE PRECISION DEFAULT 0;
-  `);
-  await tenantDb.query(`
-    ALTER TABLE customers
-    ADD COLUMN IF NOT EXISTS tenant_id TEXT;
-  `);
+  await assertTableExists(tenantDb, 'customers');
+  await assertColumnsExist(tenantDb, 'customers', ['id', 'name', 'total_spent', 'tenant_id']);
 };
 
 const ensureProductsTableColumns = async (tenantDb, table) => {
   if (table !== 'products') return;
-
-  await tenantDb.query(`
-    ALTER TABLE products
-    ADD COLUMN IF NOT EXISTS image_url TEXT;
-  `);
-
-  await tenantDb.query(`
-    ALTER TABLE products
-    ADD COLUMN IF NOT EXISTS reference_id TEXT;
-  `);
-
-  await tenantDb.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_products_reference_id_unique
-    ON products (reference_id)
-    WHERE reference_id IS NOT NULL;
-  `);
+  await assertTableExists(tenantDb, 'products');
+  await assertColumnsExist(tenantDb, 'products', ['id', 'name', 'tenant_id']);
 };
 
 const findExistingRecordByReferenceId = async (tenantDb, table, payload, tenantId) => {
@@ -242,7 +227,13 @@ const hasMutationFields = (payload) => {
   return !!payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length > 0;
 };
 
-const resolveTenantId = (req) => normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
+const resolveTenantId = (req) => normalizeTenantId(
+  req?.user?.tenantId ||
+  req?.user?.tenant_id ||
+  req?.tenant?.tenantId ||
+  req?.auth?.tenantId ||
+  req?.auth?.tenant_id,
+);
 
 const toNumber = (value) => {
   const numberValue = Number(value);
@@ -336,39 +327,19 @@ const normalizeSalesRecordItems = (items) => {
 
 const ensureSalesRecordsItemsColumn = async (tenantDb, table) => {
   if (table !== 'sales_records') return;
-  await tenantDb.query(`
-    ALTER TABLE sales_records
-    ADD COLUMN IF NOT EXISTS items_json JSONB;
-  `);
+  await assertTableExists(tenantDb, 'sales_records');
+  await assertColumnsExist(tenantDb, 'sales_records', ['id', 'tenant_id', 'items_json']);
 };
 
 const ensureSalesRecordItemsTable = async (tenantDb, table) => {
   if (table !== 'sales_records') return;
-  await tenantDb.query(`
-    CREATE TABLE IF NOT EXISTS sales_record_items (
-      id BIGSERIAL PRIMARY KEY,
-      tenant_id TEXT,
-      sales_record_id BIGINT NOT NULL,
-      product_id TEXT,
-      product_name TEXT,
-      qty INTEGER NOT NULL DEFAULT 1,
-      custom_price NUMERIC(14,2),
-      note TEXT,
-      is_service BOOLEAN NOT NULL DEFAULT FALSE,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-
-  await tenantDb.query(`
-    CREATE INDEX IF NOT EXISTS idx_sales_record_items_sales_record_id
-    ON sales_record_items (sales_record_id);
-  `);
-
-  await tenantDb.query(`
-    CREATE INDEX IF NOT EXISTS idx_sales_record_items_tenant_id
-    ON sales_record_items (tenant_id);
-  `);
+  await assertTableExists(tenantDb, 'sales_record_items');
+  await assertColumnsExist(tenantDb, 'sales_record_items', [
+    'sales_record_id',
+    'tenant_id',
+    'product_id',
+    'qty',
+  ]);
 };
 
 const syncSalesRecordItems = async (tenantDb, tenantId, salesRecordId, items) => {

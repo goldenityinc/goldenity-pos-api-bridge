@@ -9,7 +9,12 @@ const ALLOWED_STATUS = new Set([
 ]);
 
 const normalizeTenantId = (req) => (
-  req?.tenant?.tenantId ?? req?.auth?.tenantId ?? req?.auth?.tenant_id ?? ''
+  req?.user?.tenantId
+  ?? req?.user?.tenant_id
+  ?? req?.tenant?.tenantId
+  ?? req?.auth?.tenantId
+  ?? req?.auth?.tenant_id
+  ?? ''
 )
   .toString()
   .trim();
@@ -115,87 +120,40 @@ const sumServiceDetails = (serviceDetails) => {
   }, 0);
 };
 
-const ensureServiceOrdersTable = async (client) => {
-  // Create table if not exists with proper defaults
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS service_orders (
-      id TEXT PRIMARY KEY,
-      tenant_id TEXT NOT NULL,
-      customer_name TEXT NOT NULL,
-      customer_phone TEXT,
-      device_type TEXT NOT NULL,
-      device_brand TEXT,
-      serial_number TEXT,
-      complaint TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'PENDING',
-      estimated_cost NUMERIC(14,2),
-      technician_notes TEXT,
-      service_details JSONB,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+const assertColumnsExist = async (client, table, columns = []) => {
+  const result = await client.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = ANY(current_schemas(false))
+       AND table_name = $1`,
+    [table],
+  );
+  const existingColumns = new Set((result.rows || []).map((row) => row.column_name));
+  const missingColumns = columns.filter((column) => !existingColumns.has(column));
+  if (missingColumns.length > 0) {
+    throw new Error(
+      `Schema guard: tabel ${table} belum memiliki kolom wajib: ${missingColumns.join(', ')}. Jalankan migrasi di core service.`,
     );
-  `);
-
-  try {
-    await client.query(`
-      ALTER TABLE service_orders
-      ADD COLUMN IF NOT EXISTS technician_notes TEXT
-    `);
-  } catch (err) {
-    console.warn('[ensureServiceOrdersTable] technician_notes ALTER warning:', err.message);
   }
+};
 
-  try {
-    await client.query(`
-      ALTER TABLE service_orders
-      ADD COLUMN IF NOT EXISTS service_details JSONB
-    `);
-  } catch (err) {
-    console.warn('[ensureServiceOrdersTable] service_details ALTER warning:', err.message);
-  }
-
-  // Fix existing table schema if needed - ensure timestamp columns have defaults
-  try {
-    // Attempt to add/fix default for created_at (ignore if already exists)
-    await client.query(`
-      ALTER TABLE service_orders 
-      ALTER COLUMN created_at SET DEFAULT NOW()
-    `);
-  } catch (err) {
-    // Expected if column already has default
-    if (!err.message.includes('already has a default definition')) {
-      console.warn('[ensureServiceOrdersTable] created_at ALTER warning:', err.message);
-    }
-  }
-
-  try {
-    // Attempt to add/fix default for updated_at (ignore if already exists)
-    await client.query(`
-      ALTER TABLE service_orders 
-      ALTER COLUMN updated_at SET DEFAULT NOW()
-    `);
-  } catch (err) {
-    // Expected if column already has default
-    if (!err.message.includes('already has a default definition')) {
-      console.warn('[ensureServiceOrdersTable] updated_at ALTER warning:', err.message);
-    }
-  }
-
-  // Create indexes if they don't exist
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_service_orders_tenant_id
-    ON service_orders (tenant_id);
-  `);
-
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_service_orders_tenant_status
-    ON service_orders (tenant_id, status);
-  `);
-
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_service_orders_created_at
-    ON service_orders (created_at DESC);
-  `);
+const ensureServiceOrdersTable = async (client) => {
+  await assertColumnsExist(client, 'service_orders', [
+    'id',
+    'tenant_id',
+    'customer_name',
+    'customer_phone',
+    'device_type',
+    'device_brand',
+    'serial_number',
+    'complaint',
+    'status',
+    'estimated_cost',
+    'technician_notes',
+    'service_details',
+    'created_at',
+    'updated_at',
+  ]);
 };
 
 const mapRow = (row = {}) => ({
