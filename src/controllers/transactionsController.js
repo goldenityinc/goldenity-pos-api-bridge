@@ -95,6 +95,15 @@ const ensureSalesRecordsKasBonColumns = async (client) => {
   ]);
 };
 
+const ensureSalesRecordsFinancialColumns = async (client) => {
+  await client.query(
+    `ALTER TABLE sales_records
+       ADD COLUMN IF NOT EXISTS total_discount BIGINT,
+       ADD COLUMN IF NOT EXISTS total_tax BIGINT,
+       ADD COLUMN IF NOT EXISTS total_profit BIGINT`,
+  );
+};
+
 const hasMeaningfulValue = (value) => {
   if (value === null || value === undefined) {
     return false;
@@ -476,6 +485,7 @@ const createTransaction = async (req, res) => {
     await ensureSalesRecordsCashierColumns(client);
     await ensureSalesRecordsCustomerColumn(client);
     await ensureSalesRecordsKasBonColumns(client);
+    await ensureSalesRecordsFinancialColumns(client);
     await ensureSalesRecordsItemsColumn(client);
     await ensureSalesRecordItemsTable(client);
     await ensureTenantScopedTable(client, 'sales_records', tenantId);

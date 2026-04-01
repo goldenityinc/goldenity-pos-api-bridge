@@ -207,16 +207,27 @@ model Supplier {
 }
 
 model Expense {
-  id        BigInt    @id @default(autoincrement())
-  tenantId  String?   @map("tenant_id")
-  amount    Decimal?
-  notes     String?
-  createdAt DateTime? @default(now()) @map("created_at")
-  updatedAt DateTime? @default(now()) @map("updated_at")
+  id              BigInt    @id @default(autoincrement())
+  tenantId        String?   @map("tenant_id")
+  expenseNumber   String?   @map("expense_number")
+  title           String?   @default("Pengeluaran")
+  description     String?
+  notes           String?
+  amount          Decimal?  @default(0)
+  paymentMethod   String?   @default("Cash") @map("payment_method")
+  status          String?   @default("active")
+  voidReason      String?   @map("void_reason")
+  voidedAt        DateTime? @map("voided_at")
+  attachmentUrl   String?   @map("attachment_url")
+  categoryType    String?   @map("category_type")
+  referenceId     String?   @map("reference_id")
+  createdAt       DateTime? @default(now()) @map("created_at")
+  updatedAt       DateTime? @default(now()) @map("updated_at")
 
-  tenant    Tenant?   @relation(fields: [tenantId], references: [id])
+  tenant          Tenant?   @relation(fields: [tenantId], references: [id])
 
   @@index([tenantId])
+  @@index([status])
   @@map("expenses")
 }
 

@@ -629,6 +629,178 @@ const normalizeSalesRecordId = (value) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
+const toFiniteNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const normalizeBoolean = (value) => {
+  if (value === true || value === false) {
+    return value;
+  }
+
+  const normalized = (value ?? '').toString().trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return ['true', '1', 'yes', 'y'].includes(normalized);
+};
+
+const normalizeProductId = (value) => {
+  const id = (value ?? '').toString().trim();
+  return id || null;
+};
+
+const collectProductIdsFromItems = (items = []) => {
+  const ids = new Set();
+
+  for (const item of items) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+
+    const isService =
+      normalizeBoolean(item.is_service) ||
+      normalizeBoolean(item.isService) ||
+      normalizeBoolean(item?.product?.is_service) ||
+      normalizeBoolean(item?.product?.isService);
+    if (isService) {
+      continue;
+    }
+
+    const productId = normalizeProductId(
+      item.product_id ?? item.productId ?? item?.product?.id,
+    );
+    if (productId) {
+      ids.add(productId);
+    }
+  }
+
+  return Array.from(ids);
+};
+
+const loadProductPurchasePriceMap = async (tenantDb, productIds, tenantId) => {
+  if (!Array.isArray(productIds) || productIds.length === 0) {
+    return new Map();
+  }
+
+  try {
+    const normalizedTenantId = normalizeTenantId(tenantId);
+    const productColumns = await getTableColumnSet(tenantDb, 'products');
+    const hasTenantColumn = productColumns.has('tenant_id');
+
+    const result = await tenantDb.query(
+      hasTenantColumn
+        ? `SELECT id::text AS id, purchase_price
+           FROM products
+           WHERE tenant_id = $1
+             AND id::text = ANY($2::text[])`
+        : `SELECT id::text AS id, purchase_price
+           FROM products
+           WHERE id::text = ANY($1::text[])`,
+      hasTenantColumn ? [normalizedTenantId, productIds] : [productIds],
+    );
+
+    const priceMap = new Map();
+    for (const row of result.rows || []) {
+      const id = normalizeProductId(row?.id);
+      if (!id) {
+        continue;
+      }
+      priceMap.set(id, toFiniteNumber(row?.purchase_price) ?? 0);
+    }
+    return priceMap;
+  } catch (_) {
+    return new Map();
+  }
+};
+
+const extractItemQty = (item = {}) => {
+  const qty = toFiniteNumber(item.qty ?? item.quantity ?? 0);
+  if (qty === null || qty <= 0) {
+    return 0;
+  }
+  return qty;
+};
+
+const extractItemSellingPrice = (item = {}) => {
+  const candidates = [
+    item.custom_price,
+    item.customPrice,
+    item.product_price,
+    item.productPrice,
+    item.price,
+    item.unit_price,
+    item.unitPrice,
+    item?.product?.price,
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = toFiniteNumber(candidate);
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+
+  return 0;
+};
+
+const extractItemPurchasePrice = (item = {}, purchasePriceMap = new Map()) => {
+  const productId = normalizeProductId(
+    item.product_id ?? item.productId ?? item?.product?.id,
+  );
+
+  const candidates = [
+    item.purchase_price,
+    item.purchasePrice,
+    item.product_purchase_price,
+    item.productPurchasePrice,
+    item?.product?.purchase_price,
+    item?.product?.purchasePrice,
+    productId ? purchasePriceMap.get(productId) : null,
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = toFiniteNumber(candidate);
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+
+  return 0;
+};
+
+const calculateProfitFromItems = (items = [], purchasePriceMap = new Map()) => {
+  let totalProfit = 0;
+
+  for (const item of items) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+
+    const isService =
+      normalizeBoolean(item.is_service) ||
+      normalizeBoolean(item.isService) ||
+      normalizeBoolean(item?.product?.is_service) ||
+      normalizeBoolean(item?.product?.isService);
+    if (isService) {
+      continue;
+    }
+
+    const qty = extractItemQty(item);
+    if (qty <= 0) {
+      continue;
+    }
+
+    const sellingPrice = extractItemSellingPrice(item);
+    const purchasePrice = extractItemPurchasePrice(item, purchasePriceMap);
+    totalProfit += (sellingPrice - purchasePrice) * qty;
+  }
+
+  return Math.round(totalProfit);
+};
+
 const parseItemsFromJsonField = (value) => {
   if (!value) {
     return [];
@@ -733,15 +905,48 @@ const listRecords = async (req, res) => {
         tenantId,
       );
 
+      const allItems = [];
+      if (Array.isArray(normalizedRows)) {
+        for (const row of normalizedRows) {
+          const rowId = normalizeSalesRecordId(row?.id);
+          const relationItems = rowId !== null ? itemsMap.get(rowId) || [] : [];
+          const fallbackItems = parseItemsFromJsonField(row?.items_json ?? row?.items);
+          allItems.push(...(relationItems.length > 0 ? relationItems : fallbackItems));
+        }
+      }
+
+      const productPurchasePriceMap = await loadProductPurchasePriceMap(
+        req.tenantDb,
+        collectProductIdsFromItems(allItems),
+        tenantId,
+      );
+
       const hydratedRows = Array.isArray(normalizedRows)
         ? normalizedRows.map((row) => {
           const rowId = normalizeSalesRecordId(row?.id);
           const relationItems = rowId !== null ? itemsMap.get(rowId) || [] : [];
+          const resolvedItems = relationItems.length > 0
+            ? relationItems
+            : parseItemsFromJsonField(row?.items_json ?? row?.items);
+
+          const existingProfit = toFiniteNumber(
+            row?.total_profit ?? row?.totalProfit ?? row?.profit ?? row?.gross_profit ?? row?.grossProfit,
+          );
+          const computedProfit = calculateProfitFromItems(
+            resolvedItems,
+            productPurchasePriceMap,
+          );
+
+          const shouldUseComputedProfit =
+            existingProfit === null ||
+            (Math.abs(existingProfit) < 0.000001 && computedProfit !== 0);
+
           return {
             ...row,
-            items: relationItems.length > 0
-              ? relationItems
-              : parseItemsFromJsonField(row?.items_json ?? row?.items),
+            items: resolvedItems,
+            total_profit: shouldUseComputedProfit
+              ? computedProfit
+              : Math.round(existingProfit),
           };
         })
         : normalizedRows;

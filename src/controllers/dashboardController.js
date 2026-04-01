@@ -79,6 +79,9 @@ const getTodayDashboardSummary = async (req, res) => {
     const salesAmountColumn = salesColumns.has('total_price')
       ? 'total_price'
       : (salesColumns.has('total_amount') ? 'total_amount' : '0');
+    const salesProfitColumn = salesColumns.has('total_profit')
+      ? 'total_profit'
+      : (salesColumns.has('profit') ? 'profit' : (salesColumns.has('gross_profit') ? 'gross_profit' : '0'));
     const salesPaymentColumn = salesColumns.has('payment_method')
       ? 'payment_method'
       : (salesColumns.has('payment_type') ? 'payment_type' : null);
@@ -109,6 +112,7 @@ const getTodayDashboardSummary = async (req, res) => {
       `SELECT
          COUNT(*)::int AS total_transactions,
          COALESCE(SUM(${salesAmountColumn}), 0)::numeric AS total_sales,
+         COALESCE(SUM(${salesProfitColumn}), 0)::numeric AS total_gross_profit,
          COALESCE(SUM(CASE
            WHEN ${normalizedSalesPaymentExpression} IN ('CASH', 'TUNAI')
              THEN ${salesAmountColumn}
@@ -255,6 +259,7 @@ const getTodayDashboardSummary = async (req, res) => {
     }
 
     const totalSales = toInt(salesResult.rows?.[0]?.total_sales || 0);
+    const totalGrossProfit = toInt(salesResult.rows?.[0]?.total_gross_profit || 0);
     const totalRevenue = toInt(settledRevenueResult.rows?.[0]?.total_revenue || 0);
     const totalTransactions = toInt(salesResult.rows?.[0]?.total_transactions || 0);
     const totalIncomeCash = toInt(salesResult.rows?.[0]?.total_income_cash || 0);
@@ -285,7 +290,7 @@ const getTodayDashboardSummary = async (req, res) => {
         summary_date: wibDate,
         total_sales: totalSales,
         total_revenue: totalRevenue,
-        gross_profit: totalRevenue,
+        gross_profit: totalGrossProfit,
         total_transactions: totalTransactions,
         total_void_transactions: totalVoidTransactions,
         total_expenses: totalExpenses,
