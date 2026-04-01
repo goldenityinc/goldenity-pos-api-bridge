@@ -17,6 +17,7 @@ const {
 } = require('../utils/sqlHelpers');
 const { ensureTenantScopedTable } = require('../utils/tenantScope');
 const { emitTableMutation } = require('../services/realtimeEmitter');
+const { uploadBase64Object } = require('../services/objectStorageService');
 
 const createHttpError = (statusCode, message) => {
   const error = new Error(message);
@@ -181,6 +182,60 @@ const validateProductCreateOrUpsertPayload = (table, payload) => {
       purchasePrice: extractPurchasePrice(row),
     });
   }
+};
+
+const sanitizeAttachmentFileName = (originalName = '') => {
+  const raw = originalName.toString().trim().toLowerCase();
+  const safeBase = raw
+    .replace(/\.[a-z0-9]+$/i, '')
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 40);
+
+  const extensionMatch = raw.match(/\.([a-z0-9]+)$/i);
+  const extension = extensionMatch ? extensionMatch[1] : 'jpg';
+  const baseName = safeBase || 'expense-receipt';
+  return `${baseName}-${Date.now()}.${extension}`;
+};
+
+const uploadExpenseAttachmentFile = async (file) => {
+  if (!file || !file.buffer) {
+    throw createHttpError(400, 'File attachment wajib diisi');
+  }
+
+  const fileName = sanitizeAttachmentFileName(file.originalname || 'receipt.jpg');
+  const base64 = file.buffer.toString('base64');
+  const uploaded = await uploadBase64Object({
+    bucket: 'receipts',
+    fileName,
+    base64,
+    contentType: file.mimetype || 'application/octet-stream',
+  });
+
+  return (uploaded?.url || '').toString().trim();
+};
+
+const enrichExpensePayloadWithUploadedAttachment = async ({ table, payload, req }) => {
+  if ((table || '').toString().trim().toLowerCase() !== 'expenses' || !req?.file) {
+    return payload;
+  }
+
+  if (Array.isArray(payload)) {
+    throw createHttpError(400, 'Upload attachment hanya mendukung satu payload pengeluaran');
+  }
+
+  const uploadedUrl = await uploadExpenseAttachmentFile(req.file);
+  if (!uploadedUrl) {
+    throw createHttpError(500, 'Upload attachment gagal');
+  }
+
+  return {
+    ...payload,
+    attachment_url: uploadedUrl,
+    attachmentUrl: uploadedUrl,
+    attachment: uploadedUrl,
+  };
 };
 
 const normalizeSupplierPayloadObject = (payload = {}) => {
@@ -778,11 +833,16 @@ const createRecords = async (req, res) => {
       tenantId,
       async () => {
         const arrayPayload = parseBodyArray(req.body);
-        const payload = normalizePayloadForTable(
+        const basePayload = normalizePayloadForTable(
           table,
           arrayPayload || parseBodyObject(req.body),
           { isCreate: true },
         );
+        const payload = await enrichExpensePayloadWithUploadedAttachment({
+          table,
+          payload: basePayload,
+          req,
+        });
         const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
         const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
         const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
@@ -954,11 +1014,16 @@ const updateRecordById = async (req, res) => {
       tenantId,
       async () => {
         const idField = req.query.idField || 'id';
-        const payload = normalizePayloadForTable(
+        const basePayload = normalizePayloadForTable(
           table,
           parseBodyObject(req.body),
           { isCreate: false },
         );
+        const payload = await enrichExpensePayloadWithUploadedAttachment({
+          table,
+          payload: basePayload,
+          req,
+        });
         const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
         const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
         const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
@@ -1021,6 +1086,23 @@ const updateRecordById = async (req, res) => {
   }
 };
 
+const uploadExpenseAttachment = async (req, res) => {
+  try {
+    const url = await uploadExpenseAttachmentFile(req.file);
+    if (!url) {
+      throw createHttpError(500, 'Upload attachment gagal');
+    }
+    return jsonOk(res, { url }, 'Upload attachment berhasil', 201);
+  } catch (error) {
+    return jsonError(
+      res,
+      error.statusCode || 500,
+      error.message || 'Upload attachment gagal',
+      error.message,
+    );
+  }
+};
+
 const deleteRecordById = async (req, res) => {
   try {
     const table = req.params.table;
@@ -1059,4 +1141,5 @@ module.exports = {
   upsertRecords,
   updateRecordById,
   deleteRecordById,
+  uploadExpenseAttachment,
 };
