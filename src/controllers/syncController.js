@@ -26,7 +26,18 @@ const isIntegerColumnDefinition = (columnDefinition = {}) => {
   );
 };
 
-const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions) => {
+const generateNumericPrimaryKey = (() => {
+  let lastGeneratedId = 0;
+
+  return () => {
+    const nextId = Date.now();
+    lastGeneratedId = nextId > lastGeneratedId ? nextId : lastGeneratedId + 1;
+    return lastGeneratedId;
+  };
+})();
+
+const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions, options = {}) => {
+  const { table, isCreate = false } = options;
   if (!(columnDefinitions instanceof Map) || !isIntegerColumnDefinition(columnDefinitions.get('id'))) {
     return payload;
   }
@@ -36,16 +47,28 @@ const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions) => {
   }
 
   if (!Object.prototype.hasOwnProperty.call(payload, 'id')) {
+    if (table === 'products' && isCreate) {
+      return {
+        ...payload,
+        id: generateNumericPrimaryKey(),
+      };
+    }
     return payload;
   }
 
   const rawId = payload.id;
   if (rawId === undefined || rawId === null) {
+    if (table === 'products' && isCreate) {
+      return {
+        ...payload,
+        id: generateNumericPrimaryKey(),
+      };
+    }
     return payload;
   }
 
   const idText = rawId.toString().trim();
-  if (!idText || /^\d+$/.test(idText)) {
+  if (/^\d+$/.test(idText)) {
     return payload;
   }
 
@@ -58,6 +81,11 @@ const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions) => {
 
   if (!referenceId) {
     next.reference_id = idText;
+  }
+
+  if (table === 'products' && isCreate) {
+    next.id = generateNumericPrimaryKey();
+    return next;
   }
 
   delete next.id;
@@ -412,9 +440,11 @@ const runSync = async (req, res) => {
       delete payload.items;
 
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-      const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
-      // Note: sanitizeClientGeneratedPrimaryKey removes non-integer IDs to prevent ON CONFLICT errors
-      // Products without valid integer IDs will use reference_id instead and rely on regular INSERT
+      const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions, {
+        table,
+        isCreate: true,
+      });
+      // Note: product sync inserts must emit a numeric bigint-compatible id; client UUIDs stay in reference_id
       const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
       const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
       if (!hasMutationFields(filteredPayload)) {

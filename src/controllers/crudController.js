@@ -46,7 +46,18 @@ const isIntegerColumnDefinition = (columnDefinition = {}) => {
   );
 };
 
-const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions) => {
+const generateNumericPrimaryKey = (() => {
+  let lastGeneratedId = 0;
+
+  return () => {
+    const nextId = Date.now();
+    lastGeneratedId = nextId > lastGeneratedId ? nextId : lastGeneratedId + 1;
+    return lastGeneratedId;
+  };
+})();
+
+const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions, options = {}) => {
+  const { table, isCreate = false } = options;
   if (!(columnDefinitions instanceof Map) || !isIntegerColumnDefinition(columnDefinitions.get('id'))) {
     return payload;
   }
@@ -56,17 +67,30 @@ const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions) => {
       return row;
     }
 
-    if (!Object.prototype.hasOwnProperty.call(row, 'id')) {
+    const hasOwnId = Object.prototype.hasOwnProperty.call(row, 'id');
+    if (!hasOwnId) {
+      if (table === 'products' && isCreate) {
+        return {
+          ...row,
+          id: generateNumericPrimaryKey(),
+        };
+      }
       return row;
     }
 
     const rawId = row.id;
     if (rawId === undefined || rawId === null) {
+      if (table === 'products' && isCreate) {
+        return {
+          ...row,
+          id: generateNumericPrimaryKey(),
+        };
+      }
       return row;
     }
 
     const idText = rawId.toString().trim();
-    if (!idText || /^\d+$/.test(idText)) {
+    if (/^\d+$/.test(idText)) {
       return row;
     }
 
@@ -79,6 +103,11 @@ const sanitizeClientGeneratedPrimaryKey = (payload, columnDefinitions) => {
 
     if (!referenceId) {
       next.reference_id = idText;
+    }
+
+    if (table === 'products' && isCreate) {
+      next.id = generateNumericPrimaryKey();
+      return next;
     }
 
     delete next.id;
@@ -260,9 +289,11 @@ const createCrudController = (table) => ({
       const tenantId = normalizeTenantId(req.tenant?.tenantId || req.auth?.tenantId);
       await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
-      const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);
-      // Note: sanitizeClientGeneratedPrimaryKey removes non-integer IDs (UUID from client) to prevent ON CONFLICT errors
-      // These are automatically stored in reference_id column for products
+      const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions, {
+        table,
+        isCreate: true,
+      });
+      // Note: product creates must always carry a numeric id for bigint schemas; client UUIDs are preserved in reference_id
       const tenantScopedPayload = enforceTenantIdOnPayload(sanitizedPayload, tenantId, columnDefinitions);
       const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, columnDefinitions);
       const hasFields = Array.isArray(filteredPayload)
