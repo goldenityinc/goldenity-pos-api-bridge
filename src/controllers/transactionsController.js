@@ -87,11 +87,18 @@ const ensureSalesRecordsCustomerColumn = async (client) => {
 };
 
 const ensureSalesRecordsKasBonColumns = async (client) => {
+  await client.query(
+    `ALTER TABLE sales_records
+       ADD COLUMN IF NOT EXISTS remaining_balance NUMERIC,
+       ADD COLUMN IF NOT EXISTS outstanding_balance NUMERIC,
+       ADD COLUMN IF NOT EXISTS amount_paid NUMERIC DEFAULT 0`,
+  );
   await assertColumnsExist(client, 'sales_records', [
     'payment_method',
     'payment_status',
     'remaining_balance',
     'outstanding_balance',
+    'amount_paid',
   ]);
 };
 
@@ -348,11 +355,20 @@ const syncSalesRecordItems = async (client, salesRecordId, tenantId, items) => {
 };
 
 const ensureKasBonHistoryTable = async (client) => {
+  await client.query(
+    `ALTER TABLE kas_bon_payment_history
+       ADD COLUMN IF NOT EXISTS payment_method TEXT,
+       ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ DEFAULT NOW(),
+       ADD COLUMN IF NOT EXISTS note TEXT`,
+  );
   await assertColumnsExist(client, 'kas_bon_payment_history', [
     'sales_record_id',
     'tenant_id',
     'paid_amount',
     'remaining_balance',
+    'payment_method',
+    'paid_at',
+    'note',
   ]);
 };
 
@@ -385,8 +401,14 @@ const listActiveKasBon = async (req, res) => {
       return jsonError(res, 500, 'Kolom kas bon sales_records tidak lengkap');
     }
 
+    await ensureKasBonHistoryTable(client);
+
+    const statusFilter = (req.query?.status || 'all').toString().trim().toLowerCase();
+
     const normalizedPaymentExpression = `REPLACE(REPLACE(REPLACE(UPPER(COALESCE(${paymentColumn}::text, '')), ' ', ''), '-', ''), '_', '')`;
-    const filters = [`${normalizedPaymentExpression} = 'KASBON'`];
+    const filters = [
+      `(${normalizedPaymentExpression} = 'KASBON' OR ${normalizedPaymentExpression} LIKE 'LUNAS%' OR kh.sales_record_id IS NOT NULL)`,
+    ];
     filters.push('tenant_id = $1');
     // Only use payment_status column if it explicitly exists
     const paymentStatusColumn = columns.has('payment_status') ? 'payment_status' : null;
@@ -398,14 +420,32 @@ const listActiveKasBon = async (req, res) => {
     const balanceExpression = remainingColumn
       ? `COALESCE(${remainingColumn}, ${amountColumn}, 0)`
       : `COALESCE(${amountColumn}, 0)`;
-    filters.push(`${balanceExpression} > 0`);
+    const amountPaidExpression = `COALESCE(sr.amount_paid, kh.total_paid, GREATEST(COALESCE(sr.${amountColumn}, 0) - ${balanceExpression}, 0), 0)`;
+
+    if (statusFilter === 'unpaid' || statusFilter === 'belum-bayar') {
+      filters.push(`${balanceExpression} > 0`);
+      filters.push(`${amountPaidExpression} <= 0`);
+    } else if (statusFilter === 'partial' || statusFilter === 'bayar-sebagian') {
+      filters.push(`${balanceExpression} > 0`);
+      filters.push(`${amountPaidExpression} > 0`);
+    } else if (statusFilter === 'paid' || statusFilter === 'lunas') {
+      filters.push(`(${balanceExpression} <= 0 OR UPPER(COALESCE(sr.payment_status::text, '')) = 'LUNAS')`);
+    }
 
     const orderColumn = columns.has('created_at') ? 'created_at' : 'id';
     const rowsResult = await client.query(
-      `SELECT *
-       FROM sales_records
+      `SELECT sr.*,
+              kh.total_paid AS history_paid_amount,
+              ${amountPaidExpression} AS computed_amount_paid
+       FROM sales_records sr
+       LEFT JOIN (
+         SELECT sales_record_id, SUM(paid_amount) AS total_paid
+         FROM kas_bon_payment_history
+         WHERE tenant_id = $1
+         GROUP BY sales_record_id
+       ) kh ON kh.sales_record_id = sr.id
        WHERE ${filters.join(' AND ')}
-       ORDER BY ${orderColumn} DESC`,
+       ORDER BY sr.${orderColumn} DESC`,
       columns.has('tenant_id') ? [tenantId] : [],
     );
 
@@ -414,14 +454,32 @@ const listActiveKasBon = async (req, res) => {
       const remainingBalance = toNumber(
         row[remainingColumn] ?? row.remaining_balance ?? row.outstanding_balance ?? row[amountColumn],
       );
+      const amountPaid = toNumber(
+        row.amount_paid ?? row.computed_amount_paid ?? row.history_paid_amount,
+      );
+
+      const normalizedRemaining = Number.isFinite(remainingBalance) ? remainingBalance : 0;
+      const normalizedPaid = Number.isFinite(amountPaid)
+        ? amountPaid
+        : Math.max(0, (Number.isFinite(totalAmount) ? totalAmount : 0) - normalizedRemaining);
+
+      const normalizedStatus = (
+        row[paymentStatusColumn || 'payment_status'] ?? row.payment_status ?? ''
+      ).toString().trim();
+
+      const resolvedStatus = normalizedRemaining <= 0
+        ? 'LUNAS'
+        : (normalizedPaid > 0 ? 'BELUM LUNAS (DICICIL)' : (normalizedStatus || 'BELUM LUNAS'));
 
       return {
         ...row,
         total_price: Number.isFinite(totalAmount) ? totalAmount : 0,
         total_amount: Number.isFinite(totalAmount) ? totalAmount : 0,
-        remaining_balance: Number.isFinite(remainingBalance) ? remainingBalance : 0,
-        outstanding_balance: Number.isFinite(remainingBalance) ? remainingBalance : 0,
-        payment_status: (row[paymentStatusColumn || 'payment_status'] ?? '').toString().trim(),
+        remaining_balance: normalizedRemaining,
+        outstanding_balance: normalizedRemaining,
+        amount_paid: normalizedPaid,
+        payment_status: resolvedStatus,
+        payment_status_label: resolvedStatus,
       };
     });
 
@@ -651,6 +709,11 @@ const settleKasBon = async (req, res) => {
     await ensureSalesRecordsKasBonColumns(client);
     const id = req.params.id;
     const paidAmount = toNumber(req.body?.paid_amount ?? req.body?.amount);
+    const settlementMethod = (req.body?.settlement_method || req.body?.payment_method || 'Cash')
+      .toString()
+      .trim();
+    const settlementNote = (req.body?.note || req.body?.settlement_note || '').toString().trim();
+    const paidAt = req.body?.paid_at ? new Date(req.body.paid_at) : new Date();
 
     if (!id) {
       return jsonError(res, 400, 'id transaksi wajib diisi');
@@ -689,6 +752,7 @@ const settleKasBon = async (req, res) => {
               ${paymentColumn} AS payment_value,
               ${amountColumn} AS amount_value,
               ${columns.has('payment_status') ? 'payment_status,' : "NULL::TEXT AS payment_status,"}
+              ${columns.has('amount_paid') ? 'amount_paid,' : 'NULL::NUMERIC AS amount_paid,'}
               ${columns.has('outstanding_balance') ? 'outstanding_balance,' : 'NULL::NUMERIC AS outstanding_balance,'}
               remaining_balance
        FROM sales_records
@@ -724,6 +788,9 @@ const settleKasBon = async (req, res) => {
       : (Number.isFinite(toNumber(transaction.outstanding_balance))
         ? toNumber(transaction.outstanding_balance)
         : fallbackBalance);
+    const currentAmountPaid = Number.isFinite(toNumber(transaction.amount_paid))
+      ? toNumber(transaction.amount_paid)
+      : Math.max(0, (Number.isFinite(fallbackBalance) ? fallbackBalance : 0) - currentBalance);
 
     if (currentBalance <= 0) {
       await client.query('ROLLBACK');
@@ -744,6 +811,7 @@ const settleKasBon = async (req, res) => {
     const nextBalance = Number(nextBalanceRaw.toFixed(2));
     const isLunas = nextBalance <= 0;
     const normalizedBalance = isLunas ? 0 : nextBalance;
+    const nextAmountPaid = Number((currentAmountPaid + paidAmount).toFixed(2));
 
     await ensureKasBonHistoryTable(client);
     await ensureTenantScopedTable(client, 'kas_bon_payment_history', tenantId);
@@ -754,16 +822,112 @@ const settleKasBon = async (req, res) => {
          sales_record_id,
          paid_amount,
          previous_balance,
-         remaining_balance
-       ) VALUES ($1, $2, $3, $4, $5)`,
-      [tenantId, id, paidAmount, currentBalance, normalizedBalance],
+         remaining_balance,
+         payment_method,
+         paid_at,
+         note
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        tenantId,
+        id,
+        paidAmount,
+        currentBalance,
+        normalizedBalance,
+        settlementMethod,
+        paidAt,
+        settlementNote || null,
+      ],
     );
 
-    const updateClauses = ['remaining_balance = $1'];
+    const updateClauses = ['remaining_balance = $1', 'amount_paid = $3'];
     if (columns.has('outstanding_balance')) {
       updateClauses.push('outstanding_balance = $1');
     }
-    const values = [normalizedBalance, id];
+    if (columns.has('last_payment_method')) {
+      updateClauses.push('last_payment_method = $4');
+    }
+    if (columns.has('payment_method')) {
+      const finalPaymentMethod = isLunas
+        ? `Lunas - ${settlementMethod}`
+        : 'Kas Bon';
+      updateClauses.push(`payment_method = $${columns.has('last_payment_method') ? 5 : 4}`);
+      if (columns.has('last_payment_method')) {
+        updateClauses.push('last_payment_amount = $6');
+      }
+      const values = [
+        normalizedBalance,
+        id,
+        nextAmountPaid,
+        settlementMethod,
+        finalPaymentMethod,
+        paidAmount,
+      ];
+
+      if (columns.has('payment_status')) {
+        const paramPosition = values.length + 1;
+        updateClauses.push(`payment_status = $${paramPosition}`);
+        values.push(isLunas ? 'LUNAS' : 'BELUM LUNAS');
+      }
+
+      const updateSql = `
+      UPDATE sales_records
+      SET ${updateClauses.join(', ')}
+      WHERE id = $2
+        ${columns.has('tenant_id') ? `AND tenant_id = $${values.length + 1}` : ''}
+      RETURNING *
+    `;
+
+      const updateResult = await client.query(
+        updateSql,
+        columns.has('tenant_id') ? [...values, tenantId] : values,
+      );
+      await client.query('COMMIT');
+
+      const updatedTransaction = updateResult.rows[0] || null;
+
+      emitKasBonUpdated(req, updatedTransaction, {
+        transactionId: id,
+        paidAmount,
+        remainingBalance: normalizedBalance,
+        status: isLunas ? 'Lunas' : 'Belum Lunas',
+        paymentMethod: settlementMethod,
+      });
+
+      emitTransactionUpdated(req, updatedTransaction, {
+        transactionId: id,
+        action: 'UPDATE',
+        mutationType: 'KASBON_SETTLED',
+        paymentHistory: {
+          sales_record_id: id,
+          paid_amount: paidAmount,
+          previous_balance: currentBalance,
+          remaining_balance: normalizedBalance,
+          payment_method: settlementMethod,
+          paid_at: paidAt,
+          note: settlementNote || null,
+        },
+        paidAmount,
+        remainingBalance: normalizedBalance,
+        amountPaid: nextAmountPaid,
+        status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
+      });
+
+      return jsonOk(
+        res,
+        {
+          transaction: updatedTransaction,
+          paid_amount: paidAmount,
+          remaining_balance: normalizedBalance,
+          amount_paid: nextAmountPaid,
+          payment_method: settlementMethod,
+          note: settlementNote || null,
+          status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
+        },
+        'Pelunasan kas bon berhasil',
+      );
+    }
+
+    const values = [normalizedBalance, id, nextAmountPaid];
 
     if (columns.has('payment_status')) {
       const paramPosition = values.length + 1;
@@ -792,6 +956,7 @@ const settleKasBon = async (req, res) => {
       paidAmount,
       remainingBalance: normalizedBalance,
       status: isLunas ? 'Lunas' : 'Belum Lunas',
+      paymentMethod: settlementMethod,
     });
 
     emitTransactionUpdated(req, updatedTransaction, {
@@ -803,9 +968,13 @@ const settleKasBon = async (req, res) => {
         paid_amount: paidAmount,
         previous_balance: currentBalance,
         remaining_balance: normalizedBalance,
+        payment_method: settlementMethod,
+        paid_at: paidAt,
+        note: settlementNote || null,
       },
       paidAmount,
       remainingBalance: normalizedBalance,
+      amountPaid: nextAmountPaid,
       status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
     });
 
@@ -815,6 +984,9 @@ const settleKasBon = async (req, res) => {
         transaction: updatedTransaction,
         paid_amount: paidAmount,
         remaining_balance: normalizedBalance,
+        amount_paid: nextAmountPaid,
+        payment_method: settlementMethod,
+        note: settlementNote || null,
         status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
       },
       'Pelunasan kas bon berhasil',

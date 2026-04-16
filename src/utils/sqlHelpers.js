@@ -138,6 +138,51 @@ const parseSelectClause = (selectValue) => {
   return columns.map((column) => quoteIdentifier(column, 'column')).join(', ');
 };
 
+const FILTER_FIELD_PREFIXES = [
+  'eq__',
+  'neq__',
+  'gte__',
+  'lte__',
+  'ilike__',
+  'in__',
+];
+
+const resolveFilterFieldName = (key = '') => {
+  for (const prefix of FILTER_FIELD_PREFIXES) {
+    if (key.startsWith(prefix)) {
+      return key.slice(prefix.length);
+    }
+  }
+  return null;
+};
+
+const sanitizeSelectQueryByColumnSet = (query = {}, columnSet) => {
+  if (!(columnSet instanceof Set) || columnSet.size === 0) {
+    return { ...query };
+  }
+
+  const next = {};
+  for (const [key, value] of Object.entries(query)) {
+    const fieldName = resolveFilterFieldName(key);
+    if (fieldName && !columnSet.has(fieldName)) {
+      continue;
+    }
+    next[key] = value;
+  }
+
+  if (next.orderBy && !columnSet.has(next.orderBy.toString().trim())) {
+    delete next.orderBy;
+    delete next.ascending;
+  }
+
+  if (next.order && !columnSet.has(next.order.toString().trim())) {
+    delete next.order;
+    delete next.ascending;
+  }
+
+  return next;
+};
+
 const createWhereBuilder = (query = {}, startingIndex = 1) => {
   const clauses = [];
   const values = [];
@@ -459,6 +504,8 @@ const runSelect = async (tenantDb, table, query = {}, options = {}) => {
     scopedQuery = stripTenantFilters(scopedQuery);
     scopedQuery[`eq__${TENANT_COLUMN}`] = tenantId;
   }
+
+  scopedQuery = sanitizeSelectQueryByColumnSet(scopedQuery, columnSet);
 
   const { sql, values } = buildSelectQuery(table, scopedQuery);
   const result = await tenantDb.query(sql, values);
