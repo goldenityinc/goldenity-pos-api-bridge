@@ -45,6 +45,8 @@ const resolveUserIdFromRequest = (req) => {
     req?.auth?.userId ??
     req?.auth?.user_id ??
     req?.auth?.sub ??
+    req?.body?.userId ??
+    req?.body?.user_id ??
     req?.auth?.username ??
     ''
   )
@@ -95,17 +97,25 @@ const assertColumnsExist = async (client, table, columns = []) => {
   }
 };
 
+const listTableColumns = async (client, table) => {
+  const result = await client.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = ANY(current_schemas(false))
+       AND table_name = $1`,
+    [table],
+  );
+  return new Set((result.rows || []).map((row) => row.column_name));
+};
+
 const ensurePettyCashLogsTable = async (client) => {
   await assertColumnsExist(client, 'petty_cash_logs', [
     'id',
-    'tenant_id',
-    'user_id',
-    'user_name',
     'amount',
     'type',
     'notes',
-    'created_at',
   ]);
+  return listTableColumns(client, 'petty_cash_logs');
 };
 
 const mapPettyCashRow = (row = {}) => ({
@@ -127,26 +137,56 @@ const getTodayPettyCashLogs = async (req, res) => {
   const client = await req.tenantDb.connect();
 
   try {
-    await ensurePettyCashLogsTable(client);
+    const columns = await ensurePettyCashLogsTable(client);
 
     const tenantId = resolveTenantIdFromRequest(req);
+    const hasTenantId = columns.has('tenant_id');
+    const hasUserId = columns.has('user_id');
+    const hasUserName = columns.has('user_name');
+    const hasCreatedAt = columns.has('created_at');
 
-    if (!tenantId) {
+    if (hasTenantId && !tenantId) {
       return jsonError(res, 401, 'Tenant tidak valid');
     }
 
+    const selectFields = [
+      'l.id',
+      hasTenantId ? 'l.tenant_id' : 'NULL::text AS tenant_id',
+      hasUserId ? 'l.user_id' : 'NULL::text AS user_id',
+      'l.amount',
+      'l.type',
+      'l.notes',
+      hasCreatedAt ? 'l.created_at' : 'NULL::timestamp AS created_at',
+      hasUserName
+        ? "COALESCE(NULLIF(l.user_name, ''), u.username, '') AS user_name"
+        : "COALESCE(u.username, '') AS user_name",
+    ];
+    const whereConditions = [];
+    const params = [];
+
+    if (hasTenantId) {
+      params.push(tenantId);
+      whereConditions.push(`l.tenant_id = $${params.length}`);
+    }
+
+    if (hasCreatedAt) {
+      whereConditions.push(
+        `(l.created_at AT TIME ZONE '${WIB_TIME_ZONE}')::date = (CURRENT_TIMESTAMP AT TIME ZONE '${WIB_TIME_ZONE}')::date`,
+      );
+    }
+
+    const whereClause = whereConditions.length > 0
+      ? `WHERE ${whereConditions.join(' AND ')}`
+      : '';
+
     const result = await client.query(
-      `SELECT l.id, l.tenant_id, l.user_id, l.amount, l.type, l.notes, l.created_at,
-              COALESCE(NULLIF(l.user_name, ''), u.username, '') AS user_name
+      `SELECT ${selectFields.join(', ')}
        FROM petty_cash_logs l
        LEFT JOIN app_users u
-         ON CAST(u.id AS TEXT) = l.user_id
-         OR u.username = l.user_id
-       WHERE l.tenant_id = $1
-         AND (l.created_at AT TIME ZONE '${WIB_TIME_ZONE}')::date =
-             (CURRENT_TIMESTAMP AT TIME ZONE '${WIB_TIME_ZONE}')::date
+         ON ${hasUserId ? 'CAST(u.id AS TEXT) = l.user_id OR u.username = l.user_id' : 'FALSE'}
+       ${whereClause}
        ORDER BY l.created_at DESC`,
-      [tenantId],
+      params,
     );
 
     return jsonOk(
@@ -179,7 +219,13 @@ const createPettyCashLog = async (req, res) => {
     const notes = (req.body?.notes ?? '').toString().trim();
     const id = crypto.randomUUID();
 
-    if (!tenantId) {
+    const columns = await ensurePettyCashLogsTable(client);
+    const hasTenantId = columns.has('tenant_id');
+    const hasUserId = columns.has('user_id');
+    const hasUserName = columns.has('user_name');
+    const hasCreatedAt = columns.has('created_at');
+
+    if (hasTenantId && !tenantId) {
       return jsonError(res, 401, 'Tenant tidak valid');
     }
 
@@ -187,20 +233,47 @@ const createPettyCashLog = async (req, res) => {
       return jsonError(res, 400, 'Nominal petty cash harus lebih dari 0');
     }
 
-    await ensurePettyCashLogsTable(client);
+    const insertColumns = ['id'];
+    const insertValues = [id];
+
+    if (hasTenantId) {
+      insertColumns.push('tenant_id');
+      insertValues.push(tenantId || null);
+    }
+    if (hasUserId) {
+      insertColumns.push('user_id');
+      insertValues.push(userId || null);
+    }
+    if (hasUserName) {
+      insertColumns.push('user_name');
+      insertValues.push(userName || null);
+    }
+
+    insertColumns.push('amount');
+    insertValues.push(Number(amount));
+    insertColumns.push('type');
+    insertValues.push(type);
+    insertColumns.push('notes');
+    insertValues.push(notes || null);
+
+    const placeholders = insertColumns.map((_, index) => `$${index + 1}`).join(', ');
+    const returningColumns = [
+      'id',
+      hasTenantId ? 'tenant_id' : 'NULL::text AS tenant_id',
+      hasUserId ? 'user_id' : 'NULL::text AS user_id',
+      hasUserName ? 'user_name' : 'NULL::text AS user_name',
+      'amount',
+      'type',
+      'notes',
+      hasCreatedAt ? 'created_at' : 'NULL::timestamp AS created_at',
+    ];
 
     const insertResult = await client.query(
       `INSERT INTO petty_cash_logs (
-         id,
-         tenant_id,
-         user_id,
-         user_name,
-         amount,
-         type,
-         notes
-       ) VALUES ($1::text, $2::text, $3::text, $4::text, $5::numeric, $6::text, $7::text)
-       RETURNING id, tenant_id, user_id, user_name, amount, type, notes, created_at`,
-      [id, tenantId, userId || null, userName || null, Number.isFinite(Number(amount)) ? Number(amount) : 0, type, notes || null],
+         ${insertColumns.join(', ')}
+       ) VALUES (${placeholders})
+       RETURNING ${returningColumns.join(', ')}`,
+      insertValues,
     );
 
     const createdLog = mapPettyCashRow({
@@ -211,7 +284,17 @@ const createPettyCashLog = async (req, res) => {
 
     return jsonOk(res, createdLog, 'Petty cash berhasil disimpan', 201);
   } catch (error) {
-    console.error('Dashboard Aggregation Error:', error);
+    console.error('Petty Cash Create Error:', {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      hint: error.hint,
+      constraint: error.constraint,
+      table: error.table,
+      column: error.column,
+      routine: error.routine,
+      stack: error.stack,
+    });
     return jsonError(
       res,
       500,
