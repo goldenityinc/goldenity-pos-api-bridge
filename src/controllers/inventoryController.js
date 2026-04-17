@@ -227,16 +227,16 @@ const importInventoryCsv = async (req, res) => {
            SET name = $1,
                barcode = $2,
                category = $3,
-               purchase_price = $4,
-               price = $5,
-               stock = $6,
+               purchase_price = $4::numeric,
+               price = $5::numeric,
+               stock = $6::integer,
                updated_at = NOW()
-           WHERE id = $7
-             ${hasTenantColumn ? 'AND tenant_id = $8' : ''}
+           WHERE id = $7::bigint
+             ${hasTenantColumn ? 'AND tenant_id = $8::text' : ''}
            RETURNING *`,
           hasTenantColumn
-            ? [name, barcode, category || null, purchasePrice, sellingPrice, stock, existingId, tenantId]
-            : [name, barcode, category || null, purchasePrice, sellingPrice, stock, existingId],
+            ? [name, barcode, category || null, Number.isFinite(Number(purchasePrice)) ? Number(purchasePrice) : 0, Number.isFinite(Number(sellingPrice)) ? Number(sellingPrice) : 0, Number.isInteger(Number(stock)) ? Number(stock) : 0, existingId, tenantId]
+            : [name, barcode, category || null, Number.isFinite(Number(purchasePrice)) ? Number(purchasePrice) : 0, Number.isFinite(Number(sellingPrice)) ? Number(sellingPrice) : 0, Number.isInteger(Number(stock)) ? Number(stock) : 0, existingId],
         );
         emitTableMutation(req, {
           table: 'products',
@@ -257,11 +257,11 @@ const importInventoryCsv = async (req, res) => {
           price,
           stock
           ${hasTenantColumn ? ', tenant_id' : ''}
-        ) VALUES ($1, $2, $3, $4, $5, $6${hasTenantColumn ? ', $7' : ''})
+        ) VALUES ($1::text, $2::text, $3::text, $4::numeric, $5::numeric, $6::integer${hasTenantColumn ? ', $7::text' : ''}
         RETURNING *`,
         hasTenantColumn
-          ? [name, barcode, category || null, purchasePrice, sellingPrice, stock, tenantId]
-          : [name, barcode, category || null, purchasePrice, sellingPrice, stock],
+          ? [name, barcode, category || null, Number.isFinite(Number(purchasePrice)) ? Number(purchasePrice) : 0, Number.isFinite(Number(sellingPrice)) ? Number(sellingPrice) : 0, Number.isInteger(Number(stock)) ? Number(stock) : 0, tenantId]
+          : [name, barcode, category || null, Number.isFinite(Number(purchasePrice)) ? Number(purchasePrice) : 0, Number.isFinite(Number(sellingPrice)) ? Number(sellingPrice) : 0, Number.isInteger(Number(stock)) ? Number(stock) : 0],
       );
 
       emitTableMutation(req, {

@@ -222,10 +222,10 @@ const updateRole = async (req, res) => {
           description = $3,
           permissions = $4::jsonb,
           updated_at = NOW()
-      WHERE id = $1 AND tenant_id = $5
+      WHERE id = $1::text AND tenant_id = $5::text
       RETURNING id, name, description, permissions, COALESCE(is_default, false) AS is_default, created_at, updated_at
       `,
-      [id, safeName, safeDescription, JSON.stringify(permissions), tenantId],
+      [id, safeName, safeDescription, JSON.stringify(permissions), tenantId || ''],
     );
 
     return jsonOk(res, normalizeRoleRow(updated.rows[0]), 'Role updated');

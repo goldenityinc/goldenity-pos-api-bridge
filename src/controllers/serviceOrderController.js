@@ -355,18 +355,18 @@ const createServiceOrder = async (req, res) => {
          technician_notes,
          service_details
        ) VALUES (
-         COALESCE($1, gen_random_uuid()::text),
-         $2,
-         $3,
-         $4,
-         $5,
-         $6,
-         $7,
-         $8,
+         COALESCE($1::text, gen_random_uuid()::text),
+         $2::text,
+         $3::text,
+         $4::text,
+         $5::text,
+         $6::text,
+         $7::text,
+         $8::text,
          'PENDING',
-         $9,
-         $10,
-         $11
+         $9::numeric,
+         $10::text,
+         $11::jsonb
        )
        RETURNING *`,
       [

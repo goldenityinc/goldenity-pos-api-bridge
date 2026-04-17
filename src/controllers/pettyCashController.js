@@ -198,9 +198,9 @@ const createPettyCashLog = async (req, res) => {
          amount,
          type,
          notes
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ) VALUES ($1::text, $2::text, $3::text, $4::text, $5::numeric, $6::text, $7::text)
        RETURNING id, tenant_id, user_id, user_name, amount, type, notes, created_at`,
-      [id, tenantId, userId || null, userName || null, amount, type, notes || null],
+      [id, tenantId, userId || null, userName || null, Number.isFinite(Number(amount)) ? Number(amount) : 0, type, notes || null],
     );
 
     const createdLog = mapPettyCashRow({
