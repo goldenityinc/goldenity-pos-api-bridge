@@ -503,9 +503,23 @@ const createTransaction = async (req, res) => {
     const clientProvidedId = typeof payload.id === 'string'
       ? payload.id.trim()
       : '';
+    const existingTransactionIdToUpdate = (
+      payload.existing_transaction_id ?? payload.existingTransactionId ?? ''
+    )
+      .toString()
+      .trim();
+    const existingReceiptNumberToUpdate = (
+      payload.existing_receipt_number ?? payload.existingReceiptNumber ?? ''
+    )
+      .toString()
+      .trim();
     if (clientProvidedId) {
       delete payload.id;
     }
+    delete payload.existing_transaction_id;
+    delete payload.existingTransactionId;
+    delete payload.existing_receipt_number;
+    delete payload.existingReceiptNumber;
     referenceId = normalizeReferenceId(payload, clientProvidedId);
     if (referenceId) {
       payload.reference_id = referenceId;
@@ -553,6 +567,107 @@ const createTransaction = async (req, res) => {
     hasSalesTenantColumn = salesRecordColumnSet.has('tenant_id');
     const productsColumnSet = await getTableColumnSet(client, 'products');
     const hasProductsTenantColumn = productsColumnSet.has('tenant_id');
+
+    if (existingTransactionIdToUpdate || existingReceiptNumberToUpdate) {
+      const existingRecordResult = await client.query(
+        existingTransactionIdToUpdate
+          ? (hasSalesTenantColumn
+            ? 'SELECT * FROM sales_records WHERE id = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
+            : 'SELECT * FROM sales_records WHERE id = $1 LIMIT 1 FOR UPDATE')
+          : (hasSalesTenantColumn
+            ? 'SELECT * FROM sales_records WHERE receipt_number = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
+            : 'SELECT * FROM sales_records WHERE receipt_number = $1 LIMIT 1 FOR UPDATE'),
+        hasSalesTenantColumn
+          ? [
+            existingTransactionIdToUpdate || existingReceiptNumberToUpdate,
+            tenantId,
+          ]
+          : [existingTransactionIdToUpdate || existingReceiptNumberToUpdate],
+      );
+
+      if ((existingRecordResult.rowCount || 0) === 0) {
+        throw new Error('Transaksi target untuk update tidak ditemukan');
+      }
+
+      const existingRecord = existingRecordResult.rows[0] || null;
+      const existingSalesRecordId = existingRecord?.id;
+      if (!existingSalesRecordId) {
+        throw new Error('ID transaksi target tidak valid');
+      }
+
+      const tenantScopedPayload = enforceTenantIdOnPayload(
+        payload,
+        tenantId,
+        salesRecordColumnDefinitions,
+      );
+      const filteredPayload = normalizePayloadByColumnDefinitions(
+        tenantScopedPayload,
+        salesRecordColumnDefinitions,
+      );
+      delete filteredPayload.id;
+
+      if (storedItems.length > 0) {
+        filteredPayload.items_json = JSON.stringify(storedItems);
+      }
+
+      const updateEntries = Object.entries(filteredPayload).filter(
+        ([, value]) => value !== undefined,
+      );
+
+      let updatedRow = existingRecord;
+      if (updateEntries.length > 0) {
+        const setClause = updateEntries
+          .map(([column], index) => `${column} = $${index + 1}`)
+          .join(', ');
+        const updateValues = updateEntries.map(([, value]) => (
+          value === undefined ? null : value
+        ));
+        const targetParam = updateValues.length + 1;
+        const tenantParam = updateValues.length + 2;
+        const updateSql = `UPDATE sales_records
+                           SET ${setClause}
+                           WHERE id = $${targetParam}
+                           ${hasSalesTenantColumn ? `AND tenant_id = $${tenantParam}` : ''}
+                           RETURNING *`;
+        const updateResult = await client.query(
+          updateSql,
+          hasSalesTenantColumn
+            ? [...updateValues, existingSalesRecordId, tenantId]
+            : [...updateValues, existingSalesRecordId],
+        );
+        updatedRow = updateResult.rows?.[0] || existingRecord;
+      }
+
+      await syncSalesRecordItems(client, existingSalesRecordId, tenantId, storedItems);
+      await client.query('COMMIT');
+
+      const savedTransaction = updatedRow || null;
+      if (savedTransaction) {
+        const hydratedItems = await loadSalesRecordItems(
+          req.tenantDb,
+          savedTransaction.id,
+          tenantId,
+        );
+        savedTransaction.items = hydratedItems.length > 0
+          ? hydratedItems
+          : parseItemsFromJsonField(savedTransaction.items_json);
+      }
+
+      emitTransactionUpdated(req, savedTransaction, {
+        transactionId: existingSalesRecordId,
+        action: 'UPDATE',
+        mutationType: 'CHECKOUT_UPDATE_EXISTING',
+      });
+      if (isKasBonTransaction) {
+        emitKasBonUpdated(req, savedTransaction, {
+          transactionId: existingSalesRecordId,
+          paymentStatus: payload.payment_status,
+          remainingBalance: payload.remaining_balance ?? payload.outstanding_balance,
+        });
+      }
+
+      return jsonOk(res, savedTransaction, 'Transaction updated');
+    }
 
     if (referenceId) {
       const existingResult = await client.query(
@@ -708,11 +823,19 @@ const settleKasBon = async (req, res) => {
     await ensureTenantScopedTable(client, 'sales_records', tenantId);
     await ensureSalesRecordsKasBonColumns(client);
     const id = req.params.id;
-    const paidAmount = toNumber(req.body?.paid_amount ?? req.body?.amount);
-    const settlementMethod = (req.body?.settlement_method || req.body?.payment_method || 'Cash')
-      .toString()
-      .trim();
-    const settlementNote = (req.body?.note || req.body?.settlement_note || '').toString().trim();
+    const paidAmountRaw = req.body?.paid_amount ?? req.body?.amount ?? req.body?.amount_paid;
+    const paidAmount = toNumber(paidAmountRaw);
+    const settlementMethodInput =
+      req.body?.settlement_method ?? req.body?.payment_method ?? 'Cash';
+    const settlementMethod = (settlementMethodInput ?? 'Cash').toString().trim() || 'Cash';
+    const settlementNoteInput =
+      req.body?.payment_note ?? req.body?.note ?? req.body?.settlement_note ?? null;
+    const settlementNote = settlementNoteInput === null || settlementNoteInput === undefined
+      ? null
+      : settlementNoteInput.toString().trim() || null;
+    const pb1AmountRaw = req.body?.tax_pb1_amount ?? req.body?.pb1_amount ?? 0;
+    const pb1Amount = Number.parseInt(pb1AmountRaw, 10);
+    const normalizedPb1Amount = Number.isFinite(pb1Amount) ? pb1Amount : 0;
     const paidAt = req.body?.paid_at ? new Date(req.body.paid_at) : new Date();
 
     if (!id) {
@@ -807,11 +930,21 @@ const settleKasBon = async (req, res) => {
       return jsonError(res, 400, 'Nominal pembayaran melebihi sisa kas bon');
     }
 
-    const nextBalanceRaw = currentBalance - paidAmount;
+    const normalizedPaidAmount = Number.isFinite(paidAmount)
+      ? Number(paidAmount.toFixed(2))
+      : 0;
+    const nextBalanceRaw = currentBalance - normalizedPaidAmount;
     const nextBalance = Number(nextBalanceRaw.toFixed(2));
     const isLunas = nextBalance <= 0;
     const normalizedBalance = isLunas ? 0 : nextBalance;
-    const nextAmountPaid = Number((currentAmountPaid + paidAmount).toFixed(2));
+    const safeCurrentBalance = Number.isFinite(currentBalance)
+      ? Number(currentBalance.toFixed(2))
+      : 0;
+    const safeRemainingBalance = Number.isFinite(normalizedBalance)
+      ? normalizedBalance
+      : 0;
+    const nextAmountPaid = Number((currentAmountPaid + normalizedPaidAmount).toFixed(2));
+    const safeNextAmountPaid = Number.isFinite(nextAmountPaid) ? nextAmountPaid : 0;
 
     await ensureKasBonHistoryTable(client);
     await ensureTenantScopedTable(client, 'kas_bon_payment_history', tenantId);
@@ -828,14 +961,14 @@ const settleKasBon = async (req, res) => {
          note
        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
-        tenantId,
+        tenantId || null,
         id,
-        paidAmount,
-        currentBalance,
-        normalizedBalance,
-        settlementMethod,
+        normalizedPaidAmount,
+        safeCurrentBalance,
+        safeRemainingBalance,
+        settlementMethod || 'Cash',
         paidAt,
-        settlementNote || null,
+        settlementNote,
       ],
     );
 
@@ -855,12 +988,12 @@ const settleKasBon = async (req, res) => {
         updateClauses.push('last_payment_amount = $6');
       }
       const values = [
-        normalizedBalance,
+        safeRemainingBalance,
         id,
-        nextAmountPaid,
-        settlementMethod,
+        safeNextAmountPaid,
+        settlementMethod || 'Cash',
         finalPaymentMethod,
-        paidAmount,
+        normalizedPaidAmount,
       ];
 
       if (columns.has('payment_status')) {
@@ -887,10 +1020,10 @@ const settleKasBon = async (req, res) => {
 
       emitKasBonUpdated(req, updatedTransaction, {
         transactionId: id,
-        paidAmount,
-        remainingBalance: normalizedBalance,
+        paidAmount: normalizedPaidAmount,
+        remainingBalance: safeRemainingBalance,
         status: isLunas ? 'Lunas' : 'Belum Lunas',
-        paymentMethod: settlementMethod,
+        paymentMethod: settlementMethod || 'Cash',
       });
 
       emitTransactionUpdated(req, updatedTransaction, {
@@ -899,16 +1032,17 @@ const settleKasBon = async (req, res) => {
         mutationType: 'KASBON_SETTLED',
         paymentHistory: {
           sales_record_id: id,
-          paid_amount: paidAmount,
-          previous_balance: currentBalance,
-          remaining_balance: normalizedBalance,
-          payment_method: settlementMethod,
+          paid_amount: normalizedPaidAmount,
+          previous_balance: safeCurrentBalance,
+          remaining_balance: safeRemainingBalance,
+          payment_method: settlementMethod || 'Cash',
           paid_at: paidAt,
-          note: settlementNote || null,
+          note: settlementNote,
         },
-        paidAmount,
-        remainingBalance: normalizedBalance,
-        amountPaid: nextAmountPaid,
+        paidAmount: normalizedPaidAmount,
+        remainingBalance: safeRemainingBalance,
+        amountPaid: safeNextAmountPaid,
+        tax_pb1_amount: normalizedPb1Amount,
         status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
       });
 
@@ -916,18 +1050,19 @@ const settleKasBon = async (req, res) => {
         res,
         {
           transaction: updatedTransaction,
-          paid_amount: paidAmount,
-          remaining_balance: normalizedBalance,
-          amount_paid: nextAmountPaid,
-          payment_method: settlementMethod,
-          note: settlementNote || null,
+          paid_amount: normalizedPaidAmount,
+          remaining_balance: safeRemainingBalance,
+          amount_paid: safeNextAmountPaid,
+          payment_method: settlementMethod || 'Cash',
+          note: settlementNote,
+          tax_pb1_amount: normalizedPb1Amount,
           status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
         },
         'Pelunasan kas bon berhasil',
       );
     }
 
-    const values = [normalizedBalance, id, nextAmountPaid];
+    const values = [safeRemainingBalance, id, safeNextAmountPaid];
 
     if (columns.has('payment_status')) {
       const paramPosition = values.length + 1;
@@ -953,10 +1088,10 @@ const settleKasBon = async (req, res) => {
 
     emitKasBonUpdated(req, updatedTransaction, {
       transactionId: id,
-      paidAmount,
-      remainingBalance: normalizedBalance,
+      paidAmount: normalizedPaidAmount,
+      remainingBalance: safeRemainingBalance,
       status: isLunas ? 'Lunas' : 'Belum Lunas',
-      paymentMethod: settlementMethod,
+      paymentMethod: settlementMethod || 'Cash',
     });
 
     emitTransactionUpdated(req, updatedTransaction, {
@@ -965,16 +1100,17 @@ const settleKasBon = async (req, res) => {
       mutationType: 'KASBON_SETTLED',
       paymentHistory: {
         sales_record_id: id,
-        paid_amount: paidAmount,
-        previous_balance: currentBalance,
-        remaining_balance: normalizedBalance,
-        payment_method: settlementMethod,
+        paid_amount: normalizedPaidAmount,
+        previous_balance: safeCurrentBalance,
+        remaining_balance: safeRemainingBalance,
+        payment_method: settlementMethod || 'Cash',
         paid_at: paidAt,
-        note: settlementNote || null,
+        note: settlementNote,
       },
-      paidAmount,
-      remainingBalance: normalizedBalance,
-      amountPaid: nextAmountPaid,
+      paidAmount: normalizedPaidAmount,
+      remainingBalance: safeRemainingBalance,
+      amountPaid: safeNextAmountPaid,
+      tax_pb1_amount: normalizedPb1Amount,
       status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
     });
 
@@ -982,11 +1118,12 @@ const settleKasBon = async (req, res) => {
       res,
       {
         transaction: updatedTransaction,
-        paid_amount: paidAmount,
-        remaining_balance: normalizedBalance,
-        amount_paid: nextAmountPaid,
-        payment_method: settlementMethod,
-        note: settlementNote || null,
+        paid_amount: normalizedPaidAmount,
+        remaining_balance: safeRemainingBalance,
+        amount_paid: safeNextAmountPaid,
+        payment_method: settlementMethod || 'Cash',
+        note: settlementNote,
+        tax_pb1_amount: normalizedPb1Amount,
         status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
       },
       'Pelunasan kas bon berhasil',
