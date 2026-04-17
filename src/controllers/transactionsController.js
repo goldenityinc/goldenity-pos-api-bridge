@@ -339,15 +339,15 @@ const syncSalesRecordItems = async (client, salesRecordId, tenantId, items) => {
          note,
          is_service,
          updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+       ) VALUES ($1::text, $2::bigint, $3::text, $4::text, $5::integer, $6::numeric, $7::text, $8::boolean, NOW())`,
       [
-        normalizedTenantId || null,
-        salesRecordId,
-        item.product_id || null,
-        item.product_name || null,
+        normalizedTenantId || '',
+        Number.isFinite(Number(salesRecordId)) ? Number(salesRecordId) : 0,
+        (item.product_id || '').toString().trim() || null,
+        (item.product_name || '').toString().trim() || null,
         Number.isInteger(Number(item.qty)) ? Number(item.qty) : 1,
         Number.isFinite(Number(item.custom_price)) ? Number(item.custom_price) : null,
-        item.note || null,
+        (item.note || '').toString().trim() || null,
         item.is_service === true,
       ],
     );
