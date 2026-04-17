@@ -959,7 +959,16 @@ const settleKasBon = async (req, res) => {
          payment_method,
          paid_at,
          note
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+       ) VALUES (
+         $1::text,
+         $2::bigint,
+         $3::numeric,
+         $4::numeric,
+         $5::numeric,
+         $6::text,
+         $7::timestamptz,
+         $8::text
+       )`,
       [
         tenantId || null,
         id,
