@@ -817,10 +817,14 @@ const createTransaction = async (req, res) => {
 
 const settleKasBon = async (req, res) => {
   const client = await req.tenantDb.connect();
+  let settlePhase = 'init';
 
   try {
+    settlePhase = 'resolve_tenant';
     const tenantId = resolveTenantIdFromRequest(req);
+    settlePhase = 'ensure_sales_records_tenant_scope';
     await ensureTenantScopedTable(client, 'sales_records', tenantId);
+    settlePhase = 'ensure_sales_records_kasbon_columns';
     await ensureSalesRecordsKasBonColumns(client);
     const id = req.params.id;
     const paidAmountRaw = req.body?.paid_amount ?? req.body?.amount ?? req.body?.amount_paid;
@@ -849,10 +853,12 @@ const settleKasBon = async (req, res) => {
       return jsonError(res, 400, 'Nominal pembayaran harus lebih dari 0');
     }
 
+    settlePhase = 'begin_transaction';
     await client.query('BEGIN');
 
     // Use current_schemas(false) so the lookup works regardless of whether the
     // tenant's tables live in the 'public' schema or a custom search_path schema.
+    settlePhase = 'load_sales_records_columns';
     const columnsResult = await client.query(
       `SELECT column_name
        FROM information_schema.columns
@@ -873,6 +879,7 @@ const settleKasBon = async (req, res) => {
       return jsonError(res, 500, 'Kolom pembayaran sales_records tidak lengkap');
     }
 
+    settlePhase = 'lock_sales_record';
     const transactionResult = await client.query(
       `SELECT id,
               ${paymentColumn} AS payment_value,
@@ -949,9 +956,12 @@ const settleKasBon = async (req, res) => {
     const nextAmountPaid = Number((currentAmountPaid + normalizedPaidAmount).toFixed(2));
     const safeNextAmountPaid = Number.isFinite(nextAmountPaid) ? nextAmountPaid : 0;
 
+    settlePhase = 'ensure_kasbon_history_table';
     await ensureKasBonHistoryTable(client);
+    settlePhase = 'ensure_kasbon_history_tenant_scope';
     await ensureTenantScopedTable(client, 'kas_bon_payment_history', tenantId);
 
+    settlePhase = 'insert_kasbon_payment_history';
     await client.query(
       `INSERT INTO kas_bon_payment_history (
          tenant_id,
@@ -1022,10 +1032,12 @@ const settleKasBon = async (req, res) => {
       RETURNING *
     `;
 
+      settlePhase = 'update_sales_records_payment_method_branch';
       const updateResult = await client.query(
         updateSql,
         columns.has('tenant_id') ? [...values, safeTenantId || ''] : values,
       );
+      settlePhase = 'commit_payment_method_branch';
       await client.query('COMMIT');
 
       const updatedTransaction = updateResult.rows[0] || null;
@@ -1090,10 +1102,12 @@ const settleKasBon = async (req, res) => {
       RETURNING *
     `;
 
+    settlePhase = 'update_sales_records_fallback_branch';
     const updateResult = await client.query(
       updateSql,
       columns.has('tenant_id') ? [...values, safeTenantId || ''] : values,
     );
+    settlePhase = 'commit_fallback_branch';
     await client.query('COMMIT');
 
     const updatedTransaction = updateResult.rows[0] || null;
@@ -1142,7 +1156,8 @@ const settleKasBon = async (req, res) => {
     );
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
-    return jsonError(res, 500, error.message || 'Internal server error', error.message);
+    const phaseMessage = `[settleKasBon:${settlePhase}] ${error.message || 'Internal server error'}`;
+    return jsonError(res, 500, phaseMessage, phaseMessage);
   } finally {
     client.release();
   }
