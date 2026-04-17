@@ -998,25 +998,37 @@ const settleKasBon = async (req, res) => {
     if (columns.has('outstanding_balance')) {
       updateClauses.push('outstanding_balance = $1::numeric');
     }
-    if (columns.has('last_payment_method')) {
-      updateClauses.push('last_payment_method = $4::text');
-    }
     if (columns.has('payment_method')) {
+      const hasLastPaymentMethodColumn = columns.has('last_payment_method');
       const finalPaymentMethod = isLunas
         ? `Lunas - ${settlementMethod}`
         : 'Kas Bon';
-      updateClauses.push(`payment_method = $${columns.has('last_payment_method') ? 5 : 4}::text`);
-      if (columns.has('last_payment_method')) {
-        updateClauses.push('last_payment_amount = $6::numeric');
-      }
+      const paymentMethodToSave = (finalPaymentMethod || '').toString().trim() || 'Cash';
+
       const values = [
         safeRemainingBalance || 0,
         safeSalesRecordId,
         safeNextAmountPaid || 0,
-        settlementMethod || 'Cash',
-        finalPaymentMethod,
-        normalizedPaidAmount || 0,
       ];
+
+      if (hasLastPaymentMethodColumn) {
+        updateClauses.push('last_payment_method = $4::text');
+        values.push((settlementMethod || 'Cash').toString().trim() || 'Cash');
+      }
+
+      const paymentMethodParamPosition = values.length + 1;
+      updateClauses.push(
+        hasLastPaymentMethodColumn
+          ? 'payment_method = $5::text'
+          : `payment_method = $${paymentMethodParamPosition}::text`,
+      );
+      values.push(paymentMethodToSave || 'Cash');
+
+      if (hasLastPaymentMethodColumn) {
+        const lastPaymentAmountParamPosition = values.length + 1;
+        updateClauses.push(`last_payment_amount = $${lastPaymentAmountParamPosition}::numeric`);
+        values.push(normalizedPaidAmount || 0);
+      }
 
       if (columns.has('payment_status')) {
         const paramPosition = values.length + 1;
