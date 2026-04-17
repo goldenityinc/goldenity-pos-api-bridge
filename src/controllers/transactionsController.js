@@ -837,8 +837,11 @@ const settleKasBon = async (req, res) => {
     const pb1Amount = Number.parseInt(pb1AmountRaw, 10);
     const normalizedPb1Amount = Number.isFinite(pb1Amount) ? pb1Amount : 0;
     const paidAt = req.body?.paid_at ? new Date(req.body.paid_at) : new Date();
+    const safeTenantId = (tenantId || '').toString().trim() || null;
+    const salesRecordId = Number.parseInt((id || '').toString(), 10);
+    const safeSalesRecordId = Number.isFinite(salesRecordId) ? salesRecordId : null;
 
-    if (!id) {
+    if (!id || safeSalesRecordId === null) {
       return jsonError(res, 400, 'id transaksi wajib diisi');
     }
 
@@ -879,10 +882,10 @@ const settleKasBon = async (req, res) => {
               ${columns.has('outstanding_balance') ? 'outstanding_balance,' : 'NULL::NUMERIC AS outstanding_balance,'}
               remaining_balance
        FROM sales_records
-       WHERE id = $1
-         ${columns.has('tenant_id') ? 'AND tenant_id = $2' : ''}
+       WHERE id = $1::bigint
+         ${columns.has('tenant_id') ? 'AND tenant_id = $2::text' : ''}
        FOR UPDATE`,
-      columns.has('tenant_id') ? [id, tenantId] : [id],
+      columns.has('tenant_id') ? [safeSalesRecordId, safeTenantId || ''] : [safeSalesRecordId],
     );
 
     if (transactionResult.rowCount === 0) {
@@ -970,58 +973,58 @@ const settleKasBon = async (req, res) => {
          $8::text
        )`,
       [
-        tenantId || null,
-        id,
-        normalizedPaidAmount,
-        safeCurrentBalance,
-        safeRemainingBalance,
+        safeTenantId,
+        safeSalesRecordId,
+        normalizedPaidAmount || 0,
+        safeCurrentBalance || 0,
+        safeRemainingBalance || 0,
         settlementMethod || 'Cash',
-        paidAt,
-        settlementNote,
+        paidAt || new Date(),
+        settlementNote || null,
       ],
     );
 
-    const updateClauses = ['remaining_balance = $1', 'amount_paid = $3'];
+    const updateClauses = ['remaining_balance = $1::numeric', 'amount_paid = $3::numeric'];
     if (columns.has('outstanding_balance')) {
-      updateClauses.push('outstanding_balance = $1');
+      updateClauses.push('outstanding_balance = $1::numeric');
     }
     if (columns.has('last_payment_method')) {
-      updateClauses.push('last_payment_method = $4');
+      updateClauses.push('last_payment_method = $4::text');
     }
     if (columns.has('payment_method')) {
       const finalPaymentMethod = isLunas
         ? `Lunas - ${settlementMethod}`
         : 'Kas Bon';
-      updateClauses.push(`payment_method = $${columns.has('last_payment_method') ? 5 : 4}`);
+      updateClauses.push(`payment_method = $${columns.has('last_payment_method') ? 5 : 4}::text`);
       if (columns.has('last_payment_method')) {
-        updateClauses.push('last_payment_amount = $6');
+        updateClauses.push('last_payment_amount = $6::numeric');
       }
       const values = [
-        safeRemainingBalance,
-        id,
-        safeNextAmountPaid,
+        safeRemainingBalance || 0,
+        safeSalesRecordId,
+        safeNextAmountPaid || 0,
         settlementMethod || 'Cash',
         finalPaymentMethod,
-        normalizedPaidAmount,
+        normalizedPaidAmount || 0,
       ];
 
       if (columns.has('payment_status')) {
         const paramPosition = values.length + 1;
-        updateClauses.push(`payment_status = $${paramPosition}`);
+        updateClauses.push(`payment_status = $${paramPosition}::text`);
         values.push(isLunas ? 'LUNAS' : 'BELUM LUNAS');
       }
 
       const updateSql = `
       UPDATE sales_records
       SET ${updateClauses.join(', ')}
-      WHERE id = $2
-        ${columns.has('tenant_id') ? `AND tenant_id = $${values.length + 1}` : ''}
+      WHERE id = $2::bigint
+        ${columns.has('tenant_id') ? `AND tenant_id = $${values.length + 1}::text` : ''}
       RETURNING *
     `;
 
       const updateResult = await client.query(
         updateSql,
-        columns.has('tenant_id') ? [...values, tenantId] : values,
+        columns.has('tenant_id') ? [...values, safeTenantId || ''] : values,
       );
       await client.query('COMMIT');
 
@@ -1071,25 +1074,25 @@ const settleKasBon = async (req, res) => {
       );
     }
 
-    const values = [safeRemainingBalance, id, safeNextAmountPaid];
+    const values = [safeRemainingBalance || 0, safeSalesRecordId, safeNextAmountPaid || 0];
 
     if (columns.has('payment_status')) {
       const paramPosition = values.length + 1;
-      updateClauses.push(`payment_status = $${paramPosition}`);
+      updateClauses.push(`payment_status = $${paramPosition}::text`);
       values.push(isLunas ? 'LUNAS' : 'BELUM LUNAS');
     }
 
     const updateSql = `
       UPDATE sales_records
       SET ${updateClauses.join(', ')}
-      WHERE id = $2
-        ${columns.has('tenant_id') ? `AND tenant_id = $${values.length + 1}` : ''}
+      WHERE id = $2::bigint
+        ${columns.has('tenant_id') ? `AND tenant_id = $${values.length + 1}::text` : ''}
       RETURNING *
     `;
 
     const updateResult = await client.query(
       updateSql,
-      columns.has('tenant_id') ? [...values, tenantId] : values,
+      columns.has('tenant_id') ? [...values, safeTenantId || ''] : values,
     );
     await client.query('COMMIT');
 
