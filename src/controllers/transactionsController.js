@@ -483,7 +483,55 @@ const listActiveKasBon = async (req, res) => {
       };
     });
 
-    return jsonOk(res, normalizedRows, 'Kas bon aktif berhasil dimuat');
+    const rowRecency = (row) => {
+      const updatedAtRaw = row.updated_at ?? row.updatedAt ?? row.created_at ?? row.createdAt;
+      const updatedAtMs = Date.parse((updatedAtRaw ?? '').toString());
+      if (Number.isFinite(updatedAtMs)) {
+        return updatedAtMs;
+      }
+      const numericId = Number(row.id);
+      return Number.isFinite(numericId) ? numericId : 0;
+    };
+
+    const sortedRows = [...normalizedRows].sort((a, b) => rowRecency(b) - rowRecency(a));
+    const shouldCanonicalizeActiveRows = statusFilter !== 'paid' && statusFilter !== 'lunas';
+
+    if (!shouldCanonicalizeActiveRows) {
+      return jsonOk(res, sortedRows, 'Kas bon aktif berhasil dimuat');
+    }
+
+    const selectedCustomerKeys = new Set();
+    const canonicalRows = [];
+
+    for (const row of sortedRows) {
+      const remainingBalance = toNumber(row.remaining_balance ?? row.outstanding_balance ?? 0);
+      const normalizedRemainingBalance = Number.isFinite(remainingBalance) ? remainingBalance : 0;
+      const statusToken = (row.payment_status ?? '').toString().trim().toUpperCase();
+      const isOpenKasBon = normalizedRemainingBalance > 0 && statusToken !== 'LUNAS';
+
+      if (!isOpenKasBon) {
+        canonicalRows.push(row);
+        continue;
+      }
+
+      const customerId = (row.customer_id ?? row.customerId ?? '').toString().trim();
+      const customerName = (row.customer_name ?? row.customerName ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+      const customerKey = customerId
+        ? `customer_id:${customerId}`
+        : (customerName ? `customer_name:${customerName}` : `row:${row.id ?? row.receipt_number ?? canonicalRows.length}`);
+
+      if (selectedCustomerKeys.has(customerKey)) {
+        continue;
+      }
+
+      selectedCustomerKeys.add(customerKey);
+      canonicalRows.push(row);
+    }
+
+    return jsonOk(res, canonicalRows, 'Kas bon aktif berhasil dimuat');
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
   } finally {
