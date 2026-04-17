@@ -2,8 +2,7 @@ require('dotenv').config();
 
 const jwt = require('jsonwebtoken');
 const {
-  getOrCreateTenantPool,
-  pools,
+  getSharedPool,
 } = require('../src/middlewares/tenantResolver');
 
 function getCliArg(prefix) {
@@ -203,13 +202,10 @@ async function applyDuplicateClose(client, duplicates) {
 }
 
 async function closePools() {
-  const closers = [];
-  for (const entry of pools.values()) {
-    if (entry?.pool?.end) {
-      closers.push(entry.pool.end().catch(() => {}));
-    }
+  const sharedPool = global.__goldenitySharedPool;
+  if (sharedPool?.end) {
+    await sharedPool.end().catch(() => {});
   }
-  await Promise.all(closers);
 }
 
 async function main() {
@@ -220,7 +216,7 @@ async function main() {
 
   const applyChanges = hasFlag('--apply');
   const { tenantId, dbUrl, source } = resolveTenantContext();
-  const pool = getOrCreateTenantPool(tenantId, dbUrl);
+  const pool = getSharedPool();
   const client = await pool.connect();
 
   try {
