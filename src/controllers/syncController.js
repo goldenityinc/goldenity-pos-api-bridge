@@ -11,6 +11,7 @@ const {
   runSelect,
 } = require('../utils/sqlHelpers');
 const { emitTableMutation } = require('../services/realtimeEmitter');
+const { scheduleSalesJournalPosting } = require('../services/accountingAutomationService');
 
 const isIntegerColumnDefinition = (columnDefinition = {}) => {
   const dataType = `${columnDefinition.dataType || ''}`.toLowerCase();
@@ -450,6 +451,11 @@ const runSync = async (req, res) => {
           record: row,
         });
       }
+      if (table === 'sales_records') {
+        for (const row of result.rows || []) {
+          scheduleSalesJournalPosting({ salesRecord: row, tenantId });
+        }
+      }
       return jsonOk(res, result.rows, 'Sync insert success', 201);
     }
 
@@ -503,6 +509,9 @@ const runSync = async (req, res) => {
         record: result.rows[0] || null,
         id,
       });
+      if (table === 'sales_records' && result.rows?.[0]) {
+        scheduleSalesJournalPosting({ salesRecord: result.rows[0], tenantId });
+      }
       return jsonOk(res, result.rows, 'Sync update success');
     }
 

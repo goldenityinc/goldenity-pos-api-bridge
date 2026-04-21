@@ -18,6 +18,7 @@ const {
 const { ensureTenantScopedTable } = require('../utils/tenantScope');
 const { emitTableMutation } = require('../services/realtimeEmitter');
 const { uploadBase64Object } = require('../services/objectStorageService');
+const { scheduleExpenseJournalPosting } = require('../services/accountingAutomationService');
 
 const createHttpError = (statusCode, message) => {
   const error = new Error(message);
@@ -1158,6 +1159,11 @@ const createRecords = async (req, res) => {
         });
       }
     }
+    if (table === 'expenses') {
+      for (const row of result.rows || []) {
+        scheduleExpenseJournalPosting({ expenseRecord: row, tenantId });
+      }
+    }
     return jsonOk(
       res,
       result.rows,
@@ -1274,6 +1280,11 @@ const upsertRecords = async (req, res) => {
         });
       }
     }
+    if (table === 'expenses') {
+      for (const row of result.rows || []) {
+        scheduleExpenseJournalPosting({ expenseRecord: row, tenantId });
+      }
+    }
     return jsonOk(res, result.rows, 'Upserted');
   } catch (error) {
     return jsonError(
@@ -1369,6 +1380,9 @@ const updateRecordById = async (req, res) => {
       record: result.rows[0] || null,
       id: req.params.id,
     });
+    if (table === 'expenses' && result.rows?.[0]) {
+      scheduleExpenseJournalPosting({ expenseRecord: result.rows[0], tenantId });
+    }
     return jsonOk(res, result.rows[0] || null, 'Updated');
   } catch (error) {
     return jsonError(
