@@ -118,59 +118,80 @@ const getAllTenantBranches = async (db, tenantId) => {
   return result.rows;
 };
 
-const PIVOT_CANDIDATES = [
-  { table: 'user_branches', userColumn: 'user_id', branchColumn: 'branch_id' },
-  { table: 'employee_branches', userColumn: 'user_id', branchColumn: 'branch_id' },
-  { table: 'employee_branches', userColumn: 'employee_id', branchColumn: 'branch_id' },
-  { table: 'app_user_branches', userColumn: 'user_id', branchColumn: 'branch_id' },
-  { table: 'app_user_branches', userColumn: 'app_user_id', branchColumn: 'branch_id' },
-  { table: 'users_branches', userColumn: 'user_id', branchColumn: 'branch_id' },
-];
+const resolveBranchIdFromToken = (req) => normalizeText(
+  req?.user?.branch_id
+  || req?.user?.branchId
+  || req?.auth?.branch_id
+  || req?.auth?.branchId,
+);
 
-const resolvePivotConfig = async (db) => {
-  for (const candidate of PIVOT_CANDIDATES) {
-    // Pick the first pivot table shape that exists in this tenant schema.
-    // This keeps the endpoint compatible across legacy naming variants.
-    const exists = await tableExists(db, candidate.table);
+const USER_TABLE_CANDIDATES = ['app_users', 'users'];
+
+const getUserBranchIdFromDb = async (db, tenantId, userId) => {
+  if (!tenantId || !userId) {
+    return '';
+  }
+
+  for (const tableName of USER_TABLE_CANDIDATES) {
+    const exists = await tableExists(db, tableName);
     if (!exists) {
       continue;
     }
 
-    const columns = await getTableColumns(db, candidate.table);
-    if (!columns.has(candidate.userColumn) || !columns.has(candidate.branchColumn)) {
+    const columns = await getTableColumns(db, tableName);
+    if (!columns.has('branch_id') || !columns.has('id')) {
       continue;
     }
 
-    return {
-      ...candidate,
-      hasTenantColumn: columns.has('tenant_id'),
-    };
+    if (columns.has('tenant_id')) {
+      const withTenant = await db.query(
+        `SELECT branch_id
+         FROM ${tableName}
+         WHERE id = $1 AND tenant_id = $2
+         LIMIT 1`,
+        [userId, tenantId],
+      );
+      const branchId = normalizeText(withTenant.rows[0]?.branch_id);
+      if (branchId) {
+        return branchId;
+      }
+      continue;
+    }
+
+    const withoutTenant = await db.query(
+      `SELECT branch_id
+       FROM ${tableName}
+       WHERE id = $1
+       LIMIT 1`,
+      [userId],
+    );
+    const branchId = normalizeText(withoutTenant.rows[0]?.branch_id);
+    if (branchId) {
+      return branchId;
+    }
   }
 
-  return null;
+  return '';
 };
 
-const getAssignedBranches = async (db, tenantId, userId) => {
-  const pivot = await resolvePivotConfig(db);
-  if (!pivot) {
+const getBranchById = async (db, tenantId, branchId) => {
+  if (!tenantId || !branchId) {
     return [];
   }
 
-  const values = [tenantId, userId];
-  const tenantFilter = pivot.hasTenantColumn ? ' AND p.tenant_id = $1' : '';
-
   const result = await db.query(
-    `SELECT b.*
-     FROM branches b
-     INNER JOIN ${pivot.table} p ON p.${pivot.branchColumn} = b.id
-     WHERE b.tenant_id = $1
-       AND p.${pivot.userColumn} = $2
-       ${tenantFilter}
-     ORDER BY name ASC NULLS LAST, id ASC`,
-    values,
+    `SELECT *
+     FROM branches
+     WHERE tenant_id = $1 AND id = $2
+     LIMIT 1`,
+    [tenantId, branchId],
   );
 
-  return result.rows;
+  if (!result.rows.length) {
+    return [];
+  }
+
+  return [result.rows[0]];
 };
 
 const listBranchesForCurrentUser = async (req, res) => {
@@ -205,7 +226,12 @@ const listBranchesForCurrentUser = async (req, res) => {
       return jsonOk(res, rows);
     }
 
-    const rows = await getAssignedBranches(db, tenantId, userId);
+    let branchId = resolveBranchIdFromToken(req);
+    if (!branchId) {
+      branchId = await getUserBranchIdFromDb(db, tenantId, userId);
+    }
+
+    const rows = await getBranchById(db, tenantId, branchId);
     return jsonOk(res, rows);
   } catch (error) {
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
