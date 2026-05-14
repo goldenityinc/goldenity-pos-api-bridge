@@ -196,7 +196,12 @@ const getBranchById = async (db, tenantId, branchId) => {
 
 const listBranchesForCurrentUser = async (req, res) => {
   try {
+    const userId = resolveUserId(req);
     const db = req?.tenantDb;
+
+    // === AGGRESSIVE LOGGING: Log every request ===
+    console.log('[BRANCH API] Request from User:', userId, '| Role:', getAuthRole(req));
+
     if (!db) {
       return jsonError(res, 500, 'Database tenant tidak tersedia');
     }
@@ -212,7 +217,6 @@ const listBranchesForCurrentUser = async (req, res) => {
     }
 
     let role = getAuthRole(req);
-    const userId = resolveUserId(req);
 
     if (!roleProvidedInToken(req)) {
       const roleFromDb = await getAppUserRoleFromDb(db, tenantId, userId);
@@ -222,18 +226,33 @@ const listBranchesForCurrentUser = async (req, res) => {
     }
 
     if (VIP_ROLES.has(role)) {
+      console.log(`[BRANCH API] VIP role "${role}" for user ${userId} → returning ALL tenant branches`);
       const rows = await getAllTenantBranches(db, tenantId);
       return jsonOk(res, rows);
     }
+
+    // === STAFF/CASHIER FLOW: STRICT GUARDRAIL ===
+    console.log(`[BRANCH API] Staff/Cashier user ${userId} with role "${role}" → resolving branchId...`);
 
     let branchId = resolveBranchIdFromToken(req);
     if (!branchId) {
       branchId = await getUserBranchIdFromDb(db, tenantId, userId);
     }
 
+    // === CRITICAL NULL CHECK: MUST FAIL SAFELY ===
+    if (!branchId) {
+      console.log(`[BRANCH API] SECURITY GUARD: Staff user ${userId} has no valid branchId. Returning empty array.`);
+      return jsonOk(res, []);
+    }
+
+    console.log(`[BRANCH API] Resolved Staff BranchId for user ${userId}: "${branchId}"`);
+
     const rows = await getBranchById(db, tenantId, branchId);
+    console.log(`[BRANCH API] Query returned ${rows.length} branch(es) for user ${userId}`);
+
     return jsonOk(res, rows);
   } catch (error) {
+    console.error(`[BRANCH API] ERROR for user ${resolveUserId(req)}:`, error.message);
     return jsonError(res, 500, error.message || 'Internal server error', error.message);
   }
 };
