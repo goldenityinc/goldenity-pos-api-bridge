@@ -98,6 +98,7 @@ model Product {
   createdAt     DateTime? @default(now()) @map("created_at")
   updatedAt     DateTime? @default(now()) @map("updated_at")
   referenceId   String?   @map("reference_id")
+  productType   String?   @map("product_type")
 
   tenant        Tenant?   @relation(fields: [tenantId], references: [id])
 
@@ -119,12 +120,15 @@ model Category {
 }
 
 model Transaction {
-  id        BigInt    @id @default(autoincrement())
-  tenantId  String?   @map("tenant_id")
-  createdAt DateTime? @default(now()) @map("created_at")
-  updatedAt DateTime? @default(now()) @map("updated_at")
+  id                  BigInt    @id @default(autoincrement())
+  tenantId            String?   @map("tenant_id")
+  createdAt           DateTime? @default(now()) @map("created_at")
+  updatedAt           DateTime? @default(now()) @map("updated_at")
+  mechanicId          String?   @map("mechanic_id")
+  mechanicName        String?   @map("mechanic_name")
+  mechanicCommission  Decimal?  @map("mechanic_commission")
 
-  tenant    Tenant?   @relation(fields: [tenantId], references: [id])
+  tenant              Tenant?   @relation(fields: [tenantId], references: [id])
 
   @@index([tenantId])
   @@map("transactions")
@@ -146,6 +150,9 @@ model SalesRecord {
   outstandingBalance Decimal?  @map("outstanding_balance")
   createdAt          DateTime? @default(now()) @map("created_at")
   updatedAt          DateTime? @default(now()) @map("updated_at")
+  mechanicId         String?   @map("mechanic_id")
+  mechanicName       String?   @map("mechanic_name")
+  mechanicCommission Decimal?  @map("mechanic_commission")
 
   tenant             Tenant?   @relation(fields: [tenantId], references: [id])
   items              SalesRecordItem[]
@@ -261,18 +268,21 @@ model CustomRole {
 }
 
 model AppUser {
-  id           BigInt    @id @default(autoincrement())
-  tenantId     String?   @map("tenant_id")
-  username     String
-  password     String?
-  name         String?
-  role         String?
-  customRoleId String?   @map("custom_role_id")
-  isActive     Boolean?  @default(true) @map("is_active")
-  createdAt    DateTime? @default(now()) @map("created_at")
-  updatedAt    DateTime? @default(now()) @map("updated_at")
+  id               BigInt    @id @default(autoincrement())
+  tenantId         String?   @map("tenant_id")
+  username         String
+  password         String?
+  name             String?
+  role             String?
+  customRoleId     String?   @map("custom_role_id")
+  isActive         Boolean?  @default(true) @map("is_active")
+  createdAt        DateTime? @default(now()) @map("created_at")
+  updatedAt        DateTime? @default(now()) @map("updated_at")
+  employeeType     String?   @map("employee_type")
+  baseSalary       Decimal?  @map("base_salary")
+  commissionRate   Decimal?  @map("commission_rate")
 
-  tenant       Tenant?   @relation(fields: [tenantId], references: [id])
+  tenant           Tenant?   @relation(fields: [tenantId], references: [id])
 
   @@index([tenantId])
   @@index([username])
@@ -401,22 +411,25 @@ model PettyCashLog {
 }
 
 model ServiceOrder {
-  id            String   @id @default(cuid())
-  tenantId      String   @map("tenant_id")
-  customerName  String   @map("customer_name")
-  customerPhone String?  @map("customer_phone")
-  deviceType    String   @map("device_type")
-  deviceBrand   String?  @map("device_brand")
-  serialNumber  String?  @map("serial_number")
-  complaint     String
-  status        String   @default("PENDING")
-  estimatedCost Decimal? @map("estimated_cost") @db.Decimal(14, 2)
-  technicianNotes String? @map("technician_notes")
-  serviceDetails Json?   @map("service_details")
-  createdAt     DateTime @default(now()) @map("created_at")
-  updatedAt     DateTime @updatedAt @map("updated_at")
+  id               String   @id @default(cuid())
+  tenantId         String   @map("tenant_id")
+  customerName     String   @map("customer_name")
+  customerPhone    String?  @map("customer_phone")
+  deviceType       String   @map("device_type")
+  deviceBrand      String?  @map("device_brand")
+  serialNumber     String?  @map("serial_number")
+  complaint        String
+  status           String   @default("PENDING")
+  estimatedCost    Decimal? @map("estimated_cost") @db.Decimal(14, 2)
+  technicianNotes  String?  @map("technician_notes")
+  serviceDetails   Json?    @map("service_details")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+  mechanicId       String?  @map("mechanic_id")
+  mechanicName     String?  @map("mechanic_name")
+  mechanicCommission Decimal? @map("mechanic_commission")
 
-  tenant        Tenant   @relation(fields: [tenantId], references: [id])
+  tenant           Tenant   @relation(fields: [tenantId], references: [id])
 
   @@index([tenantId])
   @@index([tenantId, status])
