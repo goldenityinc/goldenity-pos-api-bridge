@@ -179,6 +179,7 @@ model SalesRecordItem {
   qty           Int         @default(1)
   customPrice   Decimal?    @map("custom_price") @db.Decimal(14, 2)
   note          String?
+  item_note     String?
   isService     Boolean     @default(false) @map("is_service")
   createdAt     DateTime?   @default(now()) @map("created_at")
   updatedAt     DateTime?   @default(now()) @map("updated_at")
