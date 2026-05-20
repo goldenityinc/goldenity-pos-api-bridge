@@ -127,6 +127,10 @@ model Transaction {
   mechanicId          String?   @map("mechanic_id")
   mechanicName        String?   @map("mechanic_name")
   mechanicCommission  Decimal?  @map("mechanic_commission")
+  transaction_type    String?
+  dp_amount           Decimal?
+  pickup_date         DateTime?
+  po_status           String?
 
   tenant              Tenant?   @relation(fields: [tenantId], references: [id])
 
@@ -153,6 +157,10 @@ model SalesRecord {
   mechanicId         String?   @map("mechanic_id")
   mechanicName       String?   @map("mechanic_name")
   mechanicCommission Decimal?  @map("mechanic_commission")
+  transaction_type   String?
+  dp_amount          Decimal?
+  pickup_date        DateTime?
+  po_status          String?
 
   tenant             Tenant?   @relation(fields: [tenantId], references: [id])
   items              SalesRecordItem[]
