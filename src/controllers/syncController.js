@@ -310,9 +310,25 @@ const normalizeSalesRecordItems = (items) => {
         return null;
       }
 
-      const customPrice = toNumber(
-        item.custom_price ?? item.customPrice ?? item.price ?? item.unit_price ?? 0,
+      let customPrice = toNumber(
+        item.custom_price ??
+        item.customPrice ??
+        item.price ??
+        item.unit_price ??
+        item.unitPrice ??
+        item.service_item_price ??
+        item.harga_jual ??
+        item?.product?.harga_jual ??
+        0,
       );
+      if (!Number.isFinite(customPrice)) {
+        const lineTotal = toNumber(
+          item.line_total ?? item.lineTotal ?? item.total_price ?? item.total ?? item.subtotal,
+        );
+        if (Number.isFinite(lineTotal) && qty > 0) {
+          customPrice = lineTotal / qty;
+        }
+      }
 
       return {
         product_id: productId || null,

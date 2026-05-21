@@ -805,11 +805,14 @@ const extractItemSellingPrice = (item = {}) => {
   const candidates = [
     item.custom_price,
     item.customPrice,
+    item.service_item_price,
     item.product_price,
     item.productPrice,
+    item.harga_jual,
     item.price,
     item.unit_price,
     item.unitPrice,
+    item?.product?.harga_jual,
     item?.product?.price,
   ];
 

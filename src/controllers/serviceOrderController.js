@@ -24,6 +24,19 @@ const normalizeStatus = (value) => (value ?? '')
   .trim()
   .toUpperCase();
 
+const toFiniteNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const toPositiveInteger = (value) => {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+};
+
 const parseJsonField = (value) => {
   if (value == null) return null;
   if (typeof value === 'string') {
@@ -65,13 +78,13 @@ const sanitizeServiceOrderPayload = (rawBody) => {
     'service_details',
     'serviceDetailsJson',
     'service_details_json',
+    'items',
     'cost_details',
     'costDetails',
     'spare_parts',
     'spareParts',
     'rincian_biaya',
     'rincianBiaya',
-    'items',
   ];
 
   for (const fieldName of jsonCandidateFields) {
@@ -145,11 +158,33 @@ const normalizeServiceDetails = (rawValue) => {
       continue;
     }
 
-    const itemName = (item.itemName ?? item.item_name ?? '')
+    const itemName = (item.itemName ?? item.item_name ?? item.name ?? '')
       .toString()
       .trim();
-    const priceRaw = item.price ?? item.amount ?? item.cost;
-    const price = Number(priceRaw ?? 0);
+    const qty = toPositiveInteger(item.qty ?? item.quantity ?? item.service_item_qty) ?? 1;
+    const price = toFiniteNumber(
+      item.price ??
+      item.amount ??
+      item.cost ??
+      item.service_item_price ??
+      item.unit_price ??
+      item.unitPrice ??
+      item.harga_jual ??
+      0,
+    );
+    const typeRaw = (
+      item.service_item_type ??
+      item.type ??
+      item.product_type ??
+      item.productType ??
+      ''
+    )
+      .toString()
+      .trim()
+      .toLowerCase();
+    const normalizedType = typeRaw
+      ? (typeRaw === 'jasa' ? 'Jasa' : 'Barang')
+      : ((item.is_service === true || item.isService === true) ? 'Jasa' : 'Barang');
 
     if (!itemName) {
       return {
@@ -158,7 +193,7 @@ const normalizeServiceDetails = (rawValue) => {
         error: 'serviceDetails.itemName tidak boleh kosong',
       };
     }
-    if (!Number.isFinite(price) || price < 0) {
+    if (price === null || price < 0) {
       return {
         hasValue: true,
         value: null,
@@ -168,7 +203,18 @@ const normalizeServiceDetails = (rawValue) => {
 
     normalizedItems.push({
       itemName,
+      qty,
       price,
+      type: normalizedType,
+      product_type: normalizedType,
+      service_item_type: normalizedType,
+      service_item_price: price,
+      service_item_qty: qty,
+      is_service: normalizedType === 'Jasa',
+      ...(item.id !== undefined && item.id !== null ? { id: item.id } : {}),
+      ...(item.product_id !== undefined && item.product_id !== null
+        ? { product_id: item.product_id }
+        : {}),
     });
   }
 
@@ -182,8 +228,9 @@ const normalizeServiceDetails = (rawValue) => {
 const sumServiceDetails = (serviceDetails) => {
   if (!Array.isArray(serviceDetails)) return 0;
   return serviceDetails.reduce((sum, item) => {
-    const price = Number(item?.price ?? 0);
-    return Number.isFinite(price) ? sum + price : sum;
+    const price = toFiniteNumber(item?.price) ?? 0;
+    const qty = toPositiveInteger(item?.qty ?? item?.quantity ?? item?.service_item_qty) ?? 1;
+    return sum + (price * qty);
   }, 0);
 };
 
@@ -219,6 +266,11 @@ const assertColumnsExist = async (client, table, columns = []) => {
 };
 
 const ensureServiceOrdersTable = async (client) => {
+  await client.query(
+    `ALTER TABLE service_orders
+       ADD COLUMN IF NOT EXISTS mechanic_id TEXT,
+       ADD COLUMN IF NOT EXISTS mechanic_name TEXT`,
+  );
   await assertColumnsExist(client, 'service_orders', [
     'id',
     'tenant_id',
@@ -231,6 +283,8 @@ const ensureServiceOrdersTable = async (client) => {
     'status',
     'estimated_cost',
     'technician_notes',
+    'mechanic_id',
+    'mechanic_name',
     'service_details',
     'created_at',
     'updated_at',
@@ -255,6 +309,10 @@ const mapRow = (row = {}) => ({
   status: row.status,
   estimatedCost: row.estimated_cost === null ? null : Number(row.estimated_cost),
   estimated_cost: row.estimated_cost === null ? null : Number(row.estimated_cost),
+  mechanicId: row.mechanic_id,
+  mechanic_id: row.mechanic_id,
+  mechanicName: row.mechanic_name,
+  mechanic_name: row.mechanic_name,
   technicianNotes: row.technician_notes,
   technician_notes: row.technician_notes,
   serviceDetails: parseJsonField(row.service_details),
@@ -275,6 +333,8 @@ const createServiceOrder = async (req, res) => {
   const client = await req.tenantDb.connect();
 
   try {
+    req.body = sanitizeServiceOrderPayload(req.body);
+
     const tenantId = normalizeTenantId(req);
     if (!tenantId) {
       return jsonError(res, 401, 'Tenant tidak valid');
@@ -301,6 +361,12 @@ const createServiceOrder = async (req, res) => {
     );
     const technicianNotes = safeStringField(
       req.body?.technicianNotes ?? req.body?.technician_notes,
+    );
+    const mechanicId = safeStringField(
+      req.body?.mechanicId ?? req.body?.mechanic_id,
+    );
+    const mechanicName = safeStringField(
+      req.body?.mechanicName ?? req.body?.mechanic_name,
     );
     const serviceDetailsRaw = req.body?.serviceDetails
       ?? req.body?.service_details
@@ -352,6 +418,8 @@ const createServiceOrder = async (req, res) => {
          complaint,
          status,
          estimated_cost,
+         mechanic_id,
+         mechanic_name,
          technician_notes,
          service_details
        ) VALUES (
@@ -366,7 +434,9 @@ const createServiceOrder = async (req, res) => {
          'PENDING',
          $9::numeric,
          $10::text,
-         $11::jsonb
+         $11::text,
+         $12::text,
+         $13::jsonb
        )
        RETURNING *`,
       [
@@ -379,6 +449,8 @@ const createServiceOrder = async (req, res) => {
         serialNumber,
         complaint,
         estimatedCost,
+        mechanicId,
+        mechanicName,
         technicianNotes,
         serviceDetailsDbValue,
       ],
@@ -476,6 +548,12 @@ const updateServiceOrder = async (req, res) => {
     const technicianNotes = safeStringField(
       req.body?.technicianNotes ?? req.body?.technician_notes,
     );
+    const mechanicId = safeStringField(
+      req.body?.mechanicId ?? req.body?.mechanic_id,
+    );
+    const mechanicName = safeStringField(
+      req.body?.mechanicName ?? req.body?.mechanic_name,
+    );
     const serviceDetailsRaw = req.body?.serviceDetails
       ?? req.body?.service_details
       ?? req.body?.serviceDetailsJson
@@ -543,6 +621,22 @@ const updateServiceOrder = async (req, res) => {
       fields.push(`technician_notes = $${params.length}`);
     }
 
+    if (
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'mechanicId') ||
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'mechanic_id')
+    ) {
+      params.push(mechanicId);
+      fields.push(`mechanic_id = $${params.length}`);
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'mechanicName') ||
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'mechanic_name')
+    ) {
+      params.push(mechanicName);
+      fields.push(`mechanic_name = $${params.length}`);
+    }
+
     if (serviceDetailsInput.hasValue) {
       params.push(serviceDetailsDbValue);
       fields.push(`service_details = $${params.length}`);
@@ -552,7 +646,7 @@ const updateServiceOrder = async (req, res) => {
       return jsonError(
         res,
         400,
-        'Minimal satu field harus diupdate: status, estimatedCost, technicianNotes, atau serviceDetails',
+        'Minimal satu field harus diupdate: status, estimatedCost, technicianNotes, mechanicId, mechanicName, atau serviceDetails',
       );
     }
 
@@ -584,6 +678,8 @@ const updateServiceOrder = async (req, res) => {
       status: req.body?.status,
       estimatedCost: req.body?.estimatedCost,
       technicianNotes: req.body?.technicianNotes,
+      mechanicId: req.body?.mechanicId,
+      mechanicName: req.body?.mechanicName,
       serviceDetails: req.body?.serviceDetails,
     });
     return jsonError(
