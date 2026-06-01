@@ -269,7 +269,9 @@ const ensureServiceOrdersTable = async (client) => {
   await client.query(
     `ALTER TABLE service_orders
        ADD COLUMN IF NOT EXISTS mechanic_id TEXT,
-       ADD COLUMN IF NOT EXISTS mechanic_name TEXT`,
+       ADD COLUMN IF NOT EXISTS mechanic_name TEXT,
+       ADD COLUMN IF NOT EXISTS payment_status TEXT,
+       ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ`,
   );
   await assertColumnsExist(client, 'service_orders', [
     'id',
@@ -286,6 +288,8 @@ const ensureServiceOrdersTable = async (client) => {
     'mechanic_id',
     'mechanic_name',
     'service_details',
+    'payment_status',
+    'paid_at',
     'created_at',
     'updated_at',
   ]);
@@ -317,6 +321,10 @@ const mapRow = (row = {}) => ({
   technician_notes: row.technician_notes,
   serviceDetails: parseJsonField(row.service_details),
   service_details: parseJsonField(row.service_details),
+  paymentStatus: row.payment_status ?? null,
+  payment_status: row.payment_status ?? null,
+  paidAt: row.paid_at ?? null,
+  paid_at: row.paid_at ?? null,
   createdAt: row.created_at,
   created_at: row.created_at,
   updatedAt: row.updated_at,
@@ -642,11 +650,33 @@ const updateServiceOrder = async (req, res) => {
       fields.push(`service_details = $${params.length}`);
     }
 
+    const paymentStatusRaw = req.body?.payment_status ?? req.body?.paymentStatus;
+    if (
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'payment_status') ||
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'paymentStatus')
+    ) {
+      const paymentStatus = paymentStatusRaw == null
+        ? null
+        : paymentStatusRaw.toString().trim().toLowerCase() || null;
+      params.push(paymentStatus);
+      fields.push(`payment_status = $${params.length}`);
+    }
+
+    const paidAtRaw = req.body?.paid_at ?? req.body?.paidAt;
+    if (
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'paid_at') ||
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'paidAt')
+    ) {
+      const paidAt = paidAtRaw == null ? null : safeStringField(paidAtRaw);
+      params.push(paidAt);
+      fields.push(`paid_at = $${params.length}`);
+    }
+
     if (!fields.length) {
       return jsonError(
         res,
         400,
-        'Minimal satu field harus diupdate: status, estimatedCost, technicianNotes, mechanicId, mechanicName, atau serviceDetails',
+        'Minimal satu field harus diupdate: status, estimatedCost, technicianNotes, mechanicId, mechanicName, serviceDetails, atau paymentStatus',
       );
     }
 
