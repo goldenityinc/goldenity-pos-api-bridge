@@ -13,7 +13,7 @@
     "prisma:generate": "prisma generate",
     "reset:db:tpp": "node scripts/reset-db.js",
     "postinstall": "prisma generate",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",

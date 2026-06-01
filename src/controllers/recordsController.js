@@ -648,6 +648,39 @@ const ensureSelectedColumn = (selectValue, columnName) => {
   return `${columns.join(',')},${columnName}`;
 };
 
+const ensureSelectedColumns = (selectValue, columnNames = [], columnSet = null) => {
+  if (!Array.isArray(columnNames) || columnNames.length === 0) {
+    return selectValue;
+  }
+
+  let nextSelectValue = selectValue;
+  for (const columnName of columnNames) {
+    if (!columnName) {
+      continue;
+    }
+    if (columnSet instanceof Set && !columnSet.has(columnName)) {
+      continue;
+    }
+    nextSelectValue = ensureSelectedColumn(nextSelectValue, columnName);
+  }
+
+  return nextSelectValue;
+};
+
+const setNoStoreHeaders = (res) => {
+  if (!res || typeof res.set !== 'function') {
+    return;
+  }
+
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    Pragma: 'no-cache',
+    Expires: '0',
+    'Surrogate-Control': 'no-store',
+    'X-Bridge-Cache': 'bypass',
+  });
+};
+
 const resolvePrimaryKeyColumn = async (tenantDb, table) => {
   const result = await tenantDb.query(
     `SELECT kcu.column_name
@@ -881,6 +914,25 @@ const calculateProfitFromItems = (items = [], purchasePriceMap = new Map()) => {
   return Math.round(totalProfit);
 };
 
+const normalizeSalesRecordItemForResponse = (item) => {
+  if (!item || typeof item !== 'object') {
+    return item;
+  }
+
+  const rawCustomPrice = item.custom_price ?? item.customPrice;
+  const normalizedCustomPrice = toFiniteNumber(rawCustomPrice);
+  const resolvedIsService = item.is_service ?? item.isService;
+
+  return {
+    ...item,
+    is_service: resolvedIsService === undefined ? null : resolvedIsService,
+    product_type: item.product_type ?? item.productType ?? null,
+    custom_price: normalizedCustomPrice === null
+      ? (rawCustomPrice === undefined ? null : rawCustomPrice)
+      : normalizedCustomPrice,
+  };
+};
+
 const parseItemsFromJsonField = (value) => {
   if (!value) {
     return [];
@@ -917,14 +969,31 @@ const loadSalesRecordItemsMap = async (tenantDb, rows, tenantId) => {
 
   try {
     const normalizedTenantId = normalizeTenantId(tenantId);
+    const salesRecordItemsColumns = await getTableColumnSet(tenantDb, 'sales_record_items');
+    const selectedColumns = [
+      'sales_record_id',
+      'product_id',
+      'product_name',
+      'qty',
+      'custom_price',
+      'note',
+      'is_service',
+      'product_type',
+    ].filter((column) => salesRecordItemsColumns.has(column));
+
+    if (selectedColumns.length === 0 || !selectedColumns.includes('sales_record_id')) {
+      return new Map();
+    }
+
+    const selectClause = selectedColumns.join(', ');
     const result = await tenantDb.query(
       normalizedTenantId
-        ? `SELECT sales_record_id, product_id, product_name, qty, custom_price, note, is_service
+        ? `SELECT ${selectClause}
            FROM sales_record_items
            WHERE tenant_id = $1
              AND sales_record_id = ANY($2::bigint[])
            ORDER BY id ASC`
-        : `SELECT sales_record_id, product_id, product_name, qty, custom_price, note, is_service
+        : `SELECT ${selectClause}
            FROM sales_record_items
            WHERE sales_record_id = ANY($1::bigint[])
            ORDER BY id ASC`,
@@ -938,12 +1007,16 @@ const loadSalesRecordItemsMap = async (tenantDb, rows, tenantId) => {
         grouped.set(key, []);
       }
       grouped.get(key).push({
+        ...row,
         product_id: row.product_id || null,
         product_name: row.product_name || '',
         qty: Number(row.qty || 0),
-        custom_price: row.custom_price === null ? null : Number(row.custom_price),
+        custom_price: toFiniteNumber(row.custom_price) === null
+          ? (row.custom_price === undefined ? null : row.custom_price)
+          : Number(row.custom_price),
         note: (row.note || '').toString(),
-        is_service: row.is_service === true,
+        is_service: row.is_service === undefined ? null : row.is_service,
+        product_type: row.product_type ?? null,
       });
     }
 
@@ -959,10 +1032,16 @@ const listRecords = async (req, res) => {
     const tenantId = resolveTenantId(req);
 
     if (table === 'sales_records') {
+      setNoStoreHeaders(res);
       const primaryKeyColumn = await resolvePrimaryKeyColumn(req.tenantDb, table);
+      const salesColumns = await getTableColumnSet(req.tenantDb, table);
       const query = {
         ...req.query,
-        select: ensureSelectedColumn(req.query?.select, primaryKeyColumn),
+        select: ensureSelectedColumns(
+          ensureSelectedColumn(req.query?.select, primaryKeyColumn),
+          ['status', 'order_status', 'is_void'],
+          salesColumns,
+        ),
       };
 
       const rows = await runWithCustomersTableRetry(
@@ -1008,12 +1087,15 @@ const listRecords = async (req, res) => {
           const resolvedItems = relationItems.length > 0
             ? relationItems
             : parseItemsFromJsonField(row?.items_json ?? row?.items);
+          const normalizedItems = Array.isArray(resolvedItems)
+            ? resolvedItems.map(normalizeSalesRecordItemForResponse)
+            : [];
 
           const existingProfit = toFiniteNumber(
             row?.total_profit ?? row?.totalProfit ?? row?.profit ?? row?.gross_profit ?? row?.grossProfit,
           );
           const computedProfit = calculateProfitFromItems(
-            resolvedItems,
+            normalizedItems,
             productPurchasePriceMap,
           );
 
@@ -1021,9 +1103,15 @@ const listRecords = async (req, res) => {
             existingProfit === null ||
             (Math.abs(existingProfit) < 0.000001 && computedProfit !== 0);
 
+          const status = row?.status ?? row?.order_status ?? null;
+          const orderStatus = row?.order_status ?? row?.status ?? null;
+
           return {
             ...row,
-            items: resolvedItems,
+            status,
+            order_status: orderStatus,
+            is_void: row?.is_void ?? row?.isVoid ?? null,
+            items: normalizedItems,
             total_profit: shouldUseComputedProfit
               ? computedProfit
               : Math.round(existingProfit),
