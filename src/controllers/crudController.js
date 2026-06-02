@@ -168,7 +168,59 @@ const normalizeCategoryPayloadObject = (payload = {}) => {
   return next;
 };
 
-const normalizePayloadByTable = (table, payload) => {
+const normalizeAppUserPayloadObject = (payload = {}, options = {}) => {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return payload;
+  }
+
+  const next = { ...payload };
+  const normalizedTenantId = normalizeTenantId(
+    options.tenantId ||
+    next.tenant_id ||
+    next.tenantId ||
+    next.user_tenant_id ||
+    next.userTenantId,
+  );
+
+  if (normalizedTenantId) {
+    next.tenant_id = normalizedTenantId;
+    next.tenantId = normalizedTenantId;
+  }
+
+  const rawRole = (
+    next.role ??
+    next.user_role ??
+    next.employee_role ??
+    next.employeeRole ??
+    ''
+  )
+    .toString()
+    .trim()
+    .toUpperCase();
+
+  const rawEmployeeType = (
+    next.employee_type ??
+    next.employeeType ??
+    next.type ??
+    ''
+  )
+    .toString()
+    .trim()
+    .toUpperCase();
+
+  const resolvedRole = rawRole || (rawEmployeeType === 'MECHANIC' ? 'MECHANIC' : 'CRM_STAFF');
+  if (resolvedRole) {
+    next.role = resolvedRole;
+  }
+
+  if (!rawEmployeeType && resolvedRole === 'MECHANIC') {
+    next.employee_type = 'MECHANIC';
+  }
+
+  return next;
+};
+
+const normalizePayloadByTable = (table, payload, options = {}) => {
   const normalizeRow = (row) => {
     if (!row || typeof row !== 'object' || Array.isArray(row)) {
       return row;
@@ -180,6 +232,10 @@ const normalizePayloadByTable = (table, payload) => {
 
     if (table === 'categories') {
       return normalizeCategoryPayloadObject(row);
+    }
+
+    if (table === 'app_users') {
+      return normalizeAppUserPayloadObject(row, options);
     }
 
     return row;
@@ -290,16 +346,20 @@ const createCrudController = (table) => ({
         return jsonOk(res, cachedResponse, 'Created (idempotent)', 200);
       }
 
+      const tenantId = resolveTenantIdFromRequest(req);
+      if (table === 'app_users' && !tenantId) {
+        throw new BadRequestError('tenantId tidak ditemukan pada token/login context');
+      }
+
       const arrayPayload = parseBodyArray(req.body);
       const normalizedIncomingPayload = arrayPayload
-        ? normalizePayloadByTable(table, arrayPayload)
-        : normalizePayloadByTable(table, parseBodyObject(req.body));
+        ? normalizePayloadByTable(table, arrayPayload, { tenantId })
+        : normalizePayloadByTable(table, parseBodyObject(req.body), { tenantId });
       const payload = arrayPayload
         ? await Promise.all(
             normalizedIncomingPayload.map((item) => normalizeUserPassword(table, item, { isCreate: true })),
           )
         : await normalizeUserPassword(table, normalizedIncomingPayload, { isCreate: true });
-      const tenantId = resolveTenantIdFromRequest(req);
       await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions, {
@@ -338,12 +398,13 @@ const createCrudController = (table) => ({
   updateById: async (req, res) => {
     try {
       const idField = req.query.idField || 'id';
+      const tenantId = resolveTenantIdFromRequest(req);
       const normalizedIncomingPayload = normalizePayloadByTable(
         table,
         parseBodyObject(req.body),
+        { tenantId },
       );
       const payload = await normalizeUserPassword(table, normalizedIncomingPayload);
-      const tenantId = resolveTenantIdFromRequest(req);
       await ensureTenantScopedTable(req.tenantDb, table, tenantId);
       const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
       validateIdValueForTable(columnDefinitions, idField, req.params.id);

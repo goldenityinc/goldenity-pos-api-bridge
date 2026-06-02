@@ -522,6 +522,53 @@ const normalizeCustomerPayload = (payload = {}, { isCreate = false } = {}) => {
   return next;
 };
 
+const normalizeAppUserPayload = (payload = {}, options = {}) => {
+  const next = { ...payload };
+
+  const normalizedTenantId = normalizeTenantId(
+    options.tenantId ||
+    next.tenant_id ||
+    next.tenantId ||
+    next.user_tenant_id ||
+    next.userTenantId,
+  );
+  if (normalizedTenantId) {
+    next.tenant_id = normalizedTenantId;
+    next.tenantId = normalizedTenantId;
+  }
+
+  const rawRole = (
+    next.role ??
+    next.user_role ??
+    next.employee_role ??
+    next.employeeRole ??
+    ''
+  )
+    .toString()
+    .trim()
+    .toUpperCase();
+  const rawEmployeeType = (
+    next.employee_type ??
+    next.employeeType ??
+    next.type ??
+    ''
+  )
+    .toString()
+    .trim()
+    .toUpperCase();
+
+  const resolvedRole = rawRole || (rawEmployeeType === 'MECHANIC' ? 'MECHANIC' : 'CRM_STAFF');
+  if (resolvedRole) {
+    next.role = resolvedRole;
+  }
+
+  if (!rawEmployeeType && resolvedRole === 'MECHANIC') {
+    next.employee_type = 'MECHANIC';
+  }
+
+  return next;
+};
+
 const normalizePayloadForTable = (table, payload, options = {}) => {
   if (Array.isArray(payload)) {
     return payload.map((row) => normalizePayloadForTable(table, row, options));
@@ -545,6 +592,10 @@ const normalizePayloadForTable = (table, payload, options = {}) => {
 
   if (table === 'expenses') {
     return normalizeExpensePayloadObject(payload, options);
+  }
+
+  if (table === 'app_users') {
+    return normalizeAppUserPayload(payload, options);
   }
 
   return payload;
@@ -1240,6 +1291,9 @@ const createRecords = async (req, res) => {
   try {
     const table = req.params.table;
     const tenantId = resolveTenantId(req);
+    if (table === 'app_users' && !tenantId) {
+      throw createHttpError(400, 'tenantId tidak ditemukan pada token/login context');
+    }
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
@@ -1249,7 +1303,7 @@ const createRecords = async (req, res) => {
         const basePayload = normalizePayloadForTable(
           table,
           arrayPayload || parseBodyObject(req.body),
-          { isCreate: true },
+          { isCreate: true, tenantId },
         );
         const payload = await enrichExpensePayloadWithUploadedAttachment({
           table,
@@ -1315,6 +1369,9 @@ const upsertRecords = async (req, res) => {
   try {
     const table = req.params.table;
     const tenantId = resolveTenantId(req);
+    if (table === 'app_users' && !tenantId) {
+      throw createHttpError(400, 'tenantId tidak ditemukan pada token/login context');
+    }
     const result = await runWithCustomersTableRetry(
       req.tenantDb,
       table,
@@ -1323,7 +1380,7 @@ const upsertRecords = async (req, res) => {
         const payload = normalizePayloadForTable(
           table,
           parseBodyArray(req.body) || parseBodyObject(req.body),
-          { isCreate: true },
+          { isCreate: true, tenantId },
         );
         const columnDefinitions = await getTableColumnDefinitions(req.tenantDb, table);
         const sanitizedPayload = sanitizeClientGeneratedPrimaryKey(payload, columnDefinitions);

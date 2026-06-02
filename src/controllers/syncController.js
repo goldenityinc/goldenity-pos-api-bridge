@@ -135,6 +135,53 @@ const normalizeCustomerPayload = (payload = {}, { isCreate = false } = {}) => {
   return next;
 };
 
+const normalizeAppUserPayload = (payload = {}, options = {}) => {
+  const next = { ...payload };
+
+  const normalizedTenantId = normalizeTenantId(
+    options.tenantId ||
+    next.tenant_id ||
+    next.tenantId ||
+    next.user_tenant_id ||
+    next.userTenantId,
+  );
+  if (normalizedTenantId) {
+    next.tenant_id = normalizedTenantId;
+    next.tenantId = normalizedTenantId;
+  }
+
+  const rawRole = (
+    next.role ??
+    next.user_role ??
+    next.employee_role ??
+    next.employeeRole ??
+    ''
+  )
+    .toString()
+    .trim()
+    .toUpperCase();
+  const rawEmployeeType = (
+    next.employee_type ??
+    next.employeeType ??
+    next.type ??
+    ''
+  )
+    .toString()
+    .trim()
+    .toUpperCase();
+
+  const resolvedRole = rawRole || (rawEmployeeType === 'MECHANIC' ? 'MECHANIC' : 'CRM_STAFF');
+  if (resolvedRole) {
+    next.role = resolvedRole;
+  }
+
+  if (!rawEmployeeType && resolvedRole === 'MECHANIC') {
+    next.employee_type = 'MECHANIC';
+  }
+
+  return next;
+};
+
 const normalizePayloadForTable = (table, payload, options = {}) => {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return payload;
@@ -146,6 +193,10 @@ const normalizePayloadForTable = (table, payload, options = {}) => {
 
   if (table === 'customers') {
     return normalizeCustomerPayload(payload, options);
+  }
+
+  if (table === 'app_users') {
+    return normalizeAppUserPayload(payload, options);
   }
 
   return payload;
@@ -413,12 +464,16 @@ const runSync = async (req, res) => {
       return jsonError(res, 400, 'table dan action wajib diisi');
     }
 
+    if (table === 'app_users' && !tenantId) {
+      return jsonError(res, 400, 'tenantId tidak ditemukan pada token/login context');
+    }
+
     await prepareTableSchema(req.tenantDb, table);
     await ensureSalesRecordsItemsColumn(req.tenantDb, table);
     await ensureSalesRecordItemsTable(req.tenantDb, table);
 
     if (action === 'INSERT') {
-      const payload = normalizePayloadForTable(table, { ...(data || {}) }, { isCreate: true });
+      const payload = normalizePayloadForTable(table, { ...(data || {}) }, { isCreate: true, tenantId });
       const normalizedItems = table === 'sales_records'
         ? normalizeSalesRecordItems(payload.items ?? payload.items_json)
         : [];
@@ -476,7 +531,7 @@ const runSync = async (req, res) => {
     }
 
     if (action === 'UPDATE') {
-      const payload = normalizePayloadForTable(table, data || {}, { isCreate: false });
+      const payload = normalizePayloadForTable(table, data || {}, { isCreate: false, tenantId });
       const normalizedItems = table === 'sales_records'
         ? normalizeSalesRecordItems(payload.items ?? payload.items_json)
         : [];
