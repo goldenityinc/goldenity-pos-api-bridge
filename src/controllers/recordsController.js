@@ -376,10 +376,43 @@ const normalizeExpensePayloadObject = (payload = {}, { isCreate = false } = {}) 
     .toString()
     .trim();
 
+  const normalizedCategory = (
+    next.category ??
+    next.expense_category ??
+    next.expenseCategory ??
+    next.category_type ??
+    next.categoryType ??
+    ''
+  )
+    .toString()
+    .trim();
+
+  const normalizedDate = (
+    next.expense_date ??
+    next.expenseDate ??
+    next.date ??
+    next.transaction_date ??
+    next.transactionDate ??
+    ''
+  )
+    .toString()
+    .trim();
+
   if (normalizedTitle || isCreate) {
     next.title = normalizedTitle || 'Pengeluaran';
     next.expense_title = next.title;
     next.name = next.title;
+  }
+
+  if (normalizedCategory) {
+    next.category = normalizedCategory;
+    next.expense_category = normalizedCategory;
+    next.category_type = normalizedCategory;
+  }
+
+  if (normalizedDate) {
+    next.expense_date = normalizedDate;
+    next.date = normalizedDate;
   }
 
   if (normalizedDescription || Object.prototype.hasOwnProperty.call(next, 'description')) {
@@ -979,6 +1012,7 @@ const loadSalesRecordItemsMap = async (tenantDb, rows, tenantId) => {
       'note',
       'is_service',
       'product_type',
+      'mechanic_id',
     ].filter((column) => salesRecordItemsColumns.has(column));
 
     if (selectedColumns.length === 0 || !selectedColumns.includes('sales_record_id')) {
@@ -1016,6 +1050,7 @@ const loadSalesRecordItemsMap = async (tenantDb, rows, tenantId) => {
           : Number(row.custom_price),
         note: (row.note || '').toString(),
         is_service: row.is_service === undefined ? null : row.is_service,
+        mechanic_id: row.mechanic_id ?? null,
         product_type: row.product_type ?? null,
       });
     }
@@ -1106,11 +1141,16 @@ const listRecords = async (req, res) => {
           const status = row?.status ?? row?.order_status ?? null;
           const orderStatus = row?.order_status ?? row?.status ?? null;
 
+          const rawIsVoid = row?.is_void ?? row?.isVoid ?? null;
+          const isVoid = rawIsVoid !== null
+            ? Boolean(rawIsVoid)
+            : ['void', 'cancelled', 'cancel'].includes((status || '').toString().toLowerCase());
+
           return {
             ...row,
             status,
             order_status: orderStatus,
-            is_void: row?.is_void ?? row?.isVoid ?? null,
+            is_void: isVoid,
             items: normalizedItems,
             total_profit: shouldUseComputedProfit
               ? computedProfit

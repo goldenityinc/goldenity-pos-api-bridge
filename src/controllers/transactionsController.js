@@ -228,6 +228,19 @@ const normalizeTransactionItemsWithNotes = (items) => {
         product.is_custom_item === true ||
         product.isCustomItem === true;
 
+      const mechanicId = (
+        item.mechanic_id ??
+        item.mechanicId ??
+        item.employee_id ??
+        item.employeeId ??
+        item.user_id ??
+        item.userId ??
+        null
+      );
+      const normalizedMechanicId = mechanicId !== null && mechanicId !== undefined
+        ? mechanicId.toString().trim() || null
+        : null;
+
       if (!productId && !isService) {
         return null;
       }
@@ -239,6 +252,7 @@ const normalizeTransactionItemsWithNotes = (items) => {
         customPrice: Number.isFinite(customPrice) && customPrice > 0 ? customPrice : undefined,
         note,
         isService,
+        mechanicId: normalizedMechanicId,
       };
     })
     .filter(Boolean);
@@ -257,6 +271,13 @@ const ensureSalesRecordItemsTable = async (client) => {
   ]);
 };
 
+const ensureSalesRecordItemsMechanicIdColumn = async (client) => {
+  await client.query(
+    `ALTER TABLE sales_record_items
+       ADD COLUMN IF NOT EXISTS mechanic_id TEXT`,
+  );
+};
+
 const toStoredSalesRecordItems = (items) => {
   return normalizeTransactionItemsWithNotes(items).map((item) => ({
     product_id: item.productId || null,
@@ -265,6 +286,7 @@ const toStoredSalesRecordItems = (items) => {
     custom_price: Number.isFinite(item.customPrice) ? item.customPrice : null,
     note: item.note || null,
     is_service: item.isService === true,
+    mechanic_id: item.mechanicId || null,
   }));
 };
 
@@ -297,14 +319,23 @@ const loadSalesRecordItems = async (client, salesRecordId, tenantId = '') => {
   const normalizedTenantId = normalizeTenantId(tenantId);
   try {
     await ensureSalesRecordItemsTable(client);
+    const itemsColumnsResult = await client.query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = ANY(current_schemas(false))
+         AND table_name = 'sales_record_items'`,
+    );
+    const itemsColumnSet = new Set((itemsColumnsResult.rows || []).map((r) => r.column_name));
+    const hasMechanicId = itemsColumnSet.has('mechanic_id');
+    const selectClause = `product_id, product_name, qty, custom_price, note, is_service${hasMechanicId ? ', mechanic_id' : ''}`;
     const result = await client.query(
       normalizedTenantId
-        ? `SELECT product_id, product_name, qty, custom_price, note, is_service
+        ? `SELECT ${selectClause}
            FROM sales_record_items
            WHERE sales_record_id = $1
              AND tenant_id = $2
            ORDER BY id ASC`
-        : `SELECT product_id, product_name, qty, custom_price, note, is_service
+        : `SELECT ${selectClause}
            FROM sales_record_items
            WHERE sales_record_id = $1
            ORDER BY id ASC`,
@@ -318,6 +349,7 @@ const loadSalesRecordItems = async (client, salesRecordId, tenantId = '') => {
       custom_price: row.custom_price === null ? null : Number(row.custom_price),
       note: (row.note || '').toString(),
       is_service: row.is_service === true,
+      mechanic_id: row.mechanic_id ?? null,
     }));
   } catch (_) {
     return [];
@@ -343,30 +375,67 @@ const syncSalesRecordItems = async (client, salesRecordId, tenantId, items) => {
     return;
   }
 
+  const syncColumnsResult = await client.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = ANY(current_schemas(false))
+       AND table_name = 'sales_record_items'`,
+  );
+  const syncColumnSet = new Set((syncColumnsResult.rows || []).map((r) => r.column_name));
+  const syncHasMechanicId = syncColumnSet.has('mechanic_id');
+
   for (const item of items) {
-    await client.query(
-      `INSERT INTO sales_record_items (
-         tenant_id,
-         sales_record_id,
-         product_id,
-         product_name,
-         qty,
-         custom_price,
-         note,
-         is_service,
-         updated_at
-       ) VALUES ($1::text, $2::bigint, $3::text, $4::text, $5::integer, $6::numeric, $7::text, $8::boolean, NOW())`,
-      [
-        normalizedTenantId || '',
-        Number.isFinite(Number(salesRecordId)) ? Number(salesRecordId) : 0,
-        (item.product_id || '').toString().trim() || null,
-        (item.product_name || '').toString().trim() || null,
-        Number.isInteger(Number(item.qty)) ? Number(item.qty) : 1,
-        Number.isFinite(Number(item.custom_price)) ? Number(item.custom_price) : null,
-        (item.note || '').toString().trim() || null,
-        item.is_service === true,
-      ],
-    );
+    if (syncHasMechanicId) {
+      await client.query(
+        `INSERT INTO sales_record_items (
+           tenant_id,
+           sales_record_id,
+           product_id,
+           product_name,
+           qty,
+           custom_price,
+           note,
+           is_service,
+           mechanic_id,
+           updated_at
+         ) VALUES ($1::text, $2::bigint, $3::text, $4::text, $5::integer, $6::numeric, $7::text, $8::boolean, $9::text, NOW())`,
+        [
+          normalizedTenantId || '',
+          Number.isFinite(Number(salesRecordId)) ? Number(salesRecordId) : 0,
+          (item.product_id || '').toString().trim() || null,
+          (item.product_name || '').toString().trim() || null,
+          Number.isInteger(Number(item.qty)) ? Number(item.qty) : 1,
+          Number.isFinite(Number(item.custom_price)) ? Number(item.custom_price) : null,
+          (item.note || '').toString().trim() || null,
+          item.is_service === true,
+          (item.mechanic_id || '').toString().trim() || null,
+        ],
+      );
+    } else {
+      await client.query(
+        `INSERT INTO sales_record_items (
+           tenant_id,
+           sales_record_id,
+           product_id,
+           product_name,
+           qty,
+           custom_price,
+           note,
+           is_service,
+           updated_at
+         ) VALUES ($1::text, $2::bigint, $3::text, $4::text, $5::integer, $6::numeric, $7::text, $8::boolean, NOW())`,
+        [
+          normalizedTenantId || '',
+          Number.isFinite(Number(salesRecordId)) ? Number(salesRecordId) : 0,
+          (item.product_id || '').toString().trim() || null,
+          (item.product_name || '').toString().trim() || null,
+          Number.isInteger(Number(item.qty)) ? Number(item.qty) : 1,
+          Number.isFinite(Number(item.custom_price)) ? Number(item.custom_price) : null,
+          (item.note || '').toString().trim() || null,
+          item.is_service === true,
+        ],
+      );
+    }
   }
 };
 
@@ -624,6 +693,7 @@ const createTransaction = async (req, res) => {
     await ensureSalesRecordsFinancialColumns(client);
     await ensureSalesRecordsItemsColumn(client);
     await ensureSalesRecordItemsTable(client);
+    await ensureSalesRecordItemsMechanicIdColumn(client);
     await ensureTenantScopedTable(client, 'sales_records', tenantId);
     await ensureTenantScopedTable(client, 'products', tenantId);
     const salesRecordColumnDefinitions = await getTableColumnDefinitions(client, 'sales_records');
