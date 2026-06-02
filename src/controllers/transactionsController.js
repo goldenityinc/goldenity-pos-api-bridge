@@ -1357,9 +1357,24 @@ const cancelTransaction = async (req, res) => {
 
     const transaction = transactionResult.rows[0];
 
-    // Check if already cancelled
-    const status = normalizePaymentType(transaction.status || transaction.payment_status || '');
-    if (status === 'VOID' || status === 'CANCELLED' || status === 'CANCEL') {
+    // Check if already cancelled/void using all known status fields.
+    const statusCandidates = [
+      transaction.status,
+      transaction.order_status,
+      transaction.transaction_status,
+      transaction.payment_status,
+    ]
+      .map((value) => normalizePaymentType(value))
+      .filter(Boolean);
+    const rawIsVoid = transaction.is_void ?? transaction.isVoid;
+    const isAlreadyVoid =
+      rawIsVoid === true ||
+      rawIsVoid === 1 ||
+      ['TRUE', '1', 'YES', 'Y'].includes(normalizePaymentType(rawIsVoid)) ||
+      statusCandidates.some((value) =>
+        ['VOID', 'CANCELLED', 'CANCELED', 'CANCEL', 'BATAL', 'DIBATALKAN'].includes(value),
+      );
+    if (isAlreadyVoid) {
       await client.query('ROLLBACK');
       return jsonError(res, 400, 'Transaksi sudah dalam status dibatalkan');
     }
@@ -1375,9 +1390,27 @@ const cancelTransaction = async (req, res) => {
       paramCount++;
     }
 
+    if (columns.has('order_status')) {
+      updateFields.push(`order_status = $${paramCount}::text`);
+      updateValues.push('VOID');
+      paramCount++;
+    }
+
+    if (columns.has('transaction_status')) {
+      updateFields.push(`transaction_status = $${paramCount}::text`);
+      updateValues.push('VOID');
+      paramCount++;
+    }
+
     if (columns.has('payment_status')) {
       updateFields.push(`payment_status = $${paramCount}::text`);
       updateValues.push('VOID');
+      paramCount++;
+    }
+
+    if (columns.has('is_void')) {
+      updateFields.push(`is_void = $${paramCount}::boolean`);
+      updateValues.push(true);
       paramCount++;
     }
 
@@ -1388,6 +1421,9 @@ const cancelTransaction = async (req, res) => {
     if (columns.has('cancelled_at') || columns.has('void_at')) {
       const columnName = columns.has('cancelled_at') ? 'cancelled_at' : 'void_at';
       updateFields.push(`${columnName} = NOW()`);
+    }
+    if (columns.has('voided_at')) {
+      updateFields.push('voided_at = NOW()');
     }
 
     if (columns.has('tenant_id')) {

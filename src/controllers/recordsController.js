@@ -153,6 +153,43 @@ const parseMoneyValue = (value) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
+const parseBooleanLike = (value) => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'number') {
+    return value === 1;
+  }
+
+  const text = (value ?? '').toString().trim().toLowerCase();
+  if (!text) {
+    return null;
+  }
+
+  if (['true', '1', 'yes', 'y'].includes(text)) {
+    return true;
+  }
+
+  if (['false', '0', 'no', 'n'].includes(text)) {
+    return false;
+  }
+
+  return null;
+};
+
+const isVoidLikeStatus = (value) => {
+  const normalized = (value ?? '').toString().trim().toLowerCase();
+  return [
+    'void',
+    'cancel',
+    'cancelled',
+    'canceled',
+    'batal',
+    'dibatalkan',
+  ].includes(normalized);
+};
+
 const extractSellingPrice = (payload = {}) => parseMoneyValue(
   payload.price ?? payload.selling_price ?? payload.harga_jual,
 );
@@ -1191,16 +1228,31 @@ const listRecords = async (req, res) => {
 
           const status = row?.status ?? row?.order_status ?? null;
           const orderStatus = row?.order_status ?? row?.status ?? null;
+          const transactionStatus =
+            row?.transaction_status ?? row?.transactionStatus ?? status ?? orderStatus ?? null;
 
           const rawIsVoid = row?.is_void ?? row?.isVoid ?? null;
-          const isVoid = rawIsVoid !== null
-            ? Boolean(rawIsVoid)
-            : ['void', 'cancelled', 'cancel'].includes((status || '').toString().toLowerCase());
+          const parsedVoidFlag = parseBooleanLike(rawIsVoid);
+          const isVoid =
+            parsedVoidFlag !== null
+              ? parsedVoidFlag
+              : isVoidLikeStatus(status) ||
+                isVoidLikeStatus(orderStatus) ||
+                isVoidLikeStatus(transactionStatus);
+
+          const canonicalStatus = isVoid
+            ? 'VOID'
+            : ((status ?? orderStatus ?? transactionStatus ?? 'COMPLETED').toString().trim() || 'COMPLETED');
 
           return {
             ...row,
-            status,
-            order_status: orderStatus,
+            status: canonicalStatus,
+            order_status: isVoid
+              ? 'VOID'
+              : ((orderStatus ?? status ?? canonicalStatus).toString().trim() || canonicalStatus),
+            transaction_status: isVoid
+              ? 'VOID'
+              : ((transactionStatus ?? orderStatus ?? status ?? canonicalStatus).toString().trim() || canonicalStatus),
             is_void: isVoid,
             items: normalizedItems,
             total_profit: shouldUseComputedProfit
