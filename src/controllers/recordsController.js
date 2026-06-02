@@ -1248,7 +1248,7 @@ const listRecords = async (req, res) => {
             ...row,
             status: canonicalStatus,
             order_status: isVoid
-              ? 'VOID'
+              ? 'CANCELLED'
               : ((orderStatus ?? status ?? canonicalStatus).toString().trim() || canonicalStatus),
             transaction_status: isVoid
               ? 'VOID'

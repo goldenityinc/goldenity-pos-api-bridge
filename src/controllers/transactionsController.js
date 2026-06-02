@@ -1391,8 +1391,9 @@ const cancelTransaction = async (req, res) => {
     }
 
     if (columns.has('order_status')) {
-      updateFields.push(`order_status = $${paramCount}::text`);
-      updateValues.push('VOID');
+      // order_status is commonly an enum (OrderStatus), so use enum-compatible value.
+      updateFields.push(`order_status = $${paramCount}`);
+      updateValues.push('CANCELLED');
       paramCount++;
     }
 
