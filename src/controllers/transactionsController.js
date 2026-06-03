@@ -1,4 +1,6 @@
 const { jsonOk, jsonError } = require('../utils/http');
+const http = require('http');
+const https = require('https');
 const {
   buildInsertQuery,
   getTableColumnDefinitions,
@@ -1310,10 +1312,7 @@ const settleKasBon = async (req, res) => {
 };
 
 const cancelTransaction = async (req, res) => {
-  const client = await req.tenantDb.connect();
-
   try {
-    const tenantId = resolveTenantIdFromRequest(req);
     const transactionId = req.params.id;
 
     if (!transactionId) {
@@ -1324,184 +1323,107 @@ const cancelTransaction = async (req, res) => {
     if (!Number.isFinite(numericId) || numericId <= 0) {
       return jsonError(res, 400, 'Transaction ID harus berupa angka positif');
     }
+    const tenantId = resolveTenantIdFromRequest(req);
+    const rawBaseUrl = (
+      process.env.ADMIN_CORE_API_BASE_URL ||
+      process.env.ADMIN_CORE_API_URL ||
+      ''
+    )
+      .toString()
+      .trim();
 
-    await client.query('BEGIN');
-    await ensureTenantScopedTable(client, 'sales_records', tenantId);
-
-    const columnsResult = await client.query(
-      `SELECT column_name
-       FROM information_schema.columns
-       WHERE table_schema = ANY(current_schemas(false))
-         AND table_name = 'sales_records'`,
-    );
-    const columns = new Set(columnsResult.rows.map((row) => row.column_name));
-
-    const queryParams = [numericId];
-    const whereClause = columns.has('tenant_id') ? 'AND tenant_id = $2' : '';
-    if (columns.has('tenant_id')) {
-      queryParams.push(tenantId);
-    }
-
-    // Lock and fetch the transaction
-    const transactionResult = await client.query(
-      `SELECT * FROM sales_records 
-       WHERE id = $1 ${whereClause}
-       FOR UPDATE`,
-      queryParams,
-    );
-
-    if ((transactionResult.rowCount || 0) === 0) {
-      await client.query('ROLLBACK');
-      return jsonError(res, 404, 'Transaksi tidak ditemukan');
-    }
-
-    const transaction = transactionResult.rows[0];
-
-    // Check if already cancelled/void using all known status fields.
-    const statusCandidates = [
-      transaction.status,
-      transaction.order_status,
-      transaction.transaction_status,
-      transaction.payment_status,
-    ]
-      .map((value) => normalizePaymentType(value))
-      .filter(Boolean);
-    const rawIsVoid = transaction.is_void ?? transaction.isVoid;
-    const isAlreadyVoid =
-      rawIsVoid === true ||
-      rawIsVoid === 1 ||
-      ['TRUE', '1', 'YES', 'Y'].includes(normalizePaymentType(rawIsVoid)) ||
-      statusCandidates.some((value) =>
-        ['VOID', 'CANCELLED', 'CANCELED', 'CANCEL', 'BATAL', 'DIBATALKAN'].includes(value),
+    if (!rawBaseUrl) {
+      return jsonError(
+        res,
+        500,
+        'ADMIN_CORE_API_BASE_URL belum dikonfigurasi',
       );
-    if (isAlreadyVoid) {
-      await client.query('ROLLBACK');
-      return jsonError(res, 400, 'Transaksi sudah dalam status dibatalkan');
     }
 
-    // Prepare update payload
-    const updateFields = [];
-    const updateValues = [numericId];
-    let paramCount = 2;
+    const baseUrl = new URL(rawBaseUrl);
+    const basePath = baseUrl.pathname.replace(/\/+$/, '');
+    const cancelPath = basePath.endsWith('/api')
+      ? `${basePath}/v1/transactions/${encodeURIComponent(transactionId)}/cancel`
+      : `${basePath}/api/v1/transactions/${encodeURIComponent(transactionId)}/cancel`;
 
-    if (columns.has('status')) {
-      updateFields.push(`status = $${paramCount}::text`);
-      updateValues.push('VOID');
-      paramCount++;
-    }
+    baseUrl.pathname = cancelPath;
+    baseUrl.search = '';
+    baseUrl.hash = '';
 
-    if (columns.has('order_status')) {
-      // order_status is commonly an enum (OrderStatus), so use enum-compatible value.
-      updateFields.push(`order_status = $${paramCount}`);
-      updateValues.push('CANCELLED');
-      paramCount++;
-    }
+    const payload = {
+      ...(req.body && typeof req.body === 'object' ? req.body : {}),
+      ...(tenantId ? { tenant_id: tenantId } : {}),
+    };
 
-    if (columns.has('transaction_status')) {
-      updateFields.push(`transaction_status = $${paramCount}::text`);
-      updateValues.push('VOID');
-      paramCount++;
-    }
+    const timeoutMs = Number(process.env.ADMIN_CORE_API_TIMEOUT_MS || 7000);
+    const transport = baseUrl.protocol === 'https:' ? https : http;
 
-    if (columns.has('payment_status')) {
-      updateFields.push(`payment_status = $${paramCount}::text`);
-      updateValues.push('VOID');
-      paramCount++;
-    }
+    const response = await new Promise((resolve, reject) => {
+      const body = JSON.stringify(payload);
+      const request = transport.request(
+        baseUrl,
+        {
+          method: 'PATCH',
+          headers: {
+            'content-type': 'application/json',
+            'content-length': Buffer.byteLength(body),
+            ...(req.headers.authorization
+              ? { authorization: req.headers.authorization }
+              : {}),
+            ...(tenantId ? { 'x-tenant-id': tenantId } : {}),
+            ...(req.headers['x-branch-id']
+              ? { 'x-branch-id': req.headers['x-branch-id'] }
+              : {}),
+          },
+          timeout: Number.isFinite(timeoutMs) ? timeoutMs : 7000,
+        },
+        (coreRes) => {
+          let raw = '';
+          coreRes.setEncoding('utf8');
+          coreRes.on('data', (chunk) => {
+            raw += chunk;
+          });
+          coreRes.on('end', () => {
+            let parsed;
+            try {
+              parsed = raw ? JSON.parse(raw) : {};
+            } catch (_) {
+              parsed = { message: raw };
+            }
 
-    if (columns.has('is_void')) {
-      updateFields.push(`is_void = $${paramCount}::boolean`);
-      updateValues.push(true);
-      paramCount++;
-    }
-
-    if (columns.has('updated_at')) {
-      updateFields.push(`updated_at = NOW()`);
-    }
-
-    if (columns.has('cancelled_at') || columns.has('void_at')) {
-      const columnName = columns.has('cancelled_at') ? 'cancelled_at' : 'void_at';
-      updateFields.push(`${columnName} = NOW()`);
-    }
-    if (columns.has('voided_at')) {
-      updateFields.push('voided_at = NOW()');
-    }
-
-    if (columns.has('tenant_id')) {
-      updateFields.push(`tenant_id = $${paramCount}::text`);
-      updateValues.push(tenantId);
-      paramCount++;
-    }
-
-    const updateSql = `UPDATE sales_records 
-                      SET ${updateFields.join(', ')} 
-                      WHERE id = $1 
-                      ${columns.has('tenant_id') ? 'AND tenant_id = $' + paramCount + '::text' : ''}
-                      RETURNING *`;
-
-    if (columns.has('tenant_id')) {
-      updateValues.push(tenantId);
-    }
-
-    const updateResult = await client.query(updateSql, updateValues);
-
-    // Update inventory if items are restored on cancel
-    const items = await loadSalesRecordItems(client, numericId, tenantId);
-    for (const item of items) {
-      if (item.is_service) {
-        continue;
-      }
-
-      const productId = item.product_id || null;
-      if (!productId) {
-        continue;
-      }
-
-      const currentResult = await client.query(
-        columns.has('tenant_id')
-          ? 'SELECT id, stock FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
-          : 'SELECT id, stock FROM "products" WHERE id = $1 LIMIT 1 FOR UPDATE',
-        columns.has('tenant_id') ? [productId, tenantId] : [productId],
+            resolve({
+              statusCode: coreRes.statusCode || 500,
+              body: parsed,
+            });
+          });
+        },
       );
 
-      if ((currentResult.rowCount || 0) > 0) {
-        const currentProduct = currentResult.rows[0];
-        const currentStock = Number(currentProduct.stock ?? 0);
-        const nextStock = currentStock + item.qty;
-
-        await client.query(
-          columns.has('tenant_id')
-            ? 'UPDATE "products" SET stock = $1 WHERE id = $2 AND tenant_id = $3'
-            : 'UPDATE "products" SET stock = $1 WHERE id = $2',
-          columns.has('tenant_id') ? [nextStock, productId, tenantId] : [nextStock, productId],
-        );
-      }
-    }
-
-    await client.query('COMMIT');
-
-    const cancelledTransaction = updateResult.rows[0] || null;
-    if (cancelledTransaction) {
-      const hydratedItems = await loadSalesRecordItems(
-        req.tenantDb,
-        cancelledTransaction.id,
-        tenantId,
-      );
-      cancelledTransaction.items = hydratedItems.length > 0
-        ? hydratedItems
-        : parseItemsFromJsonField(cancelledTransaction.items_json);
-    }
-
-    emitTransactionUpdated(req, cancelledTransaction, {
-      transactionId,
-      action: 'CANCEL',
-      mutationType: 'TRANSACTION_CANCELLED',
+      request.on('timeout', () => {
+        request.destroy(new Error('Admin core cancel request timeout'));
+      });
+      request.on('error', reject);
+      request.write(body);
+      request.end();
     });
 
-    return jsonOk(res, cancelledTransaction, 'Transaksi berhasil dibatalkan');
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
+    const statusCode = response.statusCode || 500;
+    const responseBody =
+      response.body && typeof response.body === 'object'
+        ? response.body
+        : { message: 'Invalid response from admin core' };
 
+    if (statusCode >= 200 && statusCode < 300) {
+      const cancelledTransaction = responseBody.data || responseBody;
+      emitTransactionUpdated(req, cancelledTransaction, {
+        transactionId,
+        action: 'CANCEL',
+        mutationType: 'TRANSACTION_CANCELLED',
+      });
+    }
+
+    return res.status(statusCode).json(responseBody);
+  } catch (error) {
     console.error(
       `❌ Cancel Transaction Error [Tenant=${resolveTenantIdFromRequest(req)}, ID=${req.params.id}]: ${error.message}`,
       {
@@ -1510,9 +1432,12 @@ const cancelTransaction = async (req, res) => {
       },
     );
 
-    return jsonError(res, 500, error.message || 'Internal server error', error.message);
-  } finally {
-    client.release();
+    return jsonError(
+      res,
+      502,
+      error.message || 'Gagal meneruskan pembatalan ke admin core',
+      error.message,
+    );
   }
 };
 

@@ -16,6 +16,7 @@ const { createCrudTableRoutes } = require('./crudTableRoutes');
 const {
 	listActiveKasBon,
 	settleKasBon,
+	cancelTransaction,
 } = require('../controllers/transactionsController');
 const { resetOperationalData } = require('../controllers/debugController');
 
@@ -30,6 +31,7 @@ router.use('/order_history/items', orderHistoryItemsRoutes);
 router.use('/order-history/items', orderHistoryItemsRoutes);
 router.use('/shopping-list', orderHistoryItemsRoutes);
 router.use('/records', recordsRoutes);
+router.patch('/records/sales_records/:id/cancel', cancelTransaction);
 router.use('/storage', storageRoutes);
 router.use('/petty-cash', pettyCashRoutes);
 router.use('/api/service-orders', serviceOrderRoutes);
