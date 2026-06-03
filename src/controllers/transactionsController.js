@@ -19,6 +19,36 @@ const {
 
 const normalizePaymentType = (value) => (value || '').toString().trim().toUpperCase();
 
+const VOID_TERMINAL_STATUS_SET = new Set([
+  'VOID',
+  'CANCELLED',
+  'CANCELED',
+  'BATAL',
+  'DIBATALKAN',
+]);
+
+const normalizeStatusValue = (value) => (value || '').toString().trim().toUpperCase();
+
+const isVoidedSalesRecord = (record) => {
+  if (!record || typeof record !== 'object') {
+    return false;
+  }
+
+  const statusCandidates = [
+    record.status,
+    record.order_status,
+    record.orderStatus,
+    record.transaction_status,
+    record.transactionStatus,
+  ];
+
+  if (statusCandidates.some((value) => VOID_TERMINAL_STATUS_SET.has(normalizeStatusValue(value)))) {
+    return true;
+  }
+
+  return record.is_void === true || record.isVoid === true;
+};
+
 const toNumber = (value) => {
   const numberValue = Number(value);
   return Number.isFinite(numberValue) ? numberValue : NaN;
@@ -54,6 +84,94 @@ const resolveTenantIdFromRequest = (req) => normalizeTenantId(
   req?.auth?.tenantId ||
   req?.auth?.tenant_id,
 );
+
+const mirrorCancelledTransactionToBridgeSalesRecord = async ({
+  tenantDb,
+  tenantId,
+  transactionId,
+  cancelledTransaction,
+  fallbackVoidReason,
+}) => {
+  if (!tenantDb) {
+    return;
+  }
+
+  const numericTransactionId = Number.parseInt((transactionId || '').toString(), 10);
+  const receiptNumber = (
+    cancelledTransaction?.receipt_number ?? cancelledTransaction?.receiptNumber ?? ''
+  ).toString().trim();
+  const referenceId = (
+    cancelledTransaction?.reference_id ?? cancelledTransaction?.referenceId ?? ''
+  ).toString().trim();
+  const voidReasonRaw =
+    cancelledTransaction?.void_reason ??
+    cancelledTransaction?.voidReason ??
+    fallbackVoidReason ??
+    null;
+  const voidReason = voidReasonRaw == null
+    ? null
+    : voidReasonRaw.toString().trim() || null;
+  const nowIso = new Date().toISOString();
+
+  await ensureTenantScopedTable(tenantDb, 'sales_records', tenantId);
+  const columnSet = await getTableColumnSet(tenantDb, 'sales_records');
+
+  const updateEntries = [];
+  const addUpdate = (columnName, value) => {
+    if (!columnSet.has(columnName)) {
+      return;
+    }
+    updateEntries.push({ columnName, value });
+  };
+
+  addUpdate('status', 'CANCELLED');
+  addUpdate('order_status', 'CANCELLED');
+  addUpdate('transaction_status', 'VOID');
+  addUpdate('is_void', true);
+  addUpdate('isVoid', true);
+  addUpdate('void_reason', voidReason);
+  addUpdate('voided_at', nowIso);
+  addUpdate('updated_at', nowIso);
+
+  if (updateEntries.length === 0) {
+    return;
+  }
+
+  const updateValues = [];
+  const setClauses = updateEntries.map(({ columnName, value }, index) => {
+    updateValues.push(value);
+    return `${columnName} = $${index + 1}`;
+  });
+
+  const whereClauses = [];
+  if (Number.isFinite(numericTransactionId) && numericTransactionId > 0) {
+    updateValues.push(numericTransactionId);
+    whereClauses.push(`id = $${updateValues.length}`);
+  }
+  if (receiptNumber && columnSet.has('receipt_number')) {
+    updateValues.push(receiptNumber);
+    whereClauses.push(`receipt_number = $${updateValues.length}`);
+  }
+  if (referenceId && columnSet.has('reference_id')) {
+    updateValues.push(referenceId);
+    whereClauses.push(`reference_id = $${updateValues.length}`);
+  }
+
+  if (whereClauses.length === 0) {
+    return;
+  }
+
+  const hasTenantColumn = columnSet.has('tenant_id');
+  const normalizedTenantId = (tenantId || '').toString().trim();
+  const whereSql = whereClauses.join(' OR ');
+  let sql = `UPDATE sales_records SET ${setClauses.join(', ')} WHERE (${whereSql})`;
+  if (hasTenantColumn && normalizedTenantId) {
+    updateValues.push(normalizedTenantId);
+    sql += ` AND tenant_id = $${updateValues.length}`;
+  }
+
+  await tenantDb.query(sql, updateValues);
+};
 
 const assertColumnsExist = async (client, table, columns = []) => {
   const result = await client.query(
@@ -729,6 +847,34 @@ const createTransaction = async (req, res) => {
       const existingSalesRecordId = existingRecord?.id;
       if (!existingSalesRecordId) {
         throw new Error('ID transaksi target tidak valid');
+      }
+
+      if (isVoidedSalesRecord(existingRecord)) {
+        await client.query('COMMIT');
+
+        const preservedTransaction = existingRecord;
+        if (preservedTransaction) {
+          const hydratedItems = await loadSalesRecordItems(
+            req.tenantDb,
+            preservedTransaction.id,
+            tenantId,
+          );
+          preservedTransaction.items = hydratedItems.length > 0
+            ? hydratedItems
+            : parseItemsFromJsonField(preservedTransaction.items_json);
+        }
+
+        emitTransactionUpdated(req, preservedTransaction, {
+          transactionId: existingSalesRecordId,
+          action: 'UPDATE',
+          mutationType: 'CHECKOUT_UPDATE_SKIPPED_ALREADY_CANCELLED',
+        });
+
+        return jsonOk(
+          res,
+          preservedTransaction,
+          'Transaction already cancelled; terminal status preserved',
+        );
       }
 
       const tenantScopedPayload = enforceTenantIdOnPayload(
@@ -1413,13 +1559,51 @@ const cancelTransaction = async (req, res) => {
         ? response.body
         : { message: 'Invalid response from admin core' };
 
-    if (statusCode >= 200 && statusCode < 300) {
-      const cancelledTransaction = responseBody.data || responseBody;
+    const normalizedResponseText = JSON.stringify(responseBody || {});
+    const alreadyVoidedOnCore = statusCode === 409
+      && /TRANSACTION_ALREADY_VOIDED/i.test(normalizedResponseText);
+    const treatAsSuccess = (statusCode >= 200 && statusCode < 300) || alreadyVoidedOnCore;
+
+    if (treatAsSuccess) {
+      let cancelledTransaction = responseBody.data || responseBody;
+
+      if (alreadyVoidedOnCore && (!cancelledTransaction || typeof cancelledTransaction !== 'object')) {
+        cancelledTransaction = {
+          id: numericId,
+          status: 'CANCELLED',
+          order_status: 'CANCELLED',
+          transaction_status: 'VOID',
+          is_void: true,
+          isVoid: true,
+        };
+      }
+
+      try {
+        await mirrorCancelledTransactionToBridgeSalesRecord({
+          tenantDb: req.tenantDb,
+          tenantId,
+          transactionId,
+          cancelledTransaction,
+          fallbackVoidReason: payload.void_reason ?? payload.voidReason,
+        });
+      } catch (mirrorError) {
+        console.error(
+          `⚠️ Cancel mirror warning [Tenant=${tenantId}, ID=${transactionId}]: ${mirrorError.message}`,
+        );
+      }
       emitTransactionUpdated(req, cancelledTransaction, {
         transactionId,
         action: 'CANCEL',
         mutationType: 'TRANSACTION_CANCELLED',
       });
+
+      if (alreadyVoidedOnCore) {
+        return res.status(200).json({
+          success: true,
+          message: 'Transaksi sudah dibatalkan sebelumnya. Status tetap CANCELLED.',
+          data: cancelledTransaction,
+        });
+      }
     }
 
     return res.status(statusCode).json(responseBody);
