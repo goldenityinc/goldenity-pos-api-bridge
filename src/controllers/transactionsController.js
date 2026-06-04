@@ -1473,7 +1473,10 @@ const cancelTransaction = async (req, res) => {
     const rawBaseUrl = (
       process.env.ADMIN_CORE_API_BASE_URL ||
       process.env.ADMIN_CORE_API_URL ||
-      ''
+      process.env.CORE_API_BASE_URL ||
+      process.env.CORE_API_URL ||
+      // Safety fallback for local/debug environments where only bridge is started.
+      'https://goldenity-admin-core-backend-production.up.railway.app'
     )
       .toString()
       .trim();
@@ -1482,7 +1485,7 @@ const cancelTransaction = async (req, res) => {
       return jsonError(
         res,
         500,
-        'ADMIN_CORE_API_BASE_URL belum dikonfigurasi',
+        'ADMIN_CORE_API_BASE_URL / CORE_API_BASE_URL belum dikonfigurasi',
       );
     }
 
