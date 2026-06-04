@@ -99,13 +99,14 @@ const getProducts = async (req, res) => {
     let whereClause = '';
     const productsColumns = await getTableColumnSet(req.tenantDb, 'products');
     const hasTenantColumn = productsColumns.has('tenant_id');
-    if (hasTenantColumn) {
-      values.push(tenantId);
-      whereClause = ` WHERE tenant_id = $${values.length}`;
+    if (!hasTenantColumn) {
+      return jsonError(res, 500, 'Security guard: tabel products wajib memiliki kolom tenant_id');
     }
+    values.push(tenantId);
+    whereClause = ` WHERE tenant_id = $${values.length}`;
     if (lastSyncDate && syncExpressions.filterExpression) {
       values.push(lastSyncDate);
-      whereClause += hasTenantColumn ? ` AND ${syncExpressions.filterExpression} > $${values.length}` : ` WHERE ${syncExpressions.filterExpression} > $${values.length}`;
+      whereClause += ` AND ${syncExpressions.filterExpression} > $${values.length}`;
     }
 
     const countResult = await req.tenantDb.query(
@@ -169,11 +170,12 @@ const reduceStock = async (req, res) => {
 
     const productsColumns = await getTableColumnSet(req.tenantDb, 'products');
     const hasTenantColumn = productsColumns.has('tenant_id');
+    if (!hasTenantColumn) {
+      return jsonError(res, 500, 'Security guard: tabel products wajib memiliki kolom tenant_id');
+    }
     const currentResult = await req.tenantDb.query(
-      hasTenantColumn
-        ? 'SELECT id, stock FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1'
-        : 'SELECT id, stock FROM "products" WHERE id = $1 LIMIT 1',
-      hasTenantColumn ? [productId, tenantId] : [productId],
+      'SELECT id, stock FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1',
+      [productId, tenantId],
     );
 
     if ((currentResult.rowCount || 0) === 0) {
@@ -195,10 +197,8 @@ const reduceStock = async (req, res) => {
 
     const newStock = currentStock - qty;
     const updateResult = await req.tenantDb.query(
-      hasTenantColumn
-        ? 'UPDATE "products" SET stock = $1 WHERE id = $2 AND tenant_id = $3 RETURNING *'
-        : 'UPDATE "products" SET stock = $1 WHERE id = $2 RETURNING *',
-      hasTenantColumn ? [newStock, productId, tenantId] : [newStock, productId],
+      'UPDATE "products" SET stock = $1 WHERE id = $2 AND tenant_id = $3 RETURNING *',
+      [newStock, productId, tenantId],
     );
 
     const updatedProduct = updateResult.rows[0] || null;
