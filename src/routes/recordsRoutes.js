@@ -8,6 +8,7 @@ const {
   deleteRecordById,
   uploadExpenseAttachment,
 } = require('../controllers/recordsController');
+const { cancelTransaction } = require('../controllers/transactionsController');
 
 const router = express.Router();
 const upload = multer({
@@ -26,6 +27,8 @@ const maybeExpenseAttachmentUpload = (req, res, next) => {
 };
 
 router.post('/expenses/attachment', upload.single('attachment'), uploadExpenseAttachment);
+router.patch('/sales_records/:id/cancel', cancelTransaction);
+router.post('/sales_records/:id/cancel', cancelTransaction);
 router.get('/:table', listRecords);
 router.post('/:table', maybeExpenseAttachmentUpload, createRecords);
 router.post('/:table/upsert', upsertRecords);

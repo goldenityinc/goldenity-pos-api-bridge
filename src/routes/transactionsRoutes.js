@@ -13,5 +13,6 @@ router.post('/', createTransaction);
 router.post('/kas-bon/:id/settle', settleKasBon);
 router.post('/kas-bon/:id/pay', settleKasBon);
 router.patch('/:id/cancel', cancelTransaction);
+router.post('/:id/cancel', cancelTransaction);
 
 module.exports = router;
