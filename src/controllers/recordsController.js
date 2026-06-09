@@ -1007,6 +1007,57 @@ const loadProductPurchasePriceMap = async (tenantDb, productIds, tenantId) => {
   }
 };
 
+const normalizeTableIdText = (value) => {
+  const raw = (value ?? '').toString().trim();
+  return /^\d+$/.test(raw) ? raw : '';
+};
+
+const loadTableNumberMap = async (tenantDb, rows, tenantId) => {
+  const tableIds = Array.from(new Set(
+    (Array.isArray(rows) ? rows : [])
+      .map((row) => normalizeTableIdText(row?.table_id ?? row?.tableId))
+      .filter((value) => value),
+  ));
+
+  if (tableIds.length === 0) {
+    return new Map();
+  }
+
+  try {
+    const normalizedTenantId = normalizeTenantId(tenantId);
+    const tableColumns = await getTableColumnSet(tenantDb, 'tables');
+    if (!tableColumns.has('id') || !tableColumns.has('table_number')) {
+      return new Map();
+    }
+
+    const hasTenantColumn = tableColumns.has('tenant_id');
+    const result = await tenantDb.query(
+      hasTenantColumn
+        ? `SELECT id::text AS id, table_number
+           FROM tables
+           WHERE tenant_id = $1
+             AND id::text = ANY($2::text[])`
+        : `SELECT id::text AS id, table_number
+           FROM tables
+           WHERE id::text = ANY($1::text[])`,
+      hasTenantColumn ? [normalizedTenantId, tableIds] : [tableIds],
+    );
+
+    const tableNumberMap = new Map();
+    for (const row of result.rows || []) {
+      const id = normalizeTableIdText(row?.id);
+      if (!id) {
+        continue;
+      }
+      tableNumberMap.set(id, (row?.table_number ?? '').toString().trim());
+    }
+
+    return tableNumberMap;
+  } catch (_) {
+    return new Map();
+  }
+};
+
 const extractItemQty = (item = {}) => {
   const qty = toFiniteNumber(item.qty ?? item.quantity ?? 0);
   if (qty === null || qty <= 0) {
@@ -1246,6 +1297,11 @@ const listRecords = async (req, res) => {
         Array.isArray(normalizedRows) ? normalizedRows : [],
         tenantId,
       );
+      const tableNumberMap = await loadTableNumberMap(
+        req.tenantDb,
+        Array.isArray(normalizedRows) ? normalizedRows : [],
+        tenantId,
+      );
 
       const allItems = [];
       if (Array.isArray(normalizedRows)) {
@@ -1304,8 +1360,16 @@ const listRecords = async (req, res) => {
             ? 'VOID'
             : ((status ?? orderStatus ?? transactionStatus ?? 'COMPLETED').toString().trim() || 'COMPLETED');
 
+          const resolvedTableId = normalizeTableIdText(row?.table_id ?? row?.tableId);
+          const rawTableNumber = (row?.table_number ?? row?.tableNumber ?? '').toString().trim();
+          const resolvedTableNumber = rawTableNumber || tableNumberMap.get(resolvedTableId) || '';
+          const rawOrderType = (row?.order_type ?? row?.orderType ?? '').toString().trim();
+
           return {
             ...row,
+            table_id: resolvedTableId || (row?.table_id ?? row?.tableId ?? null),
+            table_number: resolvedTableNumber || null,
+            order_type: rawOrderType || null,
             status: canonicalStatus,
             order_status: isVoid
               ? 'CANCELLED'
