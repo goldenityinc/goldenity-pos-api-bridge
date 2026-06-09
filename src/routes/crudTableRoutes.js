@@ -7,6 +7,7 @@ const createCrudTableRoutes = (table) => {
 
   router.get('/', controller.list);
   router.post('/', controller.create);
+  router.patch('/:id', controller.updateById);
   router.put('/:id', controller.updateById);
   router.delete('/:id', controller.deleteById);
 

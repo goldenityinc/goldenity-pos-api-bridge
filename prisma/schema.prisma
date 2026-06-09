@@ -42,6 +42,29 @@ enum SyncMode {
   LOCAL_SERVER
 }
 
+enum OrderType {
+  WALK_IN
+  PRE_ORDER
+  DINE_IN
+  TAKEAWAY
+  DELIVERY
+}
+
+enum OrderStatus {
+  PENDING
+  PENDING_PAYMENT
+  PREPARING
+  READY_FOR_PICKUP
+  COMPLETED
+  CANCELLED
+}
+
+enum TableStatus {
+  AVAILABLE
+  OCCUPIED
+  RESERVED
+}
+
 model Tenant {
   id                  String            @id
   name                String
@@ -60,6 +83,7 @@ model Tenant {
   showInventoryImages Boolean           @default(true) @map("show_inventory_images")
 
   products            Product[]
+  tables              tables[]
   categories          Category[]
   transactions        Transaction[]
   salesRecords        SalesRecord[]
@@ -80,6 +104,23 @@ model Tenant {
   usersByTenantColumn User[]            @relation("UsersTenantSnake")
 
   @@map("tenants")
+}
+
+model tables {
+  id           BigInt      @id @default(autoincrement())
+  tenantId     String      @map("tenant_id")
+  tableNumber  String      @map("table_number")
+  capacity     Int
+  status       TableStatus @default(AVAILABLE)
+  createdAt    DateTime?   @default(now()) @map("created_at")
+  updatedAt    DateTime?   @default(now()) @map("updated_at")
+
+  tenant       Tenant      @relation(fields: [tenantId], references: [id])
+  salesRecords SalesRecord[]
+
+  @@index([tenantId])
+  @@unique([tenantId, tableNumber])
+  @@map("tables")
 }
 
 model Product {
@@ -141,6 +182,7 @@ model Transaction {
 model SalesRecord {
   id                 BigInt    @id @default(autoincrement())
   tenantId           String?   @map("tenant_id")
+  tableId            BigInt?   @map("table_id")
   referenceId        String?   @map("reference_id")
   receiptNumber      String?   @map("receipt_number")
   paymentMethod      String?   @map("payment_method")
@@ -158,14 +200,18 @@ model SalesRecord {
   mechanicName       String?   @map("mechanic_name")
   mechanicCommission Decimal?  @map("mechanic_commission")
   transaction_type   String?
+  orderType          OrderType?   @map("order_type")
+  orderStatus        OrderStatus? @map("order_status")
   dp_amount          Decimal?
   pickup_date        DateTime?
   po_status          String?
 
   tenant             Tenant?   @relation(fields: [tenantId], references: [id])
+  table              tables?   @relation(fields: [tableId], references: [id])
   items              SalesRecordItem[]
 
   @@index([tenantId])
+  @@index([tableId])
   @@index([referenceId])
   @@map("sales_records")
 }

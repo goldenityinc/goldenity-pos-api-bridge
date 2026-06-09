@@ -606,6 +606,62 @@ const normalizeAppUserPayload = (payload = {}, options = {}) => {
   return next;
 };
 
+const BRIDGE_ORDER_TYPE_VALUES = new Set([
+  'WALK_IN',
+  'PRE_ORDER',
+  'DELIVERY',
+  'DINE_IN',
+  'TAKEAWAY',
+]);
+
+const BRIDGE_ORDER_STATUS_VALUES = new Set([
+  'PENDING',
+  'PENDING_PAYMENT',
+  'PREPARING',
+  'READY_FOR_PICKUP',
+  'COMPLETED',
+  'CANCELLED',
+]);
+
+const normalizeSalesRecordPayload = (payload = {}) => {
+  const next = { ...payload };
+
+  if (next.table_id === undefined && next.tableId !== undefined) {
+    next.table_id = next.tableId;
+  }
+  if (next.tableId === undefined && next.table_id !== undefined) {
+    next.tableId = next.table_id;
+  }
+
+  const rawOrderType = (next.order_type ?? next.orderType ?? '').toString().trim();
+  if (rawOrderType) {
+    const normalizedOrderType = rawOrderType.toUpperCase();
+    if (!BRIDGE_ORDER_TYPE_VALUES.has(normalizedOrderType)) {
+      throw createHttpError(
+        400,
+        `Invalid enum value. Expected 'WALK_IN' | 'PRE_ORDER' | 'DELIVERY' | 'DINE_IN' | 'TAKEAWAY', received '${rawOrderType}'`,
+      );
+    }
+    next.order_type = normalizedOrderType;
+    next.orderType = normalizedOrderType;
+  }
+
+  const rawOrderStatus = (next.order_status ?? next.orderStatus ?? '').toString().trim();
+  if (rawOrderStatus) {
+    const normalizedOrderStatus = rawOrderStatus.toUpperCase();
+    if (!BRIDGE_ORDER_STATUS_VALUES.has(normalizedOrderStatus)) {
+      throw createHttpError(
+        400,
+        `Invalid enum value. Expected 'PENDING' | 'PENDING_PAYMENT' | 'PREPARING' | 'READY_FOR_PICKUP' | 'COMPLETED' | 'CANCELLED', received '${rawOrderStatus}'`,
+      );
+    }
+    next.order_status = normalizedOrderStatus;
+    next.orderStatus = normalizedOrderStatus;
+  }
+
+  return next;
+};
+
 const normalizePayloadForTable = (table, payload, options = {}) => {
   if (Array.isArray(payload)) {
     return payload.map((row) => normalizePayloadForTable(table, row, options));
@@ -633,6 +689,10 @@ const normalizePayloadForTable = (table, payload, options = {}) => {
 
   if (table === 'app_users') {
     return normalizeAppUserPayload(payload, options);
+  }
+
+  if (table === 'sales_records') {
+    return normalizeSalesRecordPayload(payload);
   }
 
   return payload;

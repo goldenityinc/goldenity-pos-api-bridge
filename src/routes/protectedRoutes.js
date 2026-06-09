@@ -46,6 +46,8 @@ router.post('/kas-bon/:id/pay', settleKasBon);
 router.post('/debug/reset-data', resetOperationalData);
 
 router.use('/users', createCrudTableRoutes('app_users'));
+router.use('/tables', createCrudTableRoutes('tables'));
+router.use('/api/v1/tables', createCrudTableRoutes('tables'));
 router.use('/suppliers', createCrudTableRoutes('suppliers'));
 router.use('/restock_history', createCrudTableRoutes('restock_history'));
 router.use('/order_history', createCrudTableRoutes('order_history'));

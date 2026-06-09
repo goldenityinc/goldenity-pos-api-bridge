@@ -1,0 +1,284 @@
+const { jsonOk, jsonError } = require('../utils/http');
+const { getSharedPool } = require('../middlewares/tenantResolver');
+const { normalizeTenantId } = require('../utils/sqlHelpers');
+
+const FNB_PRODUCT_TYPES = new Set(['FOOD', 'BEVERAGE', 'FNB', 'F&B', 'MENU']);
+const FNB_CATEGORIES = new Set(['food', 'beverage', 'fnb', 'f&b', 'menu']);
+
+const parseTenantId = (value) => {
+  const tenantId = normalizeTenantId(value);
+  if (!tenantId) {
+    const error = new Error('tenantId wajib diisi');
+    error.statusCode = 400;
+    throw error;
+  }
+  return tenantId;
+};
+
+const parseTableId = (value) => {
+  const text = (value || '').toString().trim();
+  if (!/^\d+$/.test(text)) {
+    const error = new Error('table_id tidak valid');
+    error.statusCode = 400;
+    throw error;
+  }
+  return Number(text);
+};
+
+const parseOrderItems = (items) => {
+  if (!Array.isArray(items) || items.length === 0) {
+    const error = new Error('items wajib diisi minimal 1 item');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return items.map((raw, index) => {
+    if (!raw || typeof raw !== 'object') {
+      const error = new Error(`items[${index}] tidak valid`);
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const productId = (raw.productId || raw.product_id || '').toString().trim();
+    if (!productId) {
+      const error = new Error(`items[${index}].productId wajib diisi`);
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const qty = Number(raw.qty || raw.quantity);
+    if (!Number.isInteger(qty) || qty <= 0) {
+      const error = new Error(`items[${index}].qty harus angka bulat > 0`);
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const customPriceRaw = raw.customPrice ?? raw.custom_price;
+    const customPrice =
+      customPriceRaw === undefined || customPriceRaw === null || customPriceRaw === ''
+        ? undefined
+        : Number(customPriceRaw);
+
+    if (customPrice !== undefined && (!Number.isFinite(customPrice) || customPrice < 0)) {
+      const error = new Error(`items[${index}].customPrice tidak valid`);
+      error.statusCode = 400;
+      throw error;
+    }
+
+    return {
+      productId,
+      qty,
+      note: (raw.note || '').toString().trim() || null,
+      customPrice,
+    };
+  });
+};
+
+const getQrMenu = async (req, res) => {
+  try {
+    const tenantId = parseTenantId(req.params.tenantId);
+    const pool = getSharedPool();
+
+    const result = await pool.query(
+      `SELECT id, name, category, product_type, price, stock, image_url
+       FROM products
+       WHERE tenant_id = $1
+         AND COALESCE(is_active, true) = true
+         AND (
+           UPPER(COALESCE(product_type, '')) = ANY($2::text[])
+           OR LOWER(COALESCE(category, '')) = ANY($3::text[])
+         )
+         AND (
+           COALESCE(is_service, false) = true
+           OR COALESCE(stock, 0) > 0
+         )
+       ORDER BY name ASC`,
+      [tenantId, Array.from(FNB_PRODUCT_TYPES), Array.from(FNB_CATEGORIES)],
+    );
+
+    return jsonOk(res, result.rows || [], 'QR menu berhasil dimuat');
+  } catch (error) {
+    return jsonError(res, error.statusCode || 500, error.message || 'Internal server error', error.message);
+  }
+};
+
+const createQrOrder = async (req, res) => {
+  const pool = getSharedPool();
+  const client = await pool.connect();
+
+  try {
+    const tenantId = parseTenantId(req.body.tenantId || req.body.tenant_id);
+    const tableId = parseTableId(req.body.tableId || req.body.table_id);
+    const items = parseOrderItems(req.body.items);
+    const customerName = (req.body.customerName || req.body.customer_name || 'Guest').toString().trim() || 'Guest';
+
+    await client.query('BEGIN');
+
+    const tableResult = await client.query(
+      `SELECT id, status
+       FROM tables
+       WHERE id = $1 AND tenant_id = $2
+       LIMIT 1
+       FOR UPDATE`,
+      [tableId, tenantId],
+    );
+
+    if ((tableResult.rowCount || 0) === 0) {
+      const error = new Error('Meja tidak ditemukan untuk tenant ini');
+      error.statusCode = 404;
+      throw error;
+    }
+
+    const productIds = items.map((item) => item.productId);
+    const productsResult = await client.query(
+      `SELECT id, name, price, COALESCE(is_service, false) AS is_service, COALESCE(stock, 0) AS stock
+       FROM products
+       WHERE tenant_id = $1
+         AND id = ANY($2::text[])
+         AND COALESCE(is_active, true) = true`,
+      [tenantId, productIds],
+    );
+
+    const productMap = new Map((productsResult.rows || []).map((row) => [row.id, row]));
+
+    let totalAmount = 0;
+    const normalizedItems = items.map((item) => {
+      const product = productMap.get(item.productId);
+      if (!product) {
+        const error = new Error(`Produk tidak ditemukan: ${item.productId}`);
+        error.statusCode = 404;
+        throw error;
+      }
+
+      const isService = product.is_service === true;
+      const availableStock = Number(product.stock || 0);
+      if (!isService && availableStock < item.qty) {
+        const error = new Error(`Stok tidak cukup untuk produk ${product.name}`);
+        error.statusCode = 400;
+        throw error;
+      }
+
+      const unitPrice = item.customPrice !== undefined
+        ? item.customPrice
+        : Number(product.price || 0);
+
+      totalAmount += unitPrice * item.qty;
+
+      return {
+        productId: item.productId,
+        productName: product.name,
+        qty: item.qty,
+        customPrice: unitPrice,
+        note: item.note,
+        isService,
+      };
+    });
+
+    const referenceId = `qr_${Date.now()}`;
+
+    const saleInsert = await client.query(
+      `INSERT INTO sales_records (
+         tenant_id,
+         table_id,
+         reference_id,
+         payment_method,
+         payment_status,
+         order_type,
+         order_status,
+         total_price,
+         total_amount,
+         customer_name,
+         items_json,
+         amount_paid,
+         created_at,
+         updated_at
+       )
+       VALUES (
+         $1, $2, $3, $4, $5, $6, $7,
+         $8, $9, $10, $11::jsonb, $12,
+         NOW(), NOW()
+       )
+       RETURNING id, reference_id, order_status, total_amount`,
+      [
+        tenantId,
+        tableId,
+        referenceId,
+        'QRIS',
+        'PENDING_PAYMENT',
+        'DINE_IN',
+        'PENDING_PAYMENT',
+        totalAmount,
+        totalAmount,
+        customerName,
+        JSON.stringify(normalizedItems),
+        0,
+      ],
+    );
+
+    const sale = saleInsert.rows?.[0];
+    if (!sale) {
+      const error = new Error('Gagal membuat pesanan QR');
+      error.statusCode = 500;
+      throw error;
+    }
+
+    for (const item of normalizedItems) {
+      await client.query(
+        `INSERT INTO sales_record_items (
+           tenant_id,
+           sales_record_id,
+           product_id,
+           product_name,
+           qty,
+           custom_price,
+           note,
+           is_service,
+           created_at,
+           updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`,
+        [
+          tenantId,
+          sale.id,
+          item.productId,
+          item.productName,
+          item.qty,
+          item.customPrice,
+          item.note,
+          item.isService,
+        ],
+      );
+
+      if (!item.isService) {
+        await client.query(
+          `UPDATE products
+           SET stock = COALESCE(stock, 0) - $1,
+               updated_at = NOW()
+           WHERE tenant_id = $2 AND id = $3`,
+          [item.qty, tenantId, item.productId],
+        );
+      }
+    }
+
+    await client.query(
+      `UPDATE tables
+       SET status = 'OCCUPIED',
+           updated_at = NOW()
+       WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, tableId],
+    );
+
+    await client.query('COMMIT');
+
+    return jsonOk(res, sale, 'Pesanan QR berhasil dibuat', 201);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return jsonError(res, error.statusCode || 500, error.message || 'Internal server error', error.message);
+  } finally {
+    client.release();
+  }
+};
+
+module.exports = {
+  getQrMenu,
+  createQrOrder,
+};
