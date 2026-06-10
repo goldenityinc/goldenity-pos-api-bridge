@@ -113,24 +113,41 @@ const getQrMenu = async (req, res) => {
       rows = fallbackResult.rows || [];
     }
 
-    const tenantMetaResult = await pool.query(
-      `SELECT id, name, slug
-       FROM tenants
-       WHERE id = $1
-       LIMIT 1`,
-      [tenantId],
-    );
-    const tenantMeta = tenantMetaResult.rows?.[0] || null;
+    let tenantMeta = null;
+    try {
+      const tenantMetaResult = await pool.query(
+        `SELECT id, name, slug
+         FROM tenants
+         WHERE id = $1
+         LIMIT 1`,
+        [tenantId],
+      );
+      tenantMeta = tenantMetaResult.rows?.[0] || null;
+    } catch (tenantMetaError) {
+      // Tenant metadata is optional for menu rendering.
+      console.warn('[publicQrController] Tenant metadata lookup skipped:', tenantMetaError.message);
+    }
 
-    const storeSettingsResult = await pool.query(
-      `SELECT store_name
-       FROM store_settings
-       WHERE tenant_id = $1
-       ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
-       LIMIT 1`,
-      [tenantId],
-    );
-    const storeName = (storeSettingsResult.rows?.[0]?.store_name || '').toString().trim();
+    let storeName = '';
+    try {
+      const storeSettingsResult = await pool.query(
+        `SELECT COALESCE(
+            to_jsonb(ss)->>'store_name',
+            to_jsonb(ss)->>'name',
+            to_jsonb(ss)->>'nama_toko',
+            ''
+          ) AS store_name
+         FROM store_settings ss
+         WHERE tenant_id = $1
+         ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+         LIMIT 1`,
+        [tenantId],
+      );
+      storeName = (storeSettingsResult.rows?.[0]?.store_name || '').toString().trim();
+    } catch (storeSettingsError) {
+      // Keep endpoint resilient when store_settings schema differs per environment.
+      console.warn('[publicQrController] Store settings lookup skipped:', storeSettingsError.message);
+    }
 
     const categoriesMap = new Map();
     const products = rows.map((row) => {
