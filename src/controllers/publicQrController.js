@@ -87,6 +87,13 @@ const parseOrderItems = (items) => {
   });
 };
 
+const generateReceiptNumber = () => {
+  const now = new Date();
+  const yyyymmdd = `${now.getFullYear()}${`${now.getMonth() + 1}`.padStart(2, '0')}${`${now.getDate()}`.padStart(2, '0')}`;
+  const serial = `${now.getTime() % 10000}`.padStart(4, '0');
+  return `INV-${yyyymmdd}-${serial}`;
+};
+
 const getQrMenu = async (req, res) => {
   try {
     const tenantId = parseTenantId(req.params.tenantId);
@@ -309,6 +316,7 @@ const createQrOrder = async (req, res) => {
     });
 
     const referenceId = `qr_${Date.now()}`;
+    const receiptNumber = generateReceiptNumber();
 
     const saleInsert = await client.query(
       `INSERT INTO sales_records (
@@ -316,6 +324,7 @@ const createQrOrder = async (req, res) => {
         branch_id,
          table_id,
          reference_id,
+         receipt_number,
          payment_method,
          payment_status,
          order_type,
@@ -323,29 +332,32 @@ const createQrOrder = async (req, res) => {
          total_price,
          total_amount,
          customer_name,
+         cashier_name,
          items_json,
          amount_paid,
          created_at,
          updated_at
        )
        VALUES (
-         $1, $2, $3, $4, $5, $6, $7, $8,
-         $9, $10, $11, $12::jsonb, $13,
+         $1, $2, $3, $4, $5, $6, $7, $8, $9,
+         $10, $11, $12, $13::jsonb, $14,
          NOW(), NOW()
        )
-       RETURNING id, reference_id, order_status, total_amount`,
+       RETURNING id, reference_id, receipt_number, cashier_name, order_status, total_amount`,
       [
         tenantId,
         branchId,
         tableId,
         referenceId,
-        'QRIS',
+        receiptNumber,
+        'Bayar di Kasir',
         'PENDING_PAYMENT',
         'DINE_IN',
         'PENDING_PAYMENT',
         totalAmount,
         totalAmount,
         customerName,
+        'Online Order',
         JSON.stringify(normalizedItems),
         0,
       ],
