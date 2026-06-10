@@ -25,6 +25,19 @@ const parseTableId = (value) => {
   return Number(text);
 };
 
+const parseOptionalBranchId = (value) => {
+  const text = (value || '').toString().trim();
+  if (!text) {
+    return null;
+  }
+  if (!/^\d+$/.test(text)) {
+    const error = new Error('branch_id tidak valid');
+    error.statusCode = 400;
+    throw error;
+  }
+  return Number(text);
+};
+
 const parseOrderItems = (items) => {
   if (!Array.isArray(items) || items.length === 0) {
     const error = new Error('items wajib diisi minimal 1 item');
@@ -77,12 +90,17 @@ const parseOrderItems = (items) => {
 const getQrMenu = async (req, res) => {
   try {
     const tenantId = parseTenantId(req.params.tenantId);
+    const branchId = parseOptionalBranchId(req.query.branchId || req.query.branch_id);
+    const branchNameFromQuery = (req.query.branchName || req.query.branch_name || '')
+      .toString()
+      .trim();
     const pool = getSharedPool();
 
     const result = await pool.query(
-      `SELECT id, name, category, product_type, price, stock, image_url
+      `SELECT id, name, category, product_type, price, stock, image_url, COALESCE(is_service, false) AS is_service
        FROM products
        WHERE tenant_id = $1
+         AND ($4::bigint IS NULL OR branch_id = $4)
          AND COALESCE(is_active, true) = true
          AND (
            UPPER(COALESCE(product_type, '')) = ANY($2::text[])
@@ -93,22 +111,23 @@ const getQrMenu = async (req, res) => {
            OR COALESCE(stock, 0) > 0
          )
        ORDER BY name ASC`,
-      [tenantId, Array.from(FNB_PRODUCT_TYPES), Array.from(FNB_CATEGORIES)],
+      [tenantId, Array.from(FNB_PRODUCT_TYPES), Array.from(FNB_CATEGORIES), branchId],
     );
 
     let rows = result.rows || [];
     if (rows.length === 0) {
       const fallbackResult = await pool.query(
-        `SELECT id, name, category, product_type, price, stock, image_url
+        `SELECT id, name, category, product_type, price, stock, image_url, COALESCE(is_service, false) AS is_service
          FROM products
          WHERE tenant_id = $1
+           AND ($2::bigint IS NULL OR branch_id = $2)
            AND COALESCE(is_active, true) = true
            AND (
              COALESCE(is_service, false) = true
              OR COALESCE(stock, 0) > 0
            )
          ORDER BY name ASC`,
-        [tenantId],
+        [tenantId, branchId],
       );
       rows = fallbackResult.rows || [];
     }
@@ -131,22 +150,41 @@ const getQrMenu = async (req, res) => {
     let storeName = '';
     try {
       const storeSettingsResult = await pool.query(
-        `SELECT COALESCE(
-            to_jsonb(ss)->>'store_name',
-            to_jsonb(ss)->>'name',
-            to_jsonb(ss)->>'nama_toko',
-            ''
-          ) AS store_name
-         FROM store_settings ss
+        `SELECT COALESCE(value, '') AS store_name
+         FROM store_settings
          WHERE tenant_id = $1
-         ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+           AND key = ANY($2::text[])
+         ORDER BY CASE
+           WHEN key = 'store_name' THEN 0
+           WHEN key = 'nama_toko' THEN 1
+           WHEN key = 'name' THEN 2
+           ELSE 3
+         END,
+         updated_at DESC NULLS LAST,
+         created_at DESC NULLS LAST
          LIMIT 1`,
-        [tenantId],
+        [tenantId, ['store_name', 'nama_toko', 'name']],
       );
       storeName = (storeSettingsResult.rows?.[0]?.store_name || '').toString().trim();
     } catch (storeSettingsError) {
       // Keep endpoint resilient when store_settings schema differs per environment.
       console.warn('[publicQrController] Store settings lookup skipped:', storeSettingsError.message);
+    }
+
+    let branchMeta = null;
+    if (branchId !== null) {
+      try {
+        const branchResult = await pool.query(
+          `SELECT id, name, branch_code
+           FROM branches
+           WHERE tenant_id = $1 AND id = $2
+           LIMIT 1`,
+          [tenantId, branchId],
+        );
+        branchMeta = branchResult.rows?.[0] || null;
+      } catch (branchError) {
+        console.warn('[publicQrController] Branch lookup skipped:', branchError.message);
+      }
     }
 
     const categoriesMap = new Map();
@@ -180,6 +218,11 @@ const getQrMenu = async (req, res) => {
         name: storeName || tenantMeta?.name || null,
         slug: tenantMeta?.slug || null,
       },
+      branch: {
+        id: branchId,
+        name: (branchMeta?.name || branchNameFromQuery || '').toString().trim() || null,
+        code: (branchMeta?.branch_code || '').toString().trim() || null,
+      },
       categories: Array.from(categoriesMap.values()),
       products,
       items: products,
@@ -198,6 +241,7 @@ const createQrOrder = async (req, res) => {
   try {
     const tenantId = parseTenantId(req.body.tenantId || req.body.tenant_id);
     const tableId = parseTableId(req.body.tableId || req.body.table_id);
+    const branchId = parseOptionalBranchId(req.body.branchId || req.body.branch_id);
     const items = parseOrderItems(req.body.items);
     const customerName = (req.body.customerName || req.body.customer_name || 'Guest').toString().trim() || 'Guest';
 
@@ -224,8 +268,9 @@ const createQrOrder = async (req, res) => {
        FROM products
        WHERE tenant_id = $1
          AND id = ANY($2::text[])
+         AND ($3::bigint IS NULL OR branch_id = $3)
          AND COALESCE(is_active, true) = true`,
-      [tenantId, productIds],
+      [tenantId, productIds, branchId],
     );
 
     const productMap = new Map((productsResult.rows || []).map((row) => [row.id, row]));
@@ -268,6 +313,7 @@ const createQrOrder = async (req, res) => {
     const saleInsert = await client.query(
       `INSERT INTO sales_records (
          tenant_id,
+        branch_id,
          table_id,
          reference_id,
          payment_method,
@@ -283,13 +329,14 @@ const createQrOrder = async (req, res) => {
          updated_at
        )
        VALUES (
-         $1, $2, $3, $4, $5, $6, $7,
-         $8, $9, $10, $11::jsonb, $12,
+         $1, $2, $3, $4, $5, $6, $7, $8,
+         $9, $10, $11, $12::jsonb, $13,
          NOW(), NOW()
        )
        RETURNING id, reference_id, order_status, total_amount`,
       [
         tenantId,
+        branchId,
         tableId,
         referenceId,
         'QRIS',
