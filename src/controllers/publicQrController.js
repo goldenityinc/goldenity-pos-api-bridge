@@ -96,7 +96,79 @@ const getQrMenu = async (req, res) => {
       [tenantId, Array.from(FNB_PRODUCT_TYPES), Array.from(FNB_CATEGORIES)],
     );
 
-    return jsonOk(res, result.rows || [], 'QR menu berhasil dimuat');
+    let rows = result.rows || [];
+    if (rows.length === 0) {
+      const fallbackResult = await pool.query(
+        `SELECT id, name, category, product_type, price, stock, image_url
+         FROM products
+         WHERE tenant_id = $1
+           AND COALESCE(is_active, true) = true
+           AND (
+             COALESCE(is_service, false) = true
+             OR COALESCE(stock, 0) > 0
+           )
+         ORDER BY name ASC`,
+        [tenantId],
+      );
+      rows = fallbackResult.rows || [];
+    }
+
+    const tenantMetaResult = await pool.query(
+      `SELECT id, name, slug
+       FROM tenants
+       WHERE id = $1
+       LIMIT 1`,
+      [tenantId],
+    );
+    const tenantMeta = tenantMetaResult.rows?.[0] || null;
+
+    const storeSettingsResult = await pool.query(
+      `SELECT store_name
+       FROM store_settings
+       WHERE tenant_id = $1
+       ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+       LIMIT 1`,
+      [tenantId],
+    );
+    const storeName = (storeSettingsResult.rows?.[0]?.store_name || '').toString().trim();
+
+    const categoriesMap = new Map();
+    const products = rows.map((row) => {
+      const categoryName = (row.category || 'Menu').toString().trim() || 'Menu';
+      const categoryId = categoryName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      if (!categoriesMap.has(categoryId)) {
+        categoriesMap.set(categoryId, {
+          id: categoryId,
+          name: categoryName,
+          sortOrder: categoriesMap.size,
+        });
+      }
+
+      return {
+        id: row.id,
+        name: row.name,
+        categoryId,
+        categoryName,
+        price: Number(row.price || 0),
+        isAvailable: Number(row.stock || 0) > 0 || row.is_service === true,
+        stock: Number(row.stock || 0),
+        imageUrl: row.image_url || null,
+        sortOrder: 0,
+      };
+    });
+
+    const payload = {
+      tenant: {
+        id: tenantId,
+        name: storeName || tenantMeta?.name || null,
+        slug: tenantMeta?.slug || null,
+      },
+      categories: Array.from(categoriesMap.values()),
+      products,
+      items: products,
+    };
+
+    return jsonOk(res, payload, 'QR menu berhasil dimuat');
   } catch (error) {
     return jsonError(res, error.statusCode || 500, error.message || 'Internal server error', error.message);
   }
