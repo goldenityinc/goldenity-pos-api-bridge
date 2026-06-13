@@ -2,9 +2,6 @@ const { jsonOk, jsonError } = require('../utils/http');
 const { getSharedPool } = require('../middlewares/tenantResolver');
 const { normalizeTenantId } = require('../utils/sqlHelpers');
 
-const FNB_PRODUCT_TYPES = new Set(['FOOD', 'BEVERAGE', 'FNB', 'F&B', 'MENU']);
-const FNB_CATEGORIES = new Set(['food', 'beverage', 'fnb', 'f&b', 'menu']);
-
 const parseTenantId = (value) => {
   const tenantId = normalizeTenantId(value);
   if (!tenantId) {
@@ -116,18 +113,14 @@ const getQrMenu = async (req, res) => {
               COALESCE(is_available, true) AS is_available
        FROM products
        WHERE tenant_id = $1
-               AND ($4::bigint IS NULL OR branch_id = $4 OR branch_id IS NULL)
+               AND ($2::bigint IS NULL OR branch_id = $2 OR branch_id IS NULL)
          AND COALESCE(is_active, true) = true
-         AND (
-           UPPER(COALESCE(product_type, '')) = ANY($2::text[])
-           OR LOWER(COALESCE(category, '')) = ANY($3::text[])
-         )
          AND (
            COALESCE(is_service, false) = true
            OR COALESCE(stock, 0) > 0
          )
        ORDER BY name ASC`,
-      [tenantId, Array.from(FNB_PRODUCT_TYPES), Array.from(FNB_CATEGORIES), branchId],
+            [tenantId, branchId],
     );
 
     let rows = result.rows || [];
