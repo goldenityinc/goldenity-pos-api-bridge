@@ -1,6 +1,6 @@
 const { jsonOk, jsonError } = require('../utils/http');
 const { getSharedPool } = require('../middlewares/tenantResolver');
-const { normalizeTenantId } = require('../utils/sqlHelpers');
+const { normalizeTenantId, getTableColumnSet } = require('../utils/sqlHelpers');
 
 const FNB_PRODUCT_TYPES = new Set(['FOOD', 'BEVERAGE', 'FNB', 'F&B', 'MENU']);
 
@@ -100,6 +100,22 @@ const generateReceiptNumber = () => {
   return `INV-${yyyymmdd}-${serial}`;
 };
 
+const resolveSoftDeletePredicate = (columnSet) => {
+  if (!(columnSet instanceof Set)) {
+    return '1=1';
+  }
+
+  if (columnSet.has('deleted_at')) {
+    return 'deleted_at IS NULL';
+  }
+
+  if (columnSet.has('is_deleted')) {
+    return 'COALESCE(is_deleted, false) = false';
+  }
+
+  return '1=1';
+};
+
 const getQrMenu = async (req, res) => {
   try {
     const tenantId = parseTenantId(req.params.tenantId);
@@ -108,6 +124,8 @@ const getQrMenu = async (req, res) => {
       .toString()
       .trim();
     const pool = getSharedPool();
+    const productColumns = await getTableColumnSet(pool, 'products');
+    const softDeletePredicate = resolveSoftDeletePredicate(productColumns);
 
     const result = await pool.query(
             `SELECT id, name, category, product_type, price, stock, image_url,
@@ -115,7 +133,12 @@ const getQrMenu = async (req, res) => {
               COALESCE(is_available, true) AS is_available
        FROM products
        WHERE tenant_id = $1
-         AND ($3::bigint IS NULL OR branch_id = $3 OR branch_id IS NULL)
+         AND ${softDeletePredicate}
+         AND (
+           $3::bigint IS NULL
+           OR branch_id = $3
+           OR branch_id IS NULL
+         )
          AND COALESCE(is_active, true) = true
          AND (
            UPPER(COALESCE(product_type, '')) = ANY($2::text[])
@@ -136,7 +159,12 @@ const getQrMenu = async (req, res) => {
           COALESCE(is_available, true) AS is_available
          FROM products
          WHERE tenant_id = $1
-           AND ($2::bigint IS NULL OR branch_id = $2 OR branch_id IS NULL)
+           AND ${softDeletePredicate}
+           AND (
+             $2::bigint IS NULL
+             OR branch_id = $2
+             OR branch_id IS NULL
+           )
            AND COALESCE(is_active, true) = true
            AND (
              COALESCE(is_service, false) = true
@@ -280,6 +308,8 @@ const createQrOrder = async (req, res) => {
     }
 
     const productIds = items.map((item) => item.productId);
+    const productColumns = await getTableColumnSet(client, 'products');
+    const softDeletePredicate = resolveSoftDeletePredicate(productColumns);
     const productsResult = await client.query(
             `SELECT id, name, price,
               COALESCE(is_service, false) AS is_service,
@@ -288,7 +318,12 @@ const createQrOrder = async (req, res) => {
        FROM products
        WHERE tenant_id = $1
          AND id = ANY($2::text[])
-         AND ($3::bigint IS NULL OR branch_id = $3)
+         AND ${softDeletePredicate}
+         AND (
+           $3::bigint IS NULL
+           OR branch_id = $3
+           OR branch_id IS NULL
+         )
          AND COALESCE(is_active, true) = true`,
       [tenantId, productIds, branchId],
     );
