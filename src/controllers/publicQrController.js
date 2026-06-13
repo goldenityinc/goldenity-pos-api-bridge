@@ -1,8 +1,52 @@
 const { jsonOk, jsonError } = require('../utils/http');
 const { getSharedPool } = require('../middlewares/tenantResolver');
 const { normalizeTenantId, getTableColumnSet } = require('../utils/sqlHelpers');
+const { emitToTenant } = require('../services/socketServer');
 
 const FNB_PRODUCT_TYPES = new Set(['FOOD', 'BEVERAGE', 'FNB', 'F&B', 'MENU']);
+const PAYMENT_METHOD_CASHIER = 'CASHIER';
+const PAYMENT_METHOD_DIGITAL = 'DIGITAL_PAYMENT';
+
+const normalizePaymentMethod = (value) => {
+  const normalized = (value || '').toString().trim().toUpperCase();
+  if (
+    normalized === 'DIGITAL' ||
+    normalized === 'DIGITAL_PAYMENT' ||
+    normalized === 'QRIS' ||
+    normalized === 'E_WALLET' ||
+    normalized === 'EWALLET'
+  ) {
+    return PAYMENT_METHOD_DIGITAL;
+  }
+  return PAYMENT_METHOD_CASHIER;
+};
+
+const resolvePaymentState = (paymentMethod) => {
+  if (paymentMethod === PAYMENT_METHOD_DIGITAL) {
+    return {
+      paymentMethodLabel: 'Digital Payment',
+      paymentStatus: 'PENDING_PAYMENT',
+      orderStatus: 'PENDING_PAYMENT',
+    };
+  }
+
+  return {
+    paymentMethodLabel: 'Bayar di Kasir',
+    paymentStatus: 'UNPAID',
+    orderStatus: 'PENDING_AT_CASHIER',
+  };
+};
+
+const resolveWebhookPaymentState = (value) => {
+  const normalized = (value || '').toString().trim().toUpperCase();
+  if (['PAID', 'SETTLED', 'SETTLEMENT', 'SUCCESS'].includes(normalized)) {
+    return { paymentStatus: 'PAID', orderStatus: 'PAID' };
+  }
+  if (['FAILED', 'EXPIRED', 'CANCELLED', 'CANCELED', 'DENIED'].includes(normalized)) {
+    return { paymentStatus: 'FAILED', orderStatus: 'PAYMENT_FAILED' };
+  }
+  return { paymentStatus: 'PENDING_PAYMENT', orderStatus: 'PENDING_PAYMENT' };
+};
 
 const parseTenantId = (value) => {
   const tenantId = normalizeTenantId(value);
@@ -318,6 +362,10 @@ const createQrOrder = async (req, res) => {
     const branchId = parseOptionalBranchId(req.body.branchId || req.body.branch_id);
     const items = parseOrderItems(req.body.items ?? req.body.orderItems);
     const customerName = (req.body.customerName || req.body.customer_name || 'Guest').toString().trim() || 'Guest';
+    const paymentMethod = normalizePaymentMethod(
+      req.body.paymentMethod || req.body.payment_method,
+    );
+    const paymentState = resolvePaymentState(paymentMethod);
 
     await client.query('BEGIN');
 
@@ -419,20 +467,20 @@ const createQrOrder = async (req, res) => {
        )
        VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9,
-         $10, $11, $12, $13::jsonb, $14,
+         $10, $11, $12, $13, $14::jsonb, $15,
          NOW(), NOW()
        )
-       RETURNING id, reference_id, receipt_number, cashier_name, order_status, total_amount`,
+       RETURNING id, reference_id, receipt_number, cashier_name, order_status, payment_status, payment_method, total_amount`,
       [
         tenantId,
         branchId,
         tableId,
         referenceId,
         receiptNumber,
-        'Bayar di Kasir',
-        'PENDING_PAYMENT',
+        paymentState.paymentMethodLabel,
+        paymentState.paymentStatus,
         'DINE_IN',
-        'PENDING_PAYMENT',
+        paymentState.orderStatus,
         totalAmount,
         totalAmount,
         customerName,
@@ -496,7 +544,196 @@ const createQrOrder = async (req, res) => {
 
     await client.query('COMMIT');
 
+    emitToTenant(tenantId, 'qr_order_payment_status', {
+      tenantId,
+      orderId: sale.id,
+      referenceId: sale.reference_id,
+      receiptNumber: sale.receipt_number,
+      paymentMethod,
+      paymentStatus: sale.payment_status,
+      orderStatus: sale.order_status,
+      updatedAt: new Date().toISOString(),
+    });
+
     return jsonOk(res, sale, 'Pesanan QR berhasil dibuat', 201);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return jsonError(res, error.statusCode || 500, error.message || 'Internal server error', error.message);
+  } finally {
+    client.release();
+  }
+};
+
+const checkoutQrOrder = async (req, res) => {
+  const client = await getSharedPool().connect();
+  try {
+    const tenantId = parseTenantId(req.body.tenantId || req.body.tenant_id);
+    const branchId = parseOptionalBranchId(req.body.branchId || req.body.branch_id);
+    const orderId = (req.body.orderId || req.body.order_id || req.body.salesRecordId || '').toString().trim();
+    const referenceId = (req.body.referenceId || req.body.reference_id || '').toString().trim();
+    const receiptNumber = (req.body.receiptNumber || req.body.receipt_number || '').toString().trim();
+    const paymentMethod = normalizePaymentMethod(req.body.paymentMethod || req.body.payment_method);
+    const paymentState = resolvePaymentState(paymentMethod);
+
+    if (!orderId && !referenceId && !receiptNumber) {
+      const error = new Error('orderId/referenceId/receiptNumber wajib diisi');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    await client.query('BEGIN');
+
+    const lookup = await client.query(
+      `SELECT id, reference_id, receipt_number, payment_status, order_status, total_amount
+       FROM sales_records
+       WHERE tenant_id = $1
+         AND ($2::bigint IS NULL OR branch_id = $2)
+         AND (
+           ($3::text <> '' AND id::text = $3)
+           OR ($4::text <> '' AND reference_id = $4)
+           OR ($5::text <> '' AND receipt_number = $5)
+         )
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [tenantId, branchId, orderId, referenceId, receiptNumber],
+    );
+
+    const sale = lookup.rows?.[0];
+    if (!sale) {
+      const error = new Error('Pesanan tidak ditemukan');
+      error.statusCode = 404;
+      throw error;
+    }
+
+    const updatedResult = await client.query(
+      `UPDATE sales_records
+       SET payment_method = $1,
+           payment_status = $2,
+           order_status = $3,
+           updated_at = NOW()
+       WHERE tenant_id = $4
+         AND id = $5
+       RETURNING id, reference_id, receipt_number, payment_method, payment_status, order_status, total_amount`,
+      [
+        paymentState.paymentMethodLabel,
+        paymentState.paymentStatus,
+        paymentState.orderStatus,
+        tenantId,
+        sale.id,
+      ],
+    );
+
+    await client.query('COMMIT');
+
+    const updated = updatedResult.rows?.[0] || sale;
+    const responsePayload = {
+      ...updated,
+      payment_method_code: paymentMethod,
+      paymentGateway: paymentMethod === PAYMENT_METHOD_DIGITAL
+        ? {
+            mode: 'HYBRID',
+            status: 'PENDING_PAYMENT',
+            actionRequired: 'WAIT_WEBHOOK',
+          }
+        : null,
+    };
+
+    emitToTenant(tenantId, 'qr_order_payment_status', {
+      tenantId,
+      orderId: updated.id,
+      referenceId: updated.reference_id,
+      receiptNumber: updated.receipt_number,
+      paymentMethod,
+      paymentStatus: updated.payment_status,
+      orderStatus: updated.order_status,
+      updatedAt: new Date().toISOString(),
+    });
+
+    return jsonOk(res, responsePayload, 'Checkout QR berhasil diproses', 200);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return jsonError(res, error.statusCode || 500, error.message || 'Internal server error', error.message);
+  } finally {
+    client.release();
+  }
+};
+
+const handlePaymentWebhook = async (req, res) => {
+  const client = await getSharedPool().connect();
+  try {
+    const tenantId = parseTenantId(req.body.tenantId || req.body.tenant_id);
+    const orderId = (req.body.orderId || req.body.order_id || req.body.salesRecordId || '').toString().trim();
+    const referenceId = (req.body.referenceId || req.body.reference_id || '').toString().trim();
+    const receiptNumber = (req.body.receiptNumber || req.body.receipt_number || '').toString().trim();
+    const gatewayStatus =
+      req.body.paymentStatus ||
+      req.body.payment_status ||
+      req.body.transactionStatus ||
+      req.body.transaction_status ||
+      req.body.status;
+    const paidAmount = Number(req.body.paidAmount ?? req.body.paid_amount ?? req.body.amount_paid ?? 0) || 0;
+
+    if (!orderId && !referenceId && !receiptNumber) {
+      const error = new Error('orderId/referenceId/receiptNumber wajib diisi');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    await client.query('BEGIN');
+
+    const lookup = await client.query(
+      `SELECT id, reference_id, receipt_number, total_amount
+       FROM sales_records
+       WHERE tenant_id = $1
+         AND (
+           ($2::text <> '' AND id::text = $2)
+           OR ($3::text <> '' AND reference_id = $3)
+           OR ($4::text <> '' AND receipt_number = $4)
+         )
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [tenantId, orderId, referenceId, receiptNumber],
+    );
+
+    const sale = lookup.rows?.[0];
+    if (!sale) {
+      const error = new Error('Pesanan tidak ditemukan untuk webhook pembayaran');
+      error.statusCode = 404;
+      throw error;
+    }
+
+    const paymentState = resolveWebhookPaymentState(gatewayStatus);
+    const safePaidAmount = paidAmount > 0 ? paidAmount : null;
+
+    const updatedResult = await client.query(
+      `UPDATE sales_records
+       SET payment_status = $1,
+           order_status = $2,
+           amount_paid = COALESCE($3, amount_paid),
+           updated_at = NOW()
+       WHERE tenant_id = $4
+         AND id = $5
+       RETURNING id, reference_id, receipt_number, payment_status, order_status, amount_paid, total_amount`,
+      [paymentState.paymentStatus, paymentState.orderStatus, safePaidAmount, tenantId, sale.id],
+    );
+
+    await client.query('COMMIT');
+
+    const updated = updatedResult.rows?.[0] || sale;
+
+    emitToTenant(tenantId, 'qr_order_payment_status', {
+      tenantId,
+      orderId: updated.id,
+      referenceId: updated.reference_id,
+      receiptNumber: updated.receipt_number,
+      paymentStatus: updated.payment_status,
+      orderStatus: updated.order_status,
+      amountPaid: updated.amount_paid,
+      updatedAt: new Date().toISOString(),
+      source: 'payment_webhook',
+    });
+
+    return jsonOk(res, updated, 'Webhook pembayaran diproses', 200);
   } catch (error) {
     await client.query('ROLLBACK');
     return jsonError(res, error.statusCode || 500, error.message || 'Internal server error', error.message);
@@ -508,4 +745,6 @@ const createQrOrder = async (req, res) => {
 module.exports = {
   getQrMenu,
   createQrOrder,
+  checkoutQrOrder,
+  handlePaymentWebhook,
 };
