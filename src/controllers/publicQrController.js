@@ -33,7 +33,7 @@ const resolvePaymentState = (paymentMethod) => {
   return {
     paymentMethodLabel: 'Bayar di Kasir',
     paymentStatus: 'UNPAID',
-    orderStatus: 'PENDING_AT_CASHIER',
+    orderStatus: 'PENDING',
   };
 };
 
