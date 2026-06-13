@@ -136,7 +136,7 @@ const getQrMenu = async (req, res) => {
        FROM products
        WHERE tenant_id = $1
          AND ${softDeletePredicate}
-         AND ($3::bigint IS NULL OR branch_id = $3 OR branch_id IS NULL)
+         AND ($3::bigint IS NULL OR branch_id = $3)
          AND COALESCE(is_active, true) = true
          AND (
            UPPER(COALESCE(product_type, '')) = ANY($2::text[])
@@ -158,7 +158,7 @@ const getQrMenu = async (req, res) => {
          FROM products
          WHERE tenant_id = $1
            AND ${softDeletePredicate}
-           AND ($2::bigint IS NULL OR branch_id = $2 OR branch_id IS NULL)
+           AND ($2::bigint IS NULL OR branch_id = $2)
            AND COALESCE(is_active, true) = true
            AND (
              COALESCE(is_service, false) = true
@@ -177,7 +177,7 @@ const getQrMenu = async (req, res) => {
          FROM categories
          WHERE tenant_id = $1
            AND ${categorySoftDeletePredicate}
-           AND ($2::bigint IS NULL OR branch_id = $2 OR branch_id IS NULL)
+           AND ($2::bigint IS NULL OR branch_id = $2)
          ORDER BY name ASC`,
         [tenantId, branchId],
       );
@@ -348,11 +348,7 @@ const createQrOrder = async (req, res) => {
        WHERE tenant_id = $1
          AND id = ANY($2::text[])
          AND ${softDeletePredicate}
-         AND (
-           $3::bigint IS NULL
-           OR branch_id = $3
-           OR branch_id IS NULL
-         )
+         AND ($3::bigint IS NULL OR branch_id = $3)
          AND COALESCE(is_active, true) = true`,
       [tenantId, productIds, branchId],
     );
