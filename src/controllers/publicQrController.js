@@ -115,7 +115,7 @@ const getQrMenu = async (req, res) => {
               COALESCE(is_available, true) AS is_available
        FROM products
        WHERE tenant_id = $1
-         AND ($3::bigint IS NULL OR branch_id = $3 OR branch_id IS NULL)
+         AND ($3::bigint IS NULL OR branch_id = $3)
          AND COALESCE(is_active, true) = true
          AND (
            UPPER(COALESCE(product_type, '')) = ANY($2::text[])
@@ -136,7 +136,7 @@ const getQrMenu = async (req, res) => {
           COALESCE(is_available, true) AS is_available
          FROM products
          WHERE tenant_id = $1
-           AND ($2::bigint IS NULL OR branch_id = $2 OR branch_id IS NULL)
+           AND ($2::bigint IS NULL OR branch_id = $2)
            AND COALESCE(is_active, true) = true
            AND (
              COALESCE(is_service, false) = true
