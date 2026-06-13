@@ -132,6 +132,7 @@ model Product {
   price         Float?    @default(0)
   purchasePrice Float?    @map("purchase_price")
   stock         Int?      @default(0)
+  isAvailable   Boolean?  @default(true) @map("is_available")
   isService     Boolean?  @default(false) @map("is_service")
   supplierName  String?   @map("supplier_name")
   imageUrl      String?   @map("image_url")

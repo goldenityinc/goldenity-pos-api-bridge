@@ -311,7 +311,15 @@ const normalizeTransactionItemsWithNotes = (items) => {
       const productName = (
         item.product_name ?? item.productName ?? product.name ?? ''
       ).toString().trim();
-      const note = (item.note ?? item.item_note ?? item.product_note ?? '')
+      const note = (
+        item.note ??
+        item.item_note ??
+        item.product_note ??
+        item.notes ??
+        item.remark ??
+        item.remarks ??
+        ''
+      )
         .toString()
         .trim();
       const qty = toPositiveInteger(item.qty ?? item.quantity);
@@ -801,8 +809,11 @@ const createTransaction = async (req, res) => {
       }
     }
     const inventoryUpdates = [];
-    const transactionItems = normalizeTransactionItems(payload.items);
-    const storedItems = toStoredSalesRecordItems(payload.items);
+    const inputItems = Array.isArray(payload.items) && payload.items.length > 0
+      ? payload.items
+      : payload.orderItems;
+    const transactionItems = normalizeTransactionItems(inputItems);
+    const storedItems = toStoredSalesRecordItems(inputItems);
 
     await client.query('BEGIN');
     await ensureSalesRecordsReferenceIdColumn(client);

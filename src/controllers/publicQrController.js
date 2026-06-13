@@ -81,7 +81,14 @@ const parseOrderItems = (items) => {
     return {
       productId,
       qty,
-      note: (raw.note || '').toString().trim() || null,
+      note: (
+        raw.note ??
+        raw.item_note ??
+        raw.notes ??
+        raw.remark ??
+        raw.remarks ??
+        ''
+      ).toString().trim() || null,
       customPrice,
     };
   });
@@ -104,7 +111,9 @@ const getQrMenu = async (req, res) => {
     const pool = getSharedPool();
 
     const result = await pool.query(
-      `SELECT id, name, category, product_type, price, stock, image_url, COALESCE(is_service, false) AS is_service
+            `SELECT id, name, category, product_type, price, stock, image_url,
+              COALESCE(is_service, false) AS is_service,
+              COALESCE(is_available, true) AS is_available
        FROM products
        WHERE tenant_id = $1
          AND ($4::bigint IS NULL OR branch_id = $4)
@@ -124,7 +133,9 @@ const getQrMenu = async (req, res) => {
     let rows = result.rows || [];
     if (rows.length === 0) {
       const fallbackResult = await pool.query(
-        `SELECT id, name, category, product_type, price, stock, image_url, COALESCE(is_service, false) AS is_service
+        `SELECT id, name, category, product_type, price, stock, image_url,
+          COALESCE(is_service, false) AS is_service,
+          COALESCE(is_available, true) AS is_available
          FROM products
          WHERE tenant_id = $1
            AND ($2::bigint IS NULL OR branch_id = $2)
@@ -212,7 +223,8 @@ const getQrMenu = async (req, res) => {
         categoryId,
         categoryName,
         price: Number(row.price || 0),
-        isAvailable: Number(row.stock || 0) > 0 || row.is_service === true,
+        is_available: row.is_available !== false,
+        isAvailable: row.is_available !== false && (Number(row.stock || 0) > 0 || row.is_service === true),
         stock: Number(row.stock || 0),
         imageUrl: row.image_url || null,
         sortOrder: 0,
@@ -249,7 +261,7 @@ const createQrOrder = async (req, res) => {
     const tenantId = parseTenantId(req.body.tenantId || req.body.tenant_id);
     const tableId = parseTableId(req.body.tableId || req.body.table_id);
     const branchId = parseOptionalBranchId(req.body.branchId || req.body.branch_id);
-    const items = parseOrderItems(req.body.items);
+    const items = parseOrderItems(req.body.items ?? req.body.orderItems);
     const customerName = (req.body.customerName || req.body.customer_name || 'Guest').toString().trim() || 'Guest';
 
     await client.query('BEGIN');
@@ -271,7 +283,10 @@ const createQrOrder = async (req, res) => {
 
     const productIds = items.map((item) => item.productId);
     const productsResult = await client.query(
-      `SELECT id, name, price, COALESCE(is_service, false) AS is_service, COALESCE(stock, 0) AS stock
+            `SELECT id, name, price,
+              COALESCE(is_service, false) AS is_service,
+              COALESCE(is_available, true) AS is_available,
+              COALESCE(stock, 0) AS stock
        FROM products
        WHERE tenant_id = $1
          AND id = ANY($2::text[])
@@ -292,6 +307,12 @@ const createQrOrder = async (req, res) => {
       }
 
       const isService = product.is_service === true;
+      const isAvailable = product.is_available !== false;
+      if (!isAvailable) {
+        const error = new Error(`Produk sedang habis/tidak tersedia: ${product.name}`);
+        error.statusCode = 400;
+        throw error;
+      }
       const availableStock = Number(product.stock || 0);
       if (!isService && availableStock < item.qty) {
         const error = new Error(`Stok tidak cukup untuk produk ${product.name}`);

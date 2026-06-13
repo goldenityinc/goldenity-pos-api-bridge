@@ -37,6 +37,23 @@ const normalizeLastSyncDate = (value) => {
   return parsed.toISOString();
 };
 
+const normalizeProductAvailability = (product) => {
+  if (!product || typeof product !== 'object') {
+    return product;
+  }
+
+  const availabilityRaw = product.is_available ?? product.isAvailable;
+  const availability = availabilityRaw === undefined || availabilityRaw === null
+    ? true
+    : Boolean(availabilityRaw);
+
+  return {
+    ...product,
+    is_available: availability,
+    isAvailable: availability,
+  };
+};
+
 const resolveProductsSyncExpressions = async (tenantDb) => {
   const columns = await getTableColumnSet(tenantDb, 'products');
   const hasUpdatedAt = columns.has('updated_at');
@@ -128,7 +145,7 @@ const getProducts = async (req, res) => {
       dataValues,
     );
 
-    const rows = rowsResult.rows || [];
+    const rows = (rowsResult.rows || []).map((row) => normalizeProductAvailability(row));
     return res.status(200).json({
       success: true,
       message: 'Success',
@@ -201,7 +218,7 @@ const reduceStock = async (req, res) => {
       [newStock, productId, tenantId],
     );
 
-    const updatedProduct = updateResult.rows[0] || null;
+    const updatedProduct = normalizeProductAvailability(updateResult.rows[0] || null);
     emitInventoryUpdated(req, updatedProduct, {
       reason,
       source: 'products_reduce_stock',
