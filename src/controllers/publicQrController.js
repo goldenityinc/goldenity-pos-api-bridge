@@ -126,6 +126,8 @@ const getQrMenu = async (req, res) => {
     const pool = getSharedPool();
     const productColumns = await getTableColumnSet(pool, 'products');
     const softDeletePredicate = resolveSoftDeletePredicate(productColumns);
+    const categoryColumns = await getTableColumnSet(pool, 'categories');
+    const categorySoftDeletePredicate = resolveSoftDeletePredicate(categoryColumns);
 
     const result = await pool.query(
             `SELECT id, name, category, product_type, price, stock, image_url,
@@ -134,11 +136,7 @@ const getQrMenu = async (req, res) => {
        FROM products
        WHERE tenant_id = $1
          AND ${softDeletePredicate}
-         AND (
-           $3::bigint IS NULL
-           OR branch_id = $3
-           OR branch_id IS NULL
-         )
+         AND ($3::bigint IS NULL OR branch_id = $3 OR branch_id IS NULL)
          AND COALESCE(is_active, true) = true
          AND (
            UPPER(COALESCE(product_type, '')) = ANY($2::text[])
@@ -160,11 +158,7 @@ const getQrMenu = async (req, res) => {
          FROM products
          WHERE tenant_id = $1
            AND ${softDeletePredicate}
-           AND (
-             $2::bigint IS NULL
-             OR branch_id = $2
-             OR branch_id IS NULL
-           )
+           AND ($2::bigint IS NULL OR branch_id = $2 OR branch_id IS NULL)
            AND COALESCE(is_active, true) = true
            AND (
              COALESCE(is_service, false) = true
@@ -174,6 +168,23 @@ const getQrMenu = async (req, res) => {
         [tenantId, branchId],
       );
       rows = fallbackResult.rows || [];
+    }
+
+    let categoryRows = [];
+    try {
+      const categoriesResult = await pool.query(
+        `SELECT id, name
+         FROM categories
+         WHERE tenant_id = $1
+           AND ${categorySoftDeletePredicate}
+           AND ($2::bigint IS NULL OR branch_id = $2 OR branch_id IS NULL)
+         ORDER BY name ASC`,
+        [tenantId, branchId],
+      );
+      categoryRows = categoriesResult.rows || [];
+    } catch (categoriesError) {
+      // Categories table can vary by deployment schema; fallback to deriving categories from products.
+      console.warn('[publicQrController] Categories lookup skipped:', categoriesError.message);
     }
 
     let tenantMeta = null;
@@ -232,6 +243,24 @@ const getQrMenu = async (req, res) => {
     }
 
     const categoriesMap = new Map();
+    for (const categoryRow of categoryRows) {
+      const categoryIdRaw = (categoryRow.id ?? '').toString().trim();
+      const categoryName = (categoryRow.name || 'Menu').toString().trim() || 'Menu';
+      if (!categoryName) {
+        continue;
+      }
+
+      const categoryId =
+        categoryIdRaw || categoryName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      if (!categoriesMap.has(categoryId)) {
+        categoriesMap.set(categoryId, {
+          id: categoryId,
+          name: categoryName,
+          sortOrder: categoriesMap.size,
+        });
+      }
+    }
+
     const products = rows.map((row) => {
       const categoryName = (row.category || 'Menu').toString().trim() || 'Menu';
       const categoryId = categoryName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
