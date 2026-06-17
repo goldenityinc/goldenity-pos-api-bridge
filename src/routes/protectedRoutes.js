@@ -11,6 +11,7 @@ const pettyCashRoutes = require('./pettyCashRoutes');
 const roleRoutes = require('./roleRoutes');
 const serviceOrderRoutes = require('./serviceOrderRoutes');
 const branchesRoutes = require('./branchesRoutes');
+const auditLogsRoutes = require('./auditLogsRoutes');
 const { getTodayDashboardSummary } = require('../controllers/dashboardController');
 const { createCrudTableRoutes } = require('./crudTableRoutes');
 const {
@@ -37,6 +38,7 @@ router.use('/petty-cash', pettyCashRoutes);
 router.use('/api/service-orders', serviceOrderRoutes);
 router.use('/service-orders', serviceOrderRoutes);
 router.use('/branches', branchesRoutes);
+router.use('/v1/audit-logs', auditLogsRoutes);
 router.get('/dashboard/summary', getTodayDashboardSummary);
 router.use('/api/roles', roleRoutes);
 router.use('/roles', roleRoutes);
