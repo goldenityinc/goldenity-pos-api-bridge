@@ -26,7 +26,7 @@ const resolvePaymentState = (paymentMethod) => {
     return {
       paymentMethodLabel: 'Digital Payment',
       paymentStatus: 'PENDING_PAYMENT',
-      orderStatus: 'PENDING_PAYMENT',
+      orderStatus: 'PENDING',
     };
   }
 
@@ -370,7 +370,7 @@ const createQrOrder = async (req, res) => {
     await client.query('BEGIN');
 
     const tableResult = await client.query(
-      `SELECT id, status
+      `SELECT id, status, table_number
        FROM tables
        WHERE id = $1 AND tenant_id = $2
        LIMIT 1
@@ -543,6 +543,16 @@ const createQrOrder = async (req, res) => {
     );
 
     await client.query('COMMIT');
+
+    const totalItems = normalizedItems.reduce((sum, item) => sum + (Number(item.qty || 0) || 0), 0);
+    const tableLabel = (tableResult.rows?.[0]?.table_number || '').toString().trim();
+
+    emitToTenant(tenantId, 'incoming_qr_order', {
+      orderId: sale.id,
+      tableName: tableLabel || String(tableId),
+      totalItems,
+      grandTotal: Number(sale.total_amount || 0),
+    });
 
     emitToTenant(tenantId, 'qr_order_payment_status', {
       tenantId,

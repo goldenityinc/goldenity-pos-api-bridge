@@ -619,6 +619,7 @@ const BRIDGE_ORDER_STATUS_VALUES = new Set([
   'PENDING_PAYMENT',
   'PREPARING',
   'READY_FOR_PICKUP',
+  'PAID',
   'COMPLETED',
   'CANCELLED',
 ]);
@@ -652,7 +653,7 @@ const normalizeSalesRecordPayload = (payload = {}) => {
     if (!BRIDGE_ORDER_STATUS_VALUES.has(normalizedOrderStatus)) {
       throw createHttpError(
         400,
-        `Invalid enum value. Expected 'PENDING' | 'PENDING_PAYMENT' | 'PREPARING' | 'READY_FOR_PICKUP' | 'COMPLETED' | 'CANCELLED', received '${rawOrderStatus}'`,
+        `Invalid enum value. Expected 'PENDING' | 'PENDING_PAYMENT' | 'PREPARING' | 'READY_FOR_PICKUP' | 'PAID' | 'COMPLETED' | 'CANCELLED', received '${rawOrderStatus}'`,
       );
     }
     next.order_status = normalizedOrderStatus;
