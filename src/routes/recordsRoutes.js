@@ -32,6 +32,7 @@ router.post('/sales_records/:id/cancel', cancelTransaction);
 router.get('/:table', listRecords);
 router.post('/:table', maybeExpenseAttachmentUpload, createRecords);
 router.post('/:table/upsert', upsertRecords);
+router.patch('/:table/:id', maybeExpenseAttachmentUpload, updateRecordById);
 router.put('/:table/:id', maybeExpenseAttachmentUpload, updateRecordById);
 router.delete('/:table/:id', deleteRecordById);
 

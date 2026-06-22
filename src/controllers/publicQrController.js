@@ -362,6 +362,15 @@ const createQrOrder = async (req, res) => {
     const branchId = parseOptionalBranchId(req.body.branchId || req.body.branch_id);
     const items = parseOrderItems(req.body.items ?? req.body.orderItems);
     const customerName = (req.body.customerName || req.body.customer_name || 'Guest').toString().trim() || 'Guest';
+    const orderNote = (
+      req.body.orderNote ??
+      req.body.order_note ??
+      req.body.customerNote ??
+      req.body.customer_note ??
+      req.body.note ??
+      req.body.notes ??
+      ''
+    ).toString().trim();
     const paymentMethod = normalizePaymentMethod(
       req.body.paymentMethod || req.body.payment_method,
     );
@@ -548,10 +557,41 @@ const createQrOrder = async (req, res) => {
     const tableLabel = (tableResult.rows?.[0]?.table_number || '').toString().trim();
 
     emitToTenant(tenantId, 'incoming_qr_order', {
+      tenantId,
       orderId: sale.id,
+      referenceId: sale.reference_id,
+      receiptNumber: sale.receipt_number,
+      tableId,
       tableName: tableLabel || String(tableId),
+      orderType: 'DINE_IN',
+      orderStatus: sale.order_status,
+      paymentStatus: sale.payment_status,
+      paymentMethod: sale.payment_method,
+      customerName,
+      orderNote,
       totalItems,
       grandTotal: Number(sale.total_amount || 0),
+      items: normalizedItems.map((item) => ({
+        product_id: item.productId,
+        product_name: item.productName,
+        qty: Number(item.qty || 0) || 0,
+        custom_price: Number(item.customPrice || 0) || 0,
+        note: item.note || '',
+        item_note: item.note || '',
+        notes: item.note || '',
+        is_service: item.isService === true,
+      })),
+      items_json: normalizedItems.map((item) => ({
+        product_id: item.productId,
+        product_name: item.productName,
+        qty: Number(item.qty || 0) || 0,
+        custom_price: Number(item.customPrice || 0) || 0,
+        note: item.note || '',
+        item_note: item.note || '',
+        notes: item.note || '',
+        is_service: item.isService === true,
+      })),
+      created_at: new Date().toISOString(),
     });
 
     emitToTenant(tenantId, 'qr_order_payment_status', {
