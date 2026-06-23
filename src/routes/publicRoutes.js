@@ -2,6 +2,7 @@ const express = require('express');
 const { healthCheck } = require('../controllers/healthController');
 const { login } = require('../controllers/authController');
 const imageProxyRoutes = require('./imageProxyRoutes');
+const settingsRoutes = require('./settingsRoutes');
 const {
 	getQrMenu,
 	createQrOrder,
@@ -13,6 +14,10 @@ const router = express.Router();
 
 router.get('/health', healthCheck);
 router.post('/auth/login', login);
+
+// Settings endpoint - used by Flutter app for Web Order URL configuration
+router.use('/api/v1/settings', settingsRoutes);
+
 router.get('/api/v1/qr-menu/:tenantId', getQrMenu);
 router.post('/api/v1/qr-orders', createQrOrder);
 router.post('/api/v1/qr-orders/checkout', checkoutQrOrder);

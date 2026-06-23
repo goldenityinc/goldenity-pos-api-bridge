@@ -46,9 +46,16 @@ const normalizeProductAvailability = (product) => {
   const availability = availabilityRaw === undefined || availabilityRaw === null
     ? true
     : Boolean(availabilityRaw);
+  const normalizedUnit = (product.unit ?? product.unit_name ?? product.unitName ?? 'pcs')
+    .toString()
+    .trim()
+    .toLowerCase() || 'pcs';
 
   return {
     ...product,
+    unit: normalizedUnit,
+    unit_name: normalizedUnit,
+    unitName: normalizedUnit,
     is_available: availability,
     isAvailable: availability,
   };

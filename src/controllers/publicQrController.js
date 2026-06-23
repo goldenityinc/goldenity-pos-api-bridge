@@ -174,7 +174,7 @@ const getQrMenu = async (req, res) => {
     const categorySoftDeletePredicate = resolveSoftDeletePredicate(categoryColumns);
 
     const result = await pool.query(
-            `SELECT id, name, category, product_type, price, stock, image_url,
+            `SELECT id, name, category, product_type, price, stock, image_url, unit,
               COALESCE(is_service, false) AS is_service,
               COALESCE(is_available, true) AS is_available
        FROM products
@@ -196,7 +196,7 @@ const getQrMenu = async (req, res) => {
     let rows = result.rows || [];
     if (rows.length === 0) {
       const fallbackResult = await pool.query(
-        `SELECT id, name, category, product_type, price, stock, image_url,
+        `SELECT id, name, category, product_type, price, stock, image_url, unit,
           COALESCE(is_service, false) AS is_service,
           COALESCE(is_available, true) AS is_available
          FROM products
@@ -321,6 +321,8 @@ const getQrMenu = async (req, res) => {
         name: row.name,
         categoryId,
         categoryName,
+        unit: (row.unit || 'pcs').toString().trim() || 'pcs',
+        unit_name: (row.unit || 'pcs').toString().trim() || 'pcs',
         price: Number(row.price || 0),
         is_available: row.is_available !== false,
         isAvailable: row.is_available !== false && (Number(row.stock || 0) > 0 || row.is_service === true),
@@ -344,6 +346,9 @@ const getQrMenu = async (req, res) => {
       categories: Array.from(categoriesMap.values()),
       products,
       items: products,
+      config: {
+        web_order_url: (process.env.WEB_ORDER_URL || 'https://pos-web-ordering-production.up.railway.app').toString().trim(),
+      },
     };
 
     return jsonOk(res, payload, 'QR menu berhasil dimuat');
