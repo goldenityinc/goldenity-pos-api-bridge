@@ -513,21 +513,6 @@ const createQrOrder = async (req, res) => {
       throw error;
     }
 
-    if (orderNote) {
-      try {
-        await client.query(
-          `UPDATE sales_records
-           SET special_note = $1,
-               updated_at = NOW()
-           WHERE tenant_id = $2
-             AND id = $3`,
-          [orderNote, tenantId, sale.id],
-        );
-      } catch (_) {
-        // Backward compatible when sales_records.special_note is not available yet.
-      }
-    }
-
     for (const item of normalizedItems) {
       await client.query(
         `INSERT INTO sales_record_items (
@@ -574,6 +559,23 @@ const createQrOrder = async (req, res) => {
     );
 
     await client.query('COMMIT');
+
+    // Keep order-note persistence best-effort and outside transaction.
+    // A failed statement inside transaction marks PostgreSQL tx as aborted.
+    if (orderNote) {
+      try {
+        await client.query(
+          `UPDATE sales_records
+           SET special_note = $1,
+               updated_at = NOW()
+           WHERE tenant_id = $2
+             AND id = $3`,
+          [orderNote, tenantId, sale.id],
+        );
+      } catch (_) {
+        // Backward compatible when sales_records.special_note is not available yet.
+      }
+    }
 
     const totalItems = normalizedItems.reduce((sum, item) => sum + (Number(item.qty || 0) || 0), 0);
     const tableLabel = (tableResult.rows?.[0]?.table_number || '').toString().trim();
