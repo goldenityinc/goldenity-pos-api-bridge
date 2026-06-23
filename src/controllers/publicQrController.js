@@ -382,6 +382,22 @@ const createQrOrder = async (req, res) => {
       req.body.paymentMethod || req.body.payment_method,
     );
     const paymentState = resolvePaymentState(paymentMethod);
+    let branchMeta = null;
+
+    if (branchId !== null) {
+      try {
+        const branchResult = await client.query(
+          `SELECT id, name, branch_code
+           FROM branches
+           WHERE tenant_id = $1 AND id = $2
+           LIMIT 1`,
+          [tenantId, branchId],
+        );
+        branchMeta = branchResult.rows?.[0] || null;
+      } catch (branchError) {
+        console.warn('[publicQrController] Branch lookup skipped:', branchError.message);
+      }
+    }
 
     await client.query('BEGIN');
 
@@ -585,9 +601,14 @@ const createQrOrder = async (req, res) => {
       orderId: sale.id,
       referenceId: sale.reference_id,
       receiptNumber: sale.receipt_number,
+      branchId,
+      branchName: (branchMeta?.name || '').toString().trim() || null,
+      branchCode: (branchMeta?.branch_code || '').toString().trim() || null,
       tableId,
       tableName: tableLabel || String(tableId),
+      table_number: tableLabel || null,
       orderType: 'DINE_IN',
+      order_type: 'DINE_IN',
       orderStatus: sale.order_status,
       paymentStatus: sale.payment_status,
       paymentMethod: sale.payment_method,
@@ -631,7 +652,22 @@ const createQrOrder = async (req, res) => {
       updatedAt: new Date().toISOString(),
     });
 
-    return jsonOk(res, sale, 'Pesanan QR berhasil dibuat', 201);
+    return jsonOk(
+      res,
+      {
+        ...sale,
+        table_id: tableId,
+        table_number: tableLabel || null,
+        order_type: 'DINE_IN',
+        special_note: orderNote || null,
+        order_note: orderNote || null,
+        branch_id: branchId,
+        branch_name: (branchMeta?.name || '').toString().trim() || null,
+        branch_code: (branchMeta?.branch_code || '').toString().trim() || null,
+      },
+      'Pesanan QR berhasil dibuat',
+      201,
+    );
   } catch (error) {
     await client.query('ROLLBACK');
     return jsonError(res, error.statusCode || 500, error.message || 'Internal server error', error.message);
@@ -660,7 +696,15 @@ const checkoutQrOrder = async (req, res) => {
     await client.query('BEGIN');
 
     const lookup = await client.query(
-      `SELECT id, reference_id, receipt_number, payment_status, order_status, total_amount
+      `SELECT id, reference_id, receipt_number,
+              payment_status, order_status, payment_method,
+              total_amount, total_price,
+              branch_id,
+              table_id,
+              table_number,
+              order_type,
+              customer_name,
+              special_note
        FROM sales_records
        WHERE tenant_id = $1
          AND ($2::bigint IS NULL OR branch_id = $2)
@@ -689,7 +733,15 @@ const checkoutQrOrder = async (req, res) => {
            updated_at = NOW()
        WHERE tenant_id = $4
          AND id = $5
-       RETURNING id, reference_id, receipt_number, payment_method, payment_status, order_status, total_amount`,
+       RETURNING id, reference_id, receipt_number,
+                 payment_method, payment_status, order_status,
+                 total_amount, total_price,
+                 branch_id,
+                 table_id,
+                 table_number,
+                 order_type,
+                 customer_name,
+                 special_note`,
       [
         paymentState.paymentMethodLabel,
         paymentState.paymentStatus,
@@ -705,6 +757,8 @@ const checkoutQrOrder = async (req, res) => {
     const responsePayload = {
       ...updated,
       payment_method_code: paymentMethod,
+      order_note: (updated.special_note || '').toString().trim() || null,
+      specialNote: (updated.special_note || '').toString().trim() || null,
       paymentGateway: paymentMethod === PAYMENT_METHOD_DIGITAL
         ? {
             mode: 'HYBRID',
@@ -719,6 +773,12 @@ const checkoutQrOrder = async (req, res) => {
       orderId: updated.id,
       referenceId: updated.reference_id,
       receiptNumber: updated.receipt_number,
+      branchId: updated.branch_id ?? null,
+      tableId: updated.table_id ?? null,
+      table_number: (updated.table_number || '').toString().trim() || null,
+      orderType: (updated.order_type || '').toString().trim() || null,
+      orderNote: (updated.special_note || '').toString().trim() || null,
+      special_note: (updated.special_note || '').toString().trim() || null,
       paymentMethod,
       paymentStatus: updated.payment_status,
       orderStatus: updated.order_status,
