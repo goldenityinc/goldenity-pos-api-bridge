@@ -370,6 +370,8 @@ const createQrOrder = async (req, res) => {
     const orderNote = (
       req.body.orderNote ??
       req.body.order_note ??
+      req.body.special_note ??
+      req.body.specialNote ??
       req.body.customerNote ??
       req.body.customer_note ??
       req.body.note ??
@@ -511,6 +513,21 @@ const createQrOrder = async (req, res) => {
       throw error;
     }
 
+    if (orderNote) {
+      try {
+        await client.query(
+          `UPDATE sales_records
+           SET special_note = $1,
+               updated_at = NOW()
+           WHERE tenant_id = $2
+             AND id = $3`,
+          [orderNote, tenantId, sale.id],
+        );
+      } catch (_) {
+        // Backward compatible when sales_records.special_note is not available yet.
+      }
+    }
+
     for (const item of normalizedItems) {
       await client.query(
         `INSERT INTO sales_record_items (
@@ -574,6 +591,8 @@ const createQrOrder = async (req, res) => {
       paymentMethod: sale.payment_method,
       customerName,
       orderNote,
+      special_note: orderNote || null,
+      specialNote: orderNote || null,
       totalItems,
       grandTotal: Number(sale.total_amount || 0),
       items: normalizedItems.map((item) => ({

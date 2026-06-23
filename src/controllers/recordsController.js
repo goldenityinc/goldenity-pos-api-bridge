@@ -1274,7 +1274,7 @@ const listRecords = async (req, res) => {
         ...req.query,
         select: ensureSelectedColumns(
           ensureSelectedColumn(req.query?.select, primaryKeyColumn),
-          ['status', 'order_status', 'is_void'],
+          ['status', 'order_status', 'is_void', 'order_note', 'special_note'],
           salesColumns,
         ),
       };
@@ -1365,12 +1365,25 @@ const listRecords = async (req, res) => {
           const rawTableNumber = (row?.table_number ?? row?.tableNumber ?? '').toString().trim();
           const resolvedTableNumber = rawTableNumber || tableNumberMap.get(resolvedTableId) || '';
           const rawOrderType = (row?.order_type ?? row?.orderType ?? '').toString().trim();
+          const resolvedSpecialNote = (
+            row?.special_note ??
+            row?.specialNote ??
+            row?.order_note ??
+            row?.orderNote ??
+            row?.order_notes ??
+            row?.note ??
+            row?.notes ??
+            ''
+          ).toString().trim();
 
           return {
             ...row,
             table_id: resolvedTableId || (row?.table_id ?? row?.tableId ?? null),
             table_number: resolvedTableNumber || null,
             order_type: rawOrderType || null,
+            special_note: resolvedSpecialNote,
+            specialNote: resolvedSpecialNote,
+            order_note: resolvedSpecialNote,
             status: canonicalStatus,
             order_status: isVoid
               ? 'CANCELLED'
