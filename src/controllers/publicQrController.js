@@ -65,12 +65,12 @@ const resolvePaymentState = (paymentMethod) => {
 const resolveWebhookPaymentState = (value) => {
   const normalized = (value || '').toString().trim().toUpperCase();
   if (['PAID', 'SETTLED', 'SETTLEMENT', 'SUCCESS'].includes(normalized)) {
-    return { paymentStatus: 'PAID', orderStatus: 'PAID' };
+    return { paymentStatus: 'PAID', orderStatus: 'PREPARING' };
   }
   if (['FAILED', 'EXPIRED', 'CANCELLED', 'CANCELED', 'DENIED'].includes(normalized)) {
-    return { paymentStatus: 'FAILED', orderStatus: 'PAYMENT_FAILED' };
+    return { paymentStatus: 'FAILED', orderStatus: 'CANCELLED' };
   }
-  return { paymentStatus: 'PENDING_PAYMENT', orderStatus: 'PENDING_PAYMENT' };
+  return { paymentStatus: 'PENDING_PAYMENT', orderStatus: 'PENDING' };
 };
 
 const parseTenantId = (value) => {
@@ -701,7 +701,7 @@ const createQrOrder = async (req, res) => {
       paymentState = {
         paymentMethodLabel: 'QRIS',
         paymentStatus: 'PAID',
-        orderStatus: 'PAID',
+        orderStatus: 'PREPARING',
       };
     }
 
