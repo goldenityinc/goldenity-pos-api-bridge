@@ -885,9 +885,19 @@ const createQrOrder = async (req, res) => {
       orderId: sale.id,
       referenceId: sale.reference_id,
       receiptNumber: sale.receipt_number,
+      branchId: branchId,
+      tableId: tableId,
+      table_number: tableLabel || null,
+      orderType: 'DINE_IN',
+      orderNote: orderNote || null,
+      special_note: orderNote || null,
       paymentMethod,
       paymentStatus: sale.payment_status,
       orderStatus: sale.order_status,
+      paymentProofUrl: paymentProofUrl,
+      payment_proof_url: paymentProofUrl,
+      totalItems,
+      grandTotal: Number(sale.total_amount || 0),
       updatedAt: new Date().toISOString(),
     });
 
@@ -1058,7 +1068,15 @@ const handlePaymentWebhook = async (req, res) => {
     await client.query('BEGIN');
 
     const lookup = await client.query(
-      `SELECT id, reference_id, receipt_number, total_amount
+      `SELECT id, reference_id, receipt_number,
+              payment_method, payment_status, order_status,
+              payment_proof_url,
+              total_amount,
+              branch_id,
+              table_id,
+              table_number,
+              order_type,
+              special_note
        FROM sales_records
        WHERE tenant_id = $1
          AND (
@@ -1089,7 +1107,15 @@ const handlePaymentWebhook = async (req, res) => {
            updated_at = NOW()
        WHERE tenant_id = $4
          AND id = $5
-       RETURNING id, reference_id, receipt_number, payment_status, order_status, amount_paid, total_amount`,
+       RETURNING id, reference_id, receipt_number,
+                 payment_method, payment_status, order_status,
+                 payment_proof_url,
+                 amount_paid, total_amount,
+                 branch_id,
+                 table_id,
+                 table_number,
+                 order_type,
+                 special_note`,
       [paymentState.paymentStatus, paymentState.orderStatus, safePaidAmount, tenantId, sale.id],
     );
 
@@ -1102,9 +1128,19 @@ const handlePaymentWebhook = async (req, res) => {
       orderId: updated.id,
       referenceId: updated.reference_id,
       receiptNumber: updated.receipt_number,
+      branchId: updated.branch_id ?? null,
+      tableId: updated.table_id ?? null,
+      table_number: (updated.table_number || '').toString().trim() || null,
+      orderType: (updated.order_type || '').toString().trim() || null,
+      orderNote: (updated.special_note || '').toString().trim() || null,
+      special_note: (updated.special_note || '').toString().trim() || null,
+      paymentMethod: (updated.payment_method || '').toString().trim() || null,
       paymentStatus: updated.payment_status,
       orderStatus: updated.order_status,
+      paymentProofUrl: (updated.payment_proof_url || '').toString().trim() || null,
+      payment_proof_url: (updated.payment_proof_url || '').toString().trim() || null,
       amountPaid: updated.amount_paid,
+      grandTotal: Number(updated.total_amount || 0),
       updatedAt: new Date().toISOString(),
       source: 'payment_webhook',
     });
