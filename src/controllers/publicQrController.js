@@ -1,18 +1,35 @@
 const { jsonOk, jsonError } = require('../utils/http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 const { getSharedPool } = require('../middlewares/tenantResolver');
 const { normalizeTenantId, getTableColumnSet } = require('../utils/sqlHelpers');
 const { emitToTenant } = require('../services/socketServer');
+const { uploadBase64Object } = require('../services/objectStorageService');
+const { validatePaymentProof } = require('../utils/receiptScanner');
 
 const FNB_PRODUCT_TYPES = new Set(['FOOD', 'BEVERAGE', 'FNB', 'F&B', 'MENU']);
 const PAYMENT_METHOD_CASHIER = 'CASHIER';
 const PAYMENT_METHOD_DIGITAL = 'DIGITAL_PAYMENT';
+const PAYMENT_METHOD_QRIS = 'QRIS';
+const LOCAL_PAYMENT_PROOF_DIR = path.join(process.cwd(), 'public', 'uploads', 'proofs');
+const PAYMENT_PROOF_BUCKET =
+  (process.env.PAYMENT_PROOF_BUCKET || 'payment-proofs').toString().trim() || 'payment-proofs';
+const IMAGE_MIME_TO_EXTENSION = {
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
 
 const normalizePaymentMethod = (value) => {
   const normalized = (value || '').toString().trim().toUpperCase();
+  if (normalized === 'QRIS') {
+    return PAYMENT_METHOD_QRIS;
+  }
   if (
     normalized === 'DIGITAL' ||
     normalized === 'DIGITAL_PAYMENT' ||
-    normalized === 'QRIS' ||
     normalized === 'E_WALLET' ||
     normalized === 'EWALLET'
   ) {
@@ -22,6 +39,14 @@ const normalizePaymentMethod = (value) => {
 };
 
 const resolvePaymentState = (paymentMethod) => {
+  if (paymentMethod === PAYMENT_METHOD_QRIS) {
+    return {
+      paymentMethodLabel: 'QRIS',
+      paymentStatus: 'PENDING_PAYMENT',
+      orderStatus: 'PENDING',
+    };
+  }
+
   if (paymentMethod === PAYMENT_METHOD_DIGITAL) {
     return {
       paymentMethodLabel: 'Digital Payment',
@@ -135,6 +160,176 @@ const parseOrderItems = (items) => {
       customPrice,
     };
   });
+};
+
+const parseRawItems = (rawItems) => {
+  if (Array.isArray(rawItems)) {
+    return rawItems;
+  }
+
+  if (typeof rawItems === 'string') {
+    const trimmed = rawItems.trim();
+    if (!trimmed) {
+      const error = new Error('items wajib diisi minimal 1 item');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!Array.isArray(parsed)) {
+        const error = new Error('items harus berupa array');
+        error.statusCode = 400;
+        throw error;
+      }
+      return parsed;
+    } catch (_) {
+      const error = new Error('items multipart harus berupa JSON array yang valid');
+      error.statusCode = 400;
+      throw error;
+    }
+  }
+
+  return rawItems;
+};
+
+const sanitizePaymentProofMimeType = (mimeType) => {
+  const normalized = (mimeType || '').toString().trim().toLowerCase();
+  if (!IMAGE_MIME_TO_EXTENSION[normalized]) {
+    const error = new Error('Bukti pembayaran wajib berupa gambar (jpg, png, webp)');
+    error.statusCode = 400;
+    throw error;
+  }
+  return normalized;
+};
+
+const parsePaymentProofBase64 = (rawValue) => {
+  const value = (rawValue || '').toString().trim();
+  if (!value) {
+    return null;
+  }
+
+  let mimeType = 'image/jpeg';
+  let payload = value;
+  const dataUriMatch = value.match(/^data:([^;]+);base64,(.+)$/i);
+  if (dataUriMatch) {
+    mimeType = dataUriMatch[1].trim().toLowerCase();
+    payload = dataUriMatch[2].trim();
+  }
+
+  const normalizedMimeType = sanitizePaymentProofMimeType(mimeType);
+  const buffer = Buffer.from(payload, 'base64');
+  if (!buffer.length) {
+    const error = new Error('Konten bukti pembayaran kosong');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return {
+    buffer,
+    mimeType: normalizedMimeType,
+    base64Data: payload,
+  };
+};
+
+const buildPaymentProofFileName = ({ tenantId, extension }) => {
+  const safeTenant = (tenantId || 'tenant').toString().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32) || 'tenant';
+  const stamp = Date.now();
+  const random = crypto.randomBytes(6).toString('hex');
+  return `proof-${safeTenant}-${stamp}-${random}.${extension}`;
+};
+
+const savePaymentProofLocally = async ({ tenantId, buffer, mimeType, req }) => {
+  const extension = IMAGE_MIME_TO_EXTENSION[mimeType];
+  const fileName = buildPaymentProofFileName({ tenantId, extension });
+  await fs.promises.mkdir(LOCAL_PAYMENT_PROOF_DIR, { recursive: true });
+  const targetPath = path.join(LOCAL_PAYMENT_PROOF_DIR, fileName);
+  await fs.promises.writeFile(targetPath, buffer);
+  const relativePath = `/uploads/proofs/${fileName}`;
+  const host = (req?.get && req.get('host')) ? req.get('host') : '';
+  if (!host) {
+    return relativePath;
+  }
+  const protocol = (req.protocol || 'https').toString();
+  return `${protocol}://${host}${relativePath}`;
+};
+
+const uploadPaymentProof = async ({ tenantId, buffer, mimeType, req }) => {
+  const extension = IMAGE_MIME_TO_EXTENSION[mimeType];
+  const fileName = buildPaymentProofFileName({ tenantId, extension });
+  const base64 = buffer.toString('base64');
+
+  try {
+    const uploaded = await uploadBase64Object({
+      bucket: PAYMENT_PROOF_BUCKET,
+      fileName,
+      base64,
+      contentType: mimeType,
+    });
+    const remoteUrl = (uploaded?.url || '').toString().trim();
+    if (remoteUrl) {
+      return remoteUrl;
+    }
+  } catch (_) {
+    // Fallback to local file storage when object storage is not configured.
+  }
+
+  return savePaymentProofLocally({ tenantId, buffer, mimeType, req });
+};
+
+const resolvePaymentProofPayload = ({ req }) => {
+  const directUrlRaw =
+    req.body.paymentProofUrl ??
+    req.body.payment_proof_url ??
+    req.body.proof_url ??
+    req.body.proofUrl ??
+    null;
+  const directUrl = (directUrlRaw || '').toString().trim();
+  if (directUrl) {
+    return {
+      paymentProofUrl: directUrl,
+      uploadBuffer: null,
+      uploadMimeType: null,
+      base64DataForValidation: null,
+    };
+  }
+
+  if (req.file?.buffer?.length) {
+    const mimeType = sanitizePaymentProofMimeType(req.file.mimetype);
+    return {
+      paymentProofUrl: null,
+      uploadBuffer: req.file.buffer,
+      uploadMimeType: mimeType,
+      base64DataForValidation: null,
+    };
+  }
+
+  const encodedProofRaw = req.body.payment_proof ?? req.body.paymentProof ?? null;
+  if (!encodedProofRaw) {
+    return {
+      paymentProofUrl: null,
+      uploadBuffer: null,
+      uploadMimeType: null,
+      base64DataForValidation: null,
+    };
+  }
+
+  const parsed = parsePaymentProofBase64(encodedProofRaw);
+  if (!parsed) {
+    return {
+      paymentProofUrl: null,
+      uploadBuffer: null,
+      uploadMimeType: null,
+      base64DataForValidation: null,
+    };
+  }
+
+  return {
+    paymentProofUrl: null,
+    uploadBuffer: parsed.buffer,
+    uploadMimeType: parsed.mimeType,
+    base64DataForValidation: parsed.base64Data,
+  };
 };
 
 const generateReceiptNumber = () => {
@@ -365,7 +560,8 @@ const createQrOrder = async (req, res) => {
     const tenantId = parseTenantId(req.body.tenantId || req.body.tenant_id);
     const tableId = parseTableId(req.body.tableId || req.body.table_id);
     const branchId = parseOptionalBranchId(req.body.branchId || req.body.branch_id);
-    const items = parseOrderItems(req.body.items ?? req.body.orderItems);
+    const rawItems = parseRawItems(req.body.items ?? req.body.orderItems);
+    const items = parseOrderItems(rawItems);
     const customerName = (req.body.customerName || req.body.customer_name || 'Guest').toString().trim() || 'Guest';
     const orderNote = (
       req.body.orderNote ??
@@ -381,7 +577,9 @@ const createQrOrder = async (req, res) => {
     const paymentMethod = normalizePaymentMethod(
       req.body.paymentMethod || req.body.payment_method,
     );
-    const paymentState = resolvePaymentState(paymentMethod);
+    const paymentProofPayload = resolvePaymentProofPayload({ req });
+    let paymentProofUrl = paymentProofPayload.paymentProofUrl || null;
+    let paymentState = resolvePaymentState(paymentMethod);
     let branchMeta = null;
 
     if (branchId !== null) {
@@ -474,13 +672,49 @@ const createQrOrder = async (req, res) => {
       };
     });
 
+    if (paymentMethod === PAYMENT_METHOD_QRIS && paymentProofPayload.base64DataForValidation) {
+      const validation = await validatePaymentProof(
+        paymentProofPayload.base64DataForValidation,
+        paymentProofPayload.uploadMimeType || 'image/jpeg',
+        totalAmount,
+      );
+
+      if (!validation?.isValid) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          success: false,
+          error: validation?.reason || 'Bukti pembayaran tidak valid.',
+        });
+      }
+    }
+
+    if (!paymentProofUrl && paymentProofPayload.uploadBuffer && paymentProofPayload.uploadMimeType) {
+      paymentProofUrl = await uploadPaymentProof({
+        tenantId,
+        buffer: paymentProofPayload.uploadBuffer,
+        mimeType: paymentProofPayload.uploadMimeType,
+        req,
+      });
+    }
+
+    if (paymentMethod === PAYMENT_METHOD_QRIS && paymentProofUrl) {
+      paymentState = {
+        paymentMethodLabel: 'QRIS',
+        paymentStatus: 'PAID',
+        orderStatus: 'PAID',
+      };
+    }
+
     const referenceId = `qr_${Date.now()}`;
     const receiptNumber = generateReceiptNumber();
+
+    const salesRecordColumns = await getTableColumnSet(client, 'sales_records');
+    const supportsPaymentProofUrl = salesRecordColumns.has('payment_proof_url');
 
     const saleInsert = await client.query(
       `INSERT INTO sales_records (
          tenant_id,
-        branch_id,
+         branch_id,
          table_id,
          reference_id,
          receipt_number,
@@ -494,15 +728,17 @@ const createQrOrder = async (req, res) => {
          cashier_name,
          items_json,
          amount_paid,
+         ${supportsPaymentProofUrl ? 'payment_proof_url,' : ''}
          created_at,
          updated_at
        )
        VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9,
          $10, $11, $12, $13, $14::jsonb, $15,
+         ${supportsPaymentProofUrl ? '$16,' : ''}
          NOW(), NOW()
        )
-       RETURNING id, reference_id, receipt_number, cashier_name, order_status, payment_status, payment_method, total_amount`,
+       RETURNING id, reference_id, receipt_number, cashier_name, order_status, payment_status, payment_method, total_amount${supportsPaymentProofUrl ? ', payment_proof_url' : ''}`,
       [
         tenantId,
         branchId,
@@ -518,7 +754,8 @@ const createQrOrder = async (req, res) => {
         customerName,
         'Online Order',
         JSON.stringify(normalizedItems),
-        0,
+        paymentState.paymentStatus === 'PAID' ? totalAmount : 0,
+        ...(supportsPaymentProofUrl ? [paymentProofUrl] : []),
       ],
     );
 
@@ -612,6 +849,8 @@ const createQrOrder = async (req, res) => {
       orderStatus: sale.order_status,
       paymentStatus: sale.payment_status,
       paymentMethod: sale.payment_method,
+      paymentProofUrl: paymentProofUrl,
+      payment_proof_url: paymentProofUrl,
       customerName,
       orderNote,
       special_note: orderNote || null,
@@ -661,6 +900,7 @@ const createQrOrder = async (req, res) => {
         order_type: 'DINE_IN',
         special_note: orderNote || null,
         order_note: orderNote || null,
+        payment_proof_url: paymentProofUrl,
         branch_id: branchId,
         branch_name: (branchMeta?.name || '').toString().trim() || null,
         branch_code: (branchMeta?.branch_code || '').toString().trim() || null,
