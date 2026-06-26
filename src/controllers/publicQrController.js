@@ -830,7 +830,12 @@ const createQrOrder = async (req, res) => {
       };
     });
 
-    if (paymentMethod === PAYMENT_METHOD_QRIS && hasUploadedProofImage && validationBase64Data) {
+    if (
+      paymentMethod === PAYMENT_METHOD_QRIS &&
+      qrOrderSettings.isPaymentProofMandatory &&
+      hasUploadedProofImage &&
+      validationBase64Data
+    ) {
       const validation = await validatePaymentProof(
         validationBase64Data,
         paymentProofPayload.uploadMimeType || 'image/jpeg',
