@@ -350,10 +350,27 @@ const parseBooleanConfig = (value, fallback = true) => {
   return fallback;
 };
 
+const resolveValidationBase64Data = (paymentProofPayload) => {
+  if (!paymentProofPayload || typeof paymentProofPayload !== 'object') {
+    return null;
+  }
+
+  const direct = (paymentProofPayload.base64DataForValidation || '').toString().trim();
+  if (direct) {
+    return direct;
+  }
+
+  if (paymentProofPayload.uploadBuffer?.length) {
+    return paymentProofPayload.uploadBuffer.toString('base64');
+  }
+
+  return null;
+};
+
 const resolveQrOrderSettings = async ({ client, tenantId, branchId }) => {
   const defaults = {
     allowPayAtCashier: true,
-    enableQrisOcr: true,
+    isPaymentProofMandatory: true,
   };
 
   try {
@@ -363,7 +380,11 @@ const resolveQrOrderSettings = async ({ client, tenantId, branchId }) => {
     }
 
     const supportsBranch = columnSet.has('branch_id');
-    if (columnSet.has('allow_pay_at_cashier') || columnSet.has('enable_qris_ocr')) {
+    if (
+      columnSet.has('allow_pay_at_cashier') ||
+      columnSet.has('is_payment_proof_mandatory') ||
+      columnSet.has('enable_qris_ocr')
+    ) {
       const whereParts = ['tenant_id = $1'];
       const params = [tenantId];
       let branchParamIndex = 0;
@@ -388,7 +409,8 @@ const resolveQrOrderSettings = async ({ client, tenantId, branchId }) => {
       const wideResult = await client.query(
         `SELECT
            ${columnSet.has('allow_pay_at_cashier') ? 'allow_pay_at_cashier' : 'NULL::boolean'} AS allow_pay_at_cashier,
-           ${columnSet.has('enable_qris_ocr') ? 'enable_qris_ocr' : 'NULL::boolean'} AS enable_qris_ocr
+            ${columnSet.has('is_payment_proof_mandatory') ? 'is_payment_proof_mandatory' : 'NULL::boolean'} AS is_payment_proof_mandatory,
+            ${columnSet.has('enable_qris_ocr') ? 'enable_qris_ocr' : 'NULL::boolean'} AS enable_qris_ocr
          FROM store_settings
          WHERE ${whereParts.join(' AND ')}
          ORDER BY ${orderParts.length > 0 ? orderParts.join(', ') : 'id DESC'}
@@ -400,7 +422,10 @@ const resolveQrOrderSettings = async ({ client, tenantId, branchId }) => {
       if (row) {
         return {
           allowPayAtCashier: parseBooleanConfig(row.allow_pay_at_cashier, true),
-          enableQrisOcr: parseBooleanConfig(row.enable_qris_ocr, true),
+          isPaymentProofMandatory: parseBooleanConfig(
+            row.is_payment_proof_mandatory,
+            parseBooleanConfig(row.enable_qris_ocr, true),
+          ),
         };
       }
     }
@@ -419,7 +444,7 @@ const resolveQrOrderSettings = async ({ client, tenantId, branchId }) => {
          WHERE ${whereParts.join(' AND ')}
            AND key = ANY($${params.length + 1}::text[])
          ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST`,
-        [...params, ['allow_pay_at_cashier', 'enable_qris_ocr']],
+        [...params, ['allow_pay_at_cashier', 'is_payment_proof_mandatory', 'enable_qris_ocr']],
       );
 
       const resolved = { ...defaults };
@@ -427,8 +452,11 @@ const resolveQrOrderSettings = async ({ client, tenantId, branchId }) => {
         const key = (row.key || '').toString().trim();
         if (key === 'allow_pay_at_cashier') {
           resolved.allowPayAtCashier = parseBooleanConfig(row.value, resolved.allowPayAtCashier);
-        } else if (key === 'enable_qris_ocr') {
-          resolved.enableQrisOcr = parseBooleanConfig(row.value, resolved.enableQrisOcr);
+        } else if (key === 'is_payment_proof_mandatory' || key === 'enable_qris_ocr') {
+          resolved.isPaymentProofMandatory = parseBooleanConfig(
+            row.value,
+            resolved.isPaymentProofMandatory,
+          );
         }
       }
       return resolved;
@@ -691,6 +719,11 @@ const createQrOrder = async (req, res) => {
       branchId,
     });
     const paymentProofPayload = resolvePaymentProofPayload({ req });
+    const validationBase64Data = resolveValidationBase64Data(paymentProofPayload);
+    const hasUploadedProofImage = Boolean(validationBase64Data);
+    const hasPaymentProof =
+      hasUploadedProofImage ||
+      Boolean((paymentProofPayload.paymentProofUrl || '').toString().trim());
     let paymentProofUrl = paymentProofPayload.paymentProofUrl || null;
     let paymentState = resolvePaymentState(paymentMethod);
     let branchMeta = null;
@@ -712,6 +745,12 @@ const createQrOrder = async (req, res) => {
 
     if (paymentMethod === PAYMENT_METHOD_CASHIER && !qrOrderSettings.allowPayAtCashier) {
       const error = new Error('Pembayaran di kasir sedang dinonaktifkan untuk web ordering.');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    if (paymentMethod === PAYMENT_METHOD_QRIS && qrOrderSettings.isPaymentProofMandatory && !hasPaymentProof) {
+      const error = new Error('Upload bukti transfer QRIS wajib sebelum pesanan dikirim.');
       error.statusCode = 400;
       throw error;
     }
@@ -791,16 +830,22 @@ const createQrOrder = async (req, res) => {
       };
     });
 
-    if (
-      paymentMethod === PAYMENT_METHOD_QRIS &&
-      qrOrderSettings.enableQrisOcr &&
-      paymentProofPayload.base64DataForValidation
-    ) {
+    if (paymentMethod === PAYMENT_METHOD_QRIS && hasUploadedProofImage && validationBase64Data) {
       const validation = await validatePaymentProof(
-        paymentProofPayload.base64DataForValidation,
+        validationBase64Data,
         paymentProofPayload.uploadMimeType || 'image/jpeg',
         totalAmount,
       );
+
+      const detectedAmount = Number(validation?.transferredAmount);
+      if (Number.isFinite(detectedAmount) && detectedAmount < totalAmount) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          success: false,
+          error: `Nominal transfer (${Math.trunc(detectedAmount)}) lebih kecil dari total pesanan (${Math.trunc(totalAmount)}).`,
+          code: 'INSUFFICIENT_TRANSFER_AMOUNT',
+        });
+      }
 
       if (!validation?.isValid) {
         await client.query('ROLLBACK');
@@ -820,13 +865,7 @@ const createQrOrder = async (req, res) => {
       });
     }
 
-    if (paymentMethod === PAYMENT_METHOD_QRIS && !qrOrderSettings.enableQrisOcr) {
-      paymentState = {
-        paymentMethodLabel: 'QRIS',
-        paymentStatus: 'PAID',
-        orderStatus: 'PREPARING',
-      };
-    } else if (paymentMethod === PAYMENT_METHOD_QRIS && paymentProofUrl) {
+    if (paymentMethod === PAYMENT_METHOD_QRIS && paymentProofUrl) {
       paymentState = {
         paymentMethodLabel: 'QRIS',
         paymentStatus: 'PAID',

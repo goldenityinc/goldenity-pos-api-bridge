@@ -44,7 +44,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
       storeName: null,
       storeAddress: null,
       allowPayAtCashier: true,
-      enableQrisOcr: true,
+      isPaymentProofMandatory: true,
     };
   }
 
@@ -59,7 +59,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
         storeName: null,
         storeAddress: null,
         allowPayAtCashier: true,
-        enableQrisOcr: true,
+        isPaymentProofMandatory: true,
       };
     }
 
@@ -99,6 +99,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
             ${columnSet.has('store_name') ? `COALESCE(store_name, '')` : `''`} AS store_name,
             ${columnSet.has('address') ? `COALESCE(address, '')` : `''`} AS store_address,
             ${columnSet.has('allow_pay_at_cashier') ? 'allow_pay_at_cashier' : 'NULL::boolean'} AS allow_pay_at_cashier,
+            ${columnSet.has('is_payment_proof_mandatory') ? 'is_payment_proof_mandatory' : 'NULL::boolean'} AS is_payment_proof_mandatory,
             ${columnSet.has('enable_qris_ocr') ? 'enable_qris_ocr' : 'NULL::boolean'} AS enable_qris_ocr
          FROM store_settings
          WHERE ${whereParts.join(' AND ')}
@@ -115,7 +116,10 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
           storeName: (row.store_name || '').toString().trim() || null,
           storeAddress: (row.store_address || '').toString().trim() || null,
           allowPayAtCashier: parseBooleanSetting(row.allow_pay_at_cashier, true),
-          enableQrisOcr: parseBooleanSetting(row.enable_qris_ocr, true),
+          isPaymentProofMandatory: parseBooleanSetting(
+            row.is_payment_proof_mandatory,
+            parseBooleanSetting(row.enable_qris_ocr, true),
+          ),
         };
       }
     }
@@ -127,6 +131,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
         ['store_name', ['store_name', 'nama_toko', 'name']],
         ['store_address', ['address', 'store_address', 'alamat']],
         ['allow_pay_at_cashier', ['allow_pay_at_cashier']],
+        ['is_payment_proof_mandatory', ['is_payment_proof_mandatory', 'enable_qris_ocr']],
         ['enable_qris_ocr', ['enable_qris_ocr']],
       ];
 
@@ -143,7 +148,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
         storeName: null,
         storeAddress: null,
         allowPayAtCashier: true,
-        enableQrisOcr: true,
+        isPaymentProofMandatory: true,
       };
 
       for (const [field, keys] of keyPairs) {
@@ -168,8 +173,13 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
           profile.storeAddress = value;
         } else if (field === 'allow_pay_at_cashier') {
           profile.allowPayAtCashier = parseBooleanSetting(value, true);
+        } else if (field === 'is_payment_proof_mandatory') {
+          profile.isPaymentProofMandatory = parseBooleanSetting(value, true);
         } else if (field === 'enable_qris_ocr') {
-          profile.enableQrisOcr = parseBooleanSetting(value, true);
+          profile.isPaymentProofMandatory = parseBooleanSetting(
+            value,
+            profile.isPaymentProofMandatory,
+          );
         }
       }
 
@@ -185,7 +195,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
     storeName: null,
     storeAddress: null,
     allowPayAtCashier: true,
-    enableQrisOcr: true,
+    isPaymentProofMandatory: true,
   };
 };
 
@@ -198,7 +208,7 @@ const resolveTenantProfile = async ({ tenantId, branchId }) => {
       storeName: null,
       storeAddress: null,
       allowPayAtCashier: true,
-      enableQrisOcr: true,
+      isPaymentProofMandatory: true,
     };
   }
 
@@ -231,7 +241,7 @@ const resolveTenantProfile = async ({ tenantId, branchId }) => {
       storeName: storeProfile.storeName || tenantName,
       storeAddress: storeProfile.storeAddress,
       allowPayAtCashier: storeProfile.allowPayAtCashier,
-      enableQrisOcr: storeProfile.enableQrisOcr,
+      isPaymentProofMandatory: storeProfile.isPaymentProofMandatory,
     };
   } catch (error) {
     console.warn('[settingsController] Tenant QRIS lookup skipped:', error.message);
@@ -261,7 +271,8 @@ const getSettings = async (req, res) => {
         web_order_url: webOrderUrl,
         qris_image_url: profile.qrisImageUrl,
         allow_pay_at_cashier: profile.allowPayAtCashier,
-        enable_qris_ocr: profile.enableQrisOcr,
+        is_payment_proof_mandatory: profile.isPaymentProofMandatory,
+        enable_qris_ocr: profile.isPaymentProofMandatory,
         logo_url: profile.logoUrl,
         store_name: profile.storeName,
         address: profile.storeAddress,
@@ -299,7 +310,8 @@ const getTenantSettings = async (req, res) => {
         qr_order_base_url: webOrderUrl,
         qris_image_url: profile.qrisImageUrl,
         allow_pay_at_cashier: profile.allowPayAtCashier,
-        enable_qris_ocr: profile.enableQrisOcr,
+        is_payment_proof_mandatory: profile.isPaymentProofMandatory,
+        enable_qris_ocr: profile.isPaymentProofMandatory,
         logo_url: profile.logoUrl,
         store_name: profile.storeName,
         address: profile.storeAddress,

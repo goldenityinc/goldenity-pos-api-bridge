@@ -3,6 +3,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const defaultInvalidResult = {
   isValid: false,
   reason: 'Gagal memvalidasi gambar.',
+  transferredAmount: null,
 };
 
 const parseModelJson = (text) => {
@@ -57,7 +58,7 @@ const validatePaymentProof = async (base64Image, mimeType, expectedAmount) => {
     const client = new GoogleGenerativeAI(apiKey);
     const model = client.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
-    const prompt = `Anda adalah sistem verifikasi pembayaran otomatis. Analisis gambar ini. 1. Apakah ini benar gambar struk transfer bank atau e-wallet? 2. Apakah statusnya BERHASIL? 3. Apakah nominal transfernya SAMA PERSIS dengan Rp ${normalizedAmount}? Kembalikan HANYA format JSON tanpa markdown: { "isValid": true/false, "reason": "penjelasan singkat kenapa valid/tidak" }.`;
+    const prompt = `Anda adalah sistem verifikasi pembayaran otomatis. Analisis gambar ini. 1. Apakah ini benar gambar struk transfer bank atau e-wallet? 2. Apakah statusnya BERHASIL? 3. Ekstrak nominal transfer bersih sebagai angka bulat Rupiah tanpa titik/koma (contoh 40000). 4. Nyatakan valid hanya jika nominal transfer >= Rp ${normalizedAmount}. Kembalikan HANYA format JSON tanpa markdown: { "isValid": true/false, "reason": "penjelasan singkat kenapa valid/tidak", "transferredAmount": number|null }.`;
 
     const result = await model.generateContent([
       { text: prompt },
@@ -75,9 +76,11 @@ const validatePaymentProof = async (base64Image, mimeType, expectedAmount) => {
       return defaultInvalidResult;
     }
 
+    const transferredAmount = Number(parsed.transferredAmount);
     return {
       isValid: parsed.isValid === true,
       reason: (parsed.reason || '').toString().trim() || 'Tidak ada alasan dari AI.',
+      transferredAmount: Number.isFinite(transferredAmount) ? transferredAmount : null,
     };
   } catch (_) {
     return defaultInvalidResult;
