@@ -332,6 +332,114 @@ const resolvePaymentProofPayload = ({ req }) => {
   };
 };
 
+const parseBooleanConfig = (value, fallback = true) => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  const normalized = (value ?? '').toString().trim().toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+  if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['false', '0', 'no', 'n', 'off'].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+};
+
+const resolveQrOrderSettings = async ({ client, tenantId, branchId }) => {
+  const defaults = {
+    allowPayAtCashier: true,
+    enableQrisOcr: true,
+  };
+
+  try {
+    const columnSet = await getTableColumnSet(client, 'store_settings');
+    if (!(columnSet instanceof Set) || columnSet.size === 0) {
+      return defaults;
+    }
+
+    const supportsBranch = columnSet.has('branch_id');
+    if (columnSet.has('allow_pay_at_cashier') || columnSet.has('enable_qris_ocr')) {
+      const whereParts = ['tenant_id = $1'];
+      const params = [tenantId];
+      let branchParamIndex = 0;
+
+      if (supportsBranch && branchId !== null) {
+        branchParamIndex = params.length + 1;
+        whereParts.push(`(branch_id = $${branchParamIndex} OR branch_id IS NULL)`);
+        params.push(branchId);
+      }
+
+      const orderParts = [];
+      if (supportsBranch && branchId !== null && branchParamIndex > 0) {
+        orderParts.push(`CASE WHEN branch_id = $${branchParamIndex} THEN 0 WHEN branch_id IS NULL THEN 1 ELSE 2 END`);
+      }
+      if (columnSet.has('updated_at')) {
+        orderParts.push('updated_at DESC NULLS LAST');
+      }
+      if (columnSet.has('created_at')) {
+        orderParts.push('created_at DESC NULLS LAST');
+      }
+
+      const wideResult = await client.query(
+        `SELECT
+           ${columnSet.has('allow_pay_at_cashier') ? 'allow_pay_at_cashier' : 'NULL::boolean'} AS allow_pay_at_cashier,
+           ${columnSet.has('enable_qris_ocr') ? 'enable_qris_ocr' : 'NULL::boolean'} AS enable_qris_ocr
+         FROM store_settings
+         WHERE ${whereParts.join(' AND ')}
+         ORDER BY ${orderParts.length > 0 ? orderParts.join(', ') : 'id DESC'}
+         LIMIT 1`,
+        params,
+      );
+
+      const row = wideResult.rows?.[0];
+      if (row) {
+        return {
+          allowPayAtCashier: parseBooleanConfig(row.allow_pay_at_cashier, true),
+          enableQrisOcr: parseBooleanConfig(row.enable_qris_ocr, true),
+        };
+      }
+    }
+
+    if (columnSet.has('key') && columnSet.has('value')) {
+      const whereParts = ['tenant_id = $1'];
+      const params = [tenantId];
+      if (supportsBranch && branchId !== null) {
+        whereParts.push('(branch_id = $2 OR branch_id IS NULL)');
+        params.push(branchId);
+      }
+
+      const keyResult = await client.query(
+        `SELECT key, COALESCE(value, '') AS value
+         FROM store_settings
+         WHERE ${whereParts.join(' AND ')}
+           AND key = ANY($${params.length + 1}::text[])
+         ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST`,
+        [...params, ['allow_pay_at_cashier', 'enable_qris_ocr']],
+      );
+
+      const resolved = { ...defaults };
+      for (const row of keyResult.rows || []) {
+        const key = (row.key || '').toString().trim();
+        if (key === 'allow_pay_at_cashier') {
+          resolved.allowPayAtCashier = parseBooleanConfig(row.value, resolved.allowPayAtCashier);
+        } else if (key === 'enable_qris_ocr') {
+          resolved.enableQrisOcr = parseBooleanConfig(row.value, resolved.enableQrisOcr);
+        }
+      }
+      return resolved;
+    }
+  } catch (error) {
+    console.warn('[publicQrController] Failed resolving QR order settings:', error.message);
+  }
+
+  return defaults;
+};
+
 const generateReceiptNumber = () => {
   const now = new Date();
   const yyyymmdd = `${now.getFullYear()}${`${now.getMonth() + 1}`.padStart(2, '0')}${`${now.getDate()}`.padStart(2, '0')}`;
@@ -577,6 +685,11 @@ const createQrOrder = async (req, res) => {
     const paymentMethod = normalizePaymentMethod(
       req.body.paymentMethod || req.body.payment_method,
     );
+    const qrOrderSettings = await resolveQrOrderSettings({
+      client,
+      tenantId,
+      branchId,
+    });
     const paymentProofPayload = resolvePaymentProofPayload({ req });
     let paymentProofUrl = paymentProofPayload.paymentProofUrl || null;
     let paymentState = resolvePaymentState(paymentMethod);
@@ -595,6 +708,12 @@ const createQrOrder = async (req, res) => {
       } catch (branchError) {
         console.warn('[publicQrController] Branch lookup skipped:', branchError.message);
       }
+    }
+
+    if (paymentMethod === PAYMENT_METHOD_CASHIER && !qrOrderSettings.allowPayAtCashier) {
+      const error = new Error('Pembayaran di kasir sedang dinonaktifkan untuk web ordering.');
+      error.statusCode = 400;
+      throw error;
     }
 
     await client.query('BEGIN');
@@ -672,7 +791,11 @@ const createQrOrder = async (req, res) => {
       };
     });
 
-    if (paymentMethod === PAYMENT_METHOD_QRIS && paymentProofPayload.base64DataForValidation) {
+    if (
+      paymentMethod === PAYMENT_METHOD_QRIS &&
+      qrOrderSettings.enableQrisOcr &&
+      paymentProofPayload.base64DataForValidation
+    ) {
       const validation = await validatePaymentProof(
         paymentProofPayload.base64DataForValidation,
         paymentProofPayload.uploadMimeType || 'image/jpeg',
@@ -697,7 +820,13 @@ const createQrOrder = async (req, res) => {
       });
     }
 
-    if (paymentMethod === PAYMENT_METHOD_QRIS && paymentProofUrl) {
+    if (paymentMethod === PAYMENT_METHOD_QRIS && !qrOrderSettings.enableQrisOcr) {
+      paymentState = {
+        paymentMethodLabel: 'QRIS',
+        paymentStatus: 'PAID',
+        orderStatus: 'PREPARING',
+      };
+    } else if (paymentMethod === PAYMENT_METHOD_QRIS && paymentProofUrl) {
       paymentState = {
         paymentMethodLabel: 'QRIS',
         paymentStatus: 'PAID',

@@ -17,6 +17,24 @@ const parseOptionalBranchId = (value) => {
   return Number.parseInt(text, 10);
 };
 
+const parseBooleanSetting = (value, fallback = true) => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  const normalized = (value ?? '').toString().trim().toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+  if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['false', '0', 'no', 'n', 'off'].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+};
+
 const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
   const normalizedTenantId = (tenantId || '').toString().trim();
   if (!normalizedTenantId) {
@@ -25,6 +43,8 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
       logoUrl: null,
       storeName: null,
       storeAddress: null,
+      allowPayAtCashier: true,
+      enableQrisOcr: true,
     };
   }
 
@@ -38,6 +58,8 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
         logoUrl: null,
         storeName: null,
         storeAddress: null,
+        allowPayAtCashier: true,
+        enableQrisOcr: true,
       };
     }
 
@@ -75,7 +97,9 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
             ${columnSet.has('qris_image_url') ? `COALESCE(qris_image_url, '')` : `''`} AS qris_image_url,
             ${columnSet.has('logo_url') ? `COALESCE(logo_url, '')` : `''`} AS logo_url,
             ${columnSet.has('store_name') ? `COALESCE(store_name, '')` : `''`} AS store_name,
-            ${columnSet.has('address') ? `COALESCE(address, '')` : `''`} AS store_address
+            ${columnSet.has('address') ? `COALESCE(address, '')` : `''`} AS store_address,
+            ${columnSet.has('allow_pay_at_cashier') ? 'allow_pay_at_cashier' : 'NULL::boolean'} AS allow_pay_at_cashier,
+            ${columnSet.has('enable_qris_ocr') ? 'enable_qris_ocr' : 'NULL::boolean'} AS enable_qris_ocr
          FROM store_settings
          WHERE ${whereParts.join(' AND ')}
          ORDER BY ${orderParts.length > 0 ? orderParts.join(', ') : 'id DESC'}
@@ -90,6 +114,8 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
           logoUrl: (row.logo_url || '').toString().trim() || null,
           storeName: (row.store_name || '').toString().trim() || null,
           storeAddress: (row.store_address || '').toString().trim() || null,
+          allowPayAtCashier: parseBooleanSetting(row.allow_pay_at_cashier, true),
+          enableQrisOcr: parseBooleanSetting(row.enable_qris_ocr, true),
         };
       }
     }
@@ -100,6 +126,8 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
         ['logo_url', ['logo_url', 'store_logo_url']],
         ['store_name', ['store_name', 'nama_toko', 'name']],
         ['store_address', ['address', 'store_address', 'alamat']],
+        ['allow_pay_at_cashier', ['allow_pay_at_cashier']],
+        ['enable_qris_ocr', ['enable_qris_ocr']],
       ];
 
       const whereParts = ['tenant_id = $1'];
@@ -114,6 +142,8 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
         logoUrl: null,
         storeName: null,
         storeAddress: null,
+        allowPayAtCashier: true,
+        enableQrisOcr: true,
       };
 
       for (const [field, keys] of keyPairs) {
@@ -136,6 +166,10 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
           profile.storeName = value;
         } else if (field === 'store_address') {
           profile.storeAddress = value;
+        } else if (field === 'allow_pay_at_cashier') {
+          profile.allowPayAtCashier = parseBooleanSetting(value, true);
+        } else if (field === 'enable_qris_ocr') {
+          profile.enableQrisOcr = parseBooleanSetting(value, true);
         }
       }
 
@@ -150,6 +184,8 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
     logoUrl: null,
     storeName: null,
     storeAddress: null,
+    allowPayAtCashier: true,
+    enableQrisOcr: true,
   };
 };
 
@@ -161,6 +197,8 @@ const resolveTenantProfile = async ({ tenantId, branchId }) => {
       logoUrl: null,
       storeName: null,
       storeAddress: null,
+      allowPayAtCashier: true,
+      enableQrisOcr: true,
     };
   }
 
@@ -192,6 +230,8 @@ const resolveTenantProfile = async ({ tenantId, branchId }) => {
       logoUrl: storeProfile.logoUrl || tenantLogo,
       storeName: storeProfile.storeName || tenantName,
       storeAddress: storeProfile.storeAddress,
+      allowPayAtCashier: storeProfile.allowPayAtCashier,
+      enableQrisOcr: storeProfile.enableQrisOcr,
     };
   } catch (error) {
     console.warn('[settingsController] Tenant QRIS lookup skipped:', error.message);
@@ -220,6 +260,8 @@ const getSettings = async (req, res) => {
       config: {
         web_order_url: webOrderUrl,
         qris_image_url: profile.qrisImageUrl,
+        allow_pay_at_cashier: profile.allowPayAtCashier,
+        enable_qris_ocr: profile.enableQrisOcr,
         logo_url: profile.logoUrl,
         store_name: profile.storeName,
         address: profile.storeAddress,
@@ -256,6 +298,8 @@ const getTenantSettings = async (req, res) => {
         web_order_url: webOrderUrl,
         qr_order_base_url: webOrderUrl,
         qris_image_url: profile.qrisImageUrl,
+        allow_pay_at_cashier: profile.allowPayAtCashier,
+        enable_qris_ocr: profile.enableQrisOcr,
         logo_url: profile.logoUrl,
         store_name: profile.storeName,
         address: profile.storeAddress,
