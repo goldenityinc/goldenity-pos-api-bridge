@@ -202,6 +202,14 @@ const ensureSalesRecordsCashierColumns = async (client) => {
   await assertColumnsExist(client, 'sales_records', ['cashier_id', 'cashier_name']);
 };
 
+const ensureSalesRecordsNoteColumns = async (client) => {
+  await client.query(
+    `ALTER TABLE sales_records
+       ADD COLUMN IF NOT EXISTS cashier_note TEXT,
+       ADD COLUMN IF NOT EXISTS order_note TEXT`,
+  );
+};
+
 const ensureSalesRecordsCustomerColumn = async (client) => {
   await assertColumnsExist(client, 'sales_records', ['customer_name']);
 };
@@ -823,6 +831,7 @@ const createTransaction = async (req, res) => {
     await ensureSalesRecordsKasBonColumns(client);
     await ensureSalesRecordsFinancialColumns(client);
     await ensureSalesRecordsItemsColumn(client);
+    await ensureSalesRecordsNoteColumns(client);
     await ensureSalesRecordItemsTable(client);
     await ensureSalesRecordItemsMechanicIdColumn(client);
     await ensureTenantScopedTable(client, 'sales_records', tenantId);
