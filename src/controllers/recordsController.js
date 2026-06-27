@@ -1,3 +1,5 @@
+const http = require('http');
+const https = require('https');
 const { jsonOk, jsonError } = require('../utils/http');
 const {
   normalizeArray,
@@ -775,6 +777,16 @@ const ensureProductsTableColumns = async (tenantDb, table) => {
   await assertColumnsExist(tenantDb, 'products', ['id', 'name', 'tenant_id']);
 };
 
+const ensureSalesRecordsNoteColumns = async (tenantDb, table) => {
+  if (table !== 'sales_records') return;
+  await assertTableExists(tenantDb, 'sales_records');
+  await tenantDb.query(
+    `ALTER TABLE sales_records
+       ADD COLUMN IF NOT EXISTS cashier_note TEXT,
+       ADD COLUMN IF NOT EXISTS order_note TEXT`,
+  );
+};
+
 const findExistingRecordByReferenceId = async (tenantDb, table, payload, tenantId) => {
   if (table !== 'products' || Array.isArray(payload) || !payload) {
     return null;
@@ -808,6 +820,7 @@ const runWithCustomersTableRetry = async (tenantDb, table, tenantId, operation) 
 
   await ensureCustomersTable(tenantDb, table);
   await ensureProductsTableColumns(tenantDb, table);
+  await ensureSalesRecordsNoteColumns(tenantDb, table);
   return operation();
 };
 
@@ -861,6 +874,149 @@ const setNoStoreHeaders = (res) => {
     'Surrogate-Control': 'no-store',
     'X-Bridge-Cache': 'bypass',
   });
+};
+
+const readFirstOwnedTextField = (payload = {}, keys = []) => {
+  if (!payload || typeof payload !== 'object') {
+    return undefined;
+  }
+
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(payload, key)) {
+      continue;
+    }
+
+    return (payload[key] ?? '').toString().trim();
+  }
+
+  return undefined;
+};
+
+const buildSalesRecordNotesPayload = (payload = {}) => {
+  const cashierNote = readFirstOwnedTextField(payload, [
+    'cashier_note',
+    'cashierNote',
+    'table_note',
+    'tableNote',
+    'session_note',
+    'sessionNote',
+  ]);
+  const orderNote = readFirstOwnedTextField(payload, [
+    'order_note',
+    'orderNote',
+    'special_note',
+    'specialNote',
+    'notes',
+    'note',
+  ]);
+
+  return {
+    ...(cashierNote !== undefined ? { cashier_note: cashierNote } : {}),
+    ...(orderNote !== undefined ? { order_note: orderNote } : {}),
+  };
+};
+
+const syncSalesRecordNotesToAdminCore = async ({ req, transactionId, payload }) => {
+  const notesPayload = buildSalesRecordNotesPayload(payload);
+  if (Object.keys(notesPayload).length === 0) {
+    return null;
+  }
+
+  const tenantId = resolveTenantId(req);
+  const rawBaseUrl = (
+    process.env.ADMIN_CORE_API_BASE_URL ||
+    process.env.ADMIN_CORE_API_URL ||
+    process.env.CORE_API_BASE_URL ||
+    process.env.CORE_API_URL ||
+    'https://goldenity-admin-core-backend-production.up.railway.app'
+  )
+    .toString()
+    .trim();
+
+  if (!rawBaseUrl) {
+    throw createHttpError(500, 'ADMIN_CORE_API_BASE_URL / CORE_API_BASE_URL belum dikonfigurasi');
+  }
+
+  const baseUrl = new URL(rawBaseUrl);
+  const basePath = baseUrl.pathname.replace(/\/+$/, '');
+  const notesPath = basePath.endsWith('/api')
+    ? `${basePath}/v1/transactions/${encodeURIComponent(transactionId)}/notes`
+    : `${basePath}/api/v1/transactions/${encodeURIComponent(transactionId)}/notes`;
+
+  baseUrl.pathname = notesPath;
+  baseUrl.search = '';
+  baseUrl.hash = '';
+
+  const timeoutMs = Number(process.env.ADMIN_CORE_API_TIMEOUT_MS || 7000);
+  const transport = baseUrl.protocol === 'https:' ? https : http;
+
+  const response = await new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      ...notesPayload,
+      ...(tenantId ? { tenant_id: tenantId } : {}),
+    });
+
+    const request = transport.request(
+      baseUrl,
+      {
+        method: 'PATCH',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body),
+          ...(req.headers.authorization
+            ? { authorization: req.headers.authorization }
+            : {}),
+          ...(tenantId ? { 'x-tenant-id': tenantId } : {}),
+          ...(req.headers['x-branch-id']
+            ? { 'x-branch-id': req.headers['x-branch-id'] }
+            : {}),
+        },
+        timeout: Number.isFinite(timeoutMs) ? timeoutMs : 7000,
+      },
+      (coreRes) => {
+        let raw = '';
+        coreRes.setEncoding('utf8');
+        coreRes.on('data', (chunk) => {
+          raw += chunk;
+        });
+        coreRes.on('end', () => {
+          let parsed;
+          try {
+            parsed = raw ? JSON.parse(raw) : {};
+          } catch (_) {
+            parsed = { message: raw };
+          }
+
+          resolve({
+            statusCode: coreRes.statusCode || 500,
+            body: parsed,
+          });
+        });
+      },
+    );
+
+    request.on('timeout', () => {
+      request.destroy(new Error('Admin core transaction note request timeout'));
+    });
+    request.on('error', reject);
+    request.write(body);
+    request.end();
+  });
+
+  const statusCode = response.statusCode || 500;
+  const responseBody =
+    response.body && typeof response.body === 'object'
+      ? response.body
+      : { message: 'Invalid response from admin core' };
+
+  if (statusCode < 200 || statusCode >= 300) {
+    throw createHttpError(
+      502,
+      responseBody.message || 'Gagal sinkron catatan transaksi ke admin core',
+    );
+  }
+
+  return responseBody.data || null;
 };
 
 const resolvePrimaryKeyColumn = async (tenantDb, table) => {
@@ -1274,7 +1430,7 @@ const listRecords = async (req, res) => {
         ...req.query,
         select: ensureSelectedColumns(
           ensureSelectedColumn(req.query?.select, primaryKeyColumn),
-          ['status', 'order_status', 'is_void', 'order_note', 'special_note'],
+          ['status', 'order_status', 'is_void', 'cashier_note', 'order_note', 'special_note'],
           salesColumns,
         ),
       };
@@ -1365,6 +1521,17 @@ const listRecords = async (req, res) => {
           const rawTableNumber = (row?.table_number ?? row?.tableNumber ?? '').toString().trim();
           const resolvedTableNumber = rawTableNumber || tableNumberMap.get(resolvedTableId) || '';
           const rawOrderType = (row?.order_type ?? row?.orderType ?? '').toString().trim();
+          const resolvedCashierNote = (
+            row?.cashier_note ??
+            row?.cashierNote ??
+            row?.cashier_notes ??
+            row?.cashierNotes ??
+            row?.table_note ??
+            row?.tableNote ??
+            row?.session_note ??
+            row?.sessionNote ??
+            ''
+          ).toString().trim();
           const resolvedSpecialNote = (
             row?.special_note ??
             row?.specialNote ??
@@ -1381,6 +1548,8 @@ const listRecords = async (req, res) => {
             table_id: resolvedTableId || (row?.table_id ?? row?.tableId ?? null),
             table_number: resolvedTableNumber || null,
             order_type: rawOrderType || null,
+            cashier_note: resolvedCashierNote,
+            cashierNote: resolvedCashierNote,
             special_note: resolvedSpecialNote,
             specialNote: resolvedSpecialNote,
             order_note: resolvedSpecialNote,
@@ -1752,16 +1921,32 @@ const updateRecordById = async (req, res) => {
     if ((result.rowCount || 0) === 0) {
       return jsonError(res, 404, 'Record tidak ditemukan');
     }
+
+    let syncedRecord = result.rows[0] || null;
+    if (table === 'sales_records') {
+      const mirroredRecord = await syncSalesRecordNotesToAdminCore({
+        req,
+        transactionId: req.params.id,
+        payload: req.body,
+      });
+      if (mirroredRecord && typeof mirroredRecord === 'object') {
+        syncedRecord = {
+          ...syncedRecord,
+          ...mirroredRecord,
+        };
+      }
+    }
+
     emitTableMutation(req, {
       table,
       action: 'UPDATE',
-      record: result.rows[0] || null,
+      record: syncedRecord,
       id: req.params.id,
     });
     if (table === 'expenses' && result.rows?.[0]) {
       scheduleExpenseJournalPosting({ expenseRecord: result.rows[0], tenantId });
     }
-    return jsonOk(res, result.rows[0] || null, 'Updated');
+    return jsonOk(res, syncedRecord, 'Updated');
   } catch (error) {
     return jsonError(
       res,
