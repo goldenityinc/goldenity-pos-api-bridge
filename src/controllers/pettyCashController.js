@@ -67,6 +67,34 @@ const resolveUsernameFromRequest = (req) => {
     .trim();
 };
 
+const normalizePositiveIntegerText = (value) => {
+  const normalized = (value ?? '').toString().trim();
+  if (!normalized || !/^\d+$/.test(normalized)) {
+    return '';
+  }
+  return normalized;
+};
+
+const resolveBranchIdFromRequest = (req) => {
+  return normalizePositiveIntegerText(
+    req?.user?.branch_id ??
+    req?.auth?.branch_id ??
+    req?.body?.branchId ??
+    req?.body?.branch_id ??
+    req?.query?.branchId ??
+    req?.query?.branch_id,
+  );
+};
+
+const resolveShiftIdFromRequest = (req) => {
+  return normalizePositiveIntegerText(
+    req?.body?.shiftId ??
+    req?.body?.shift_id ??
+    req?.query?.shiftId ??
+    req?.query?.shift_id,
+  );
+};
+
 const resolveTenantIdFromRequest = (req) => {
   return (
     req?.user?.tenantId ??
@@ -122,6 +150,10 @@ const mapPettyCashRow = (row = {}) => ({
   id: row.id,
   tenantId: row.tenant_id,
   tenant_id: row.tenant_id,
+  branchId: row.branch_id ?? null,
+  branch_id: row.branch_id ?? null,
+  shiftId: row.shift_id ?? null,
+  shift_id: row.shift_id ?? null,
   userId: row.user_id,
   user_id: row.user_id,
   userName: (row.user_name ?? '').toString().trim(),
@@ -140,7 +172,12 @@ const getTodayPettyCashLogs = async (req, res) => {
     const columns = await ensurePettyCashLogsTable(client);
 
     const tenantId = resolveTenantIdFromRequest(req);
+    const branchId = resolveBranchIdFromRequest(req);
+    const shiftId = resolveShiftIdFromRequest(req);
+    const userId = resolveUserIdFromRequest(req);
     const hasTenantId = columns.has('tenant_id');
+    const hasBranchId = columns.has('branch_id');
+    const hasShiftId = columns.has('shift_id');
     const hasUserId = columns.has('user_id');
     const hasUserName = columns.has('user_name');
     const hasCreatedAt = columns.has('created_at');
@@ -152,6 +189,8 @@ const getTodayPettyCashLogs = async (req, res) => {
     const selectFields = [
       'l.id',
       hasTenantId ? 'l.tenant_id' : 'NULL::text AS tenant_id',
+      hasBranchId ? 'l.branch_id' : 'NULL::bigint AS branch_id',
+      hasShiftId ? 'l.shift_id' : 'NULL::bigint AS shift_id',
       hasUserId ? 'l.user_id' : 'NULL::text AS user_id',
       'l.amount',
       'l.type',
@@ -167,6 +206,21 @@ const getTodayPettyCashLogs = async (req, res) => {
     if (hasTenantId) {
       params.push(tenantId);
       whereConditions.push(`l.tenant_id = $${params.length}`);
+    }
+
+    if (hasBranchId && branchId) {
+      params.push(branchId);
+      whereConditions.push(`l.branch_id = $${params.length}`);
+    }
+
+    if (hasShiftId && shiftId) {
+      params.push(shiftId);
+      whereConditions.push(`l.shift_id = $${params.length}`);
+    }
+
+    if (hasUserId && userId) {
+      params.push(userId);
+      whereConditions.push(`l.user_id = $${params.length}`);
     }
 
     if (hasCreatedAt) {
@@ -214,6 +268,8 @@ const createPettyCashLog = async (req, res) => {
     const tenantId = resolveTenantIdFromRequest(req);
     const userId = resolveUserIdFromRequest(req);
     const userName = resolveUsernameFromRequest(req);
+    const branchId = resolveBranchIdFromRequest(req);
+    const shiftId = resolveShiftIdFromRequest(req);
     const amount = toIntegerAmount(req.body?.amount);
     const type = normalizeType(req.body?.type);
     const notes = (req.body?.notes ?? '').toString().trim();
@@ -221,6 +277,8 @@ const createPettyCashLog = async (req, res) => {
 
     const columns = await ensurePettyCashLogsTable(client);
     const hasTenantId = columns.has('tenant_id');
+    const hasBranchId = columns.has('branch_id');
+    const hasShiftId = columns.has('shift_id');
     const hasUserId = columns.has('user_id');
     const hasUserName = columns.has('user_name');
     const hasCreatedAt = columns.has('created_at');
@@ -239,6 +297,14 @@ const createPettyCashLog = async (req, res) => {
     if (hasTenantId) {
       insertColumns.push('tenant_id');
       insertValues.push(tenantId || null);
+    }
+    if (hasBranchId) {
+      insertColumns.push('branch_id');
+      insertValues.push(branchId || null);
+    }
+    if (hasShiftId) {
+      insertColumns.push('shift_id');
+      insertValues.push(shiftId || null);
     }
     if (hasUserId) {
       insertColumns.push('user_id');
@@ -260,6 +326,8 @@ const createPettyCashLog = async (req, res) => {
     const returningColumns = [
       'id',
       hasTenantId ? 'tenant_id' : 'NULL::text AS tenant_id',
+      hasBranchId ? 'branch_id' : 'NULL::bigint AS branch_id',
+      hasShiftId ? 'shift_id' : 'NULL::bigint AS shift_id',
       hasUserId ? 'user_id' : 'NULL::text AS user_id',
       hasUserName ? 'user_name' : 'NULL::text AS user_name',
       'amount',

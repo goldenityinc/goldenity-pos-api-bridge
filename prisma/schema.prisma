@@ -452,7 +452,10 @@ model DailyCash {
 model PettyCashLog {
   id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   tenantId  String?   @map("tenant_id")
+  branchId  BigInt?   @map("branch_id")
+  shiftId   BigInt?   @map("shift_id")
   userId    String?   @map("user_id")
+  userName  String?   @map("user_name")
   amount    Int?
   type      String?
   notes     String?
@@ -462,6 +465,7 @@ model PettyCashLog {
 
   @@index([tenantId])
   @@index([tenantId, createdAt])
+  @@index([tenantId, branchId, userId, createdAt])
   @@index([userId])
   @@map("petty_cash_logs")
 }
