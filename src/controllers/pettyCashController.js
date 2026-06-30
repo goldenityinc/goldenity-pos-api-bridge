@@ -42,6 +42,10 @@ const normalizeUtcIsoString = (value) => {
 
 const resolveUserIdFromRequest = (req) => {
   return (
+    req?.user?.userId ??
+    req?.user?.user_id ??
+    req?.user?.id ??
+    req?.user?.username ??
     req?.auth?.userId ??
     req?.auth?.user_id ??
     req?.auth?.sub ??
@@ -56,6 +60,8 @@ const resolveUserIdFromRequest = (req) => {
 
 const resolveUsernameFromRequest = (req) => {
   return (
+    req?.user?.username ??
+    req?.user?.name ??
     req?.auth?.username ??
     req?.auth?.userName ??
     req?.auth?.user_name ??
@@ -77,6 +83,7 @@ const normalizePositiveIntegerText = (value) => {
 
 const resolveBranchIdFromRequest = (req) => {
   return normalizePositiveIntegerText(
+    req?.user?.branchId ??
     req?.user?.branch_id ??
     req?.auth?.branch_id ??
     req?.body?.branchId ??
@@ -88,6 +95,8 @@ const resolveBranchIdFromRequest = (req) => {
 
 const resolveShiftIdFromRequest = (req) => {
   return normalizePositiveIntegerText(
+    req?.user?.shiftId ??
+    req?.user?.shift_id ??
     req?.body?.shiftId ??
     req?.body?.shift_id ??
     req?.query?.shiftId ??
