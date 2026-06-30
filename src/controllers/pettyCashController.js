@@ -183,7 +183,6 @@ const getTodayPettyCashLogs = async (req, res) => {
     const tenantId = resolveTenantIdFromRequest(req);
     const branchId = resolveBranchIdFromRequest(req);
     const shiftId = resolveShiftIdFromRequest(req);
-    const userId = resolveUserIdFromRequest(req);
     const hasTenantId = columns.has('tenant_id');
     const hasBranchId = columns.has('branch_id');
     const hasShiftId = columns.has('shift_id');
@@ -225,11 +224,6 @@ const getTodayPettyCashLogs = async (req, res) => {
     if (hasShiftId && shiftId) {
       params.push(shiftId);
       whereConditions.push(`l.shift_id = $${params.length}`);
-    }
-
-    if (hasUserId && userId) {
-      params.push(userId);
-      whereConditions.push(`l.user_id = $${params.length}`);
     }
 
     if (hasCreatedAt) {
