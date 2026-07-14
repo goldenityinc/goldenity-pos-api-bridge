@@ -182,6 +182,35 @@ const normalizeAppUserPayload = (payload = {}, options = {}) => {
   return next;
 };
 
+const normalizeTenantPayload = (payload = {}) => {
+  const next = { ...payload };
+
+  const rawEndDate = (
+    next.endDate ??
+    next.subscription_end_date ??
+    next.subscriptionEndDate ??
+    next.end_date ??
+    ''
+  )
+    .toString()
+    .trim();
+
+  const normalizedEndDate = rawEndDate || null;
+  if (normalizedEndDate !== null) {
+    if (next.endDate === undefined) {
+      next.endDate = normalizedEndDate;
+    }
+    if (next.subscription_end_date === undefined) {
+      next.subscription_end_date = normalizedEndDate;
+    }
+    if (next.end_date === undefined) {
+      next.end_date = normalizedEndDate;
+    }
+  }
+
+  return next;
+};
+
 const normalizePayloadForTable = (table, payload, options = {}) => {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return payload;
@@ -197,6 +226,10 @@ const normalizePayloadForTable = (table, payload, options = {}) => {
 
   if (table === 'app_users') {
     return normalizeAppUserPayload(payload, options);
+  }
+
+  if (table === 'tenants') {
+    return normalizeTenantPayload(payload, options);
   }
 
   return payload;
