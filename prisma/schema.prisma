@@ -79,10 +79,14 @@ model Tenant {
   country             String?
   bridgeApiUrl        String?           @map("bridge_api_url")
   logoUrl             String?           @map("logo_url")
+  qrisImageUrl        String?           @map("qris_image_url")
+  allowPayAtCashier   Boolean           @default(true) @map("allow_pay_at_cashier")
+  isPaymentProofMandatory Boolean       @default(true) @map("is_payment_proof_mandatory")
   logoObjectKey       String?           @map("logo_object_key")
   showInventoryImages Boolean           @default(true) @map("show_inventory_images")
 
   products            Product[]
+  branches            Branch[]
   tables              tables[]
   categories          Category[]
   transactions        Transaction[]
@@ -104,6 +108,26 @@ model Tenant {
   usersByTenantColumn User[]            @relation("UsersTenantSnake")
 
   @@map("tenants")
+}
+
+model Branch {
+  id                  BigInt    @id @default(autoincrement())
+  tenantId            String    @map("tenant_id")
+  name                String
+  branchCode          String?   @unique @map("branch_code")
+  address             String?
+  phone               String?
+  qrisImageUrl        String?   @map("qris_image_url")
+  isActive            Boolean   @default(true) @map("is_active")
+  isMainBranch        Boolean   @default(false) @map("is_main_branch")
+  isBlindCloseEnabled Boolean   @default(true) @map("is_blind_close_enabled")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at")
+  tenant              Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([tenantId, isActive])
+  @@map("branches")
 }
 
 model tables {
@@ -132,6 +156,7 @@ model Product {
   price         Float?    @default(0)
   purchasePrice Float?    @map("purchase_price")
   stock         Int?      @default(0)
+  isStockTracked Boolean  @default(true) @map("is_stock_tracked")
   isAvailable   Boolean?  @default(true) @map("is_available")
   isService     Boolean?  @default(false) @map("is_service")
   supplierName  String?   @map("supplier_name")
@@ -170,6 +195,7 @@ model Transaction {
   mechanicName        String?   @map("mechanic_name")
   mechanicCommission  Decimal?  @map("mechanic_commission")
   transaction_type    String?
+  notes               String?
   dp_amount           Decimal?
   pickup_date         DateTime?
   po_status           String?
@@ -201,6 +227,7 @@ model SalesRecord {
   mechanicName       String?   @map("mechanic_name")
   mechanicCommission Decimal?  @map("mechanic_commission")
   transaction_type   String?
+  notes              String?
   orderType          OrderType?   @map("order_type")
   orderStatus        OrderStatus? @map("order_status")
   dp_amount          Decimal?
@@ -225,6 +252,7 @@ model SalesRecordItem {
   productName   String?     @map("product_name")
   qty           Int         @default(1)
   customPrice   Decimal?    @map("custom_price") @db.Decimal(14, 2)
+  notes         String?
   note          String?
   item_note     String?
   isService     Boolean     @default(false) @map("is_service")
@@ -346,25 +374,31 @@ model AppUser {
 }
 
 model User {
-  id            String          @id
-  firebaseUid   String?         @map("firebaseUid")
-  email         String?
-  name          String
-  role          UserRole        @default(CRM_STAFF)
-  tenantId      String          @map("tenantId")
-  isActive      Boolean         @default(true) @map("isActive")
-  createdAt     DateTime        @default(now()) @map("createdAt")
-  updatedAt     DateTime        @map("updatedAt")
-  passwordHash  String?         @map("passwordHash")
-  username      String?
-  customRoleId  String?         @map("custom_role_id")
-  tenantIdSnake String?         @map("tenant_id")
+  id               String          @id @default(uuid())
+  firebaseUid      String?         @unique
+  email            String?         @unique
+  name             String
+  allowedSolutions String[]        @default([]) @map("allowed_solutions")
+  employeeType     String          @default("Kasir") @map("employee_type")
+  baseSalary       Decimal         @default(0) @map("base_salary") @db.Decimal(14, 2)
+  commissionRate   Decimal         @default(0) @map("commission_rate") @db.Decimal(14, 2)
+  role             UserRole        @default(CRM_STAFF)
+  tenantId         String
+  branchId         BigInt?         @map("branch_id")
+  isActive         Boolean         @default(true)
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  passwordHash     String?
+  username         String?
+  customRoleId     String?         @map("custom_role_id")
+  tenantIdSnake    String?         @map("tenant_id")
 
-  tenant        Tenant?         @relation("UsersTenantSnake", fields: [tenantIdSnake], references: [id])
-  appAccesses   UserAppAccess[]
+  tenant           Tenant?         @relation("UsersTenantSnake", fields: [tenantIdSnake], references: [id])
+  appAccesses      UserAppAccess[]
 
   @@index([tenantIdSnake])
   @@index([tenantId])
+  @@index([branchId])
   @@index([username])
   @@index([email])
   @@map("users")
