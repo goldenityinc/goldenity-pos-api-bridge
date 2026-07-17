@@ -1,6 +1,9 @@
 const { jsonOk, jsonError } = require('../utils/http');
 const { getSharedPool } = require('../middlewares/tenantResolver');
 const { getTableColumnSet } = require('../utils/sqlHelpers');
+const { uploadBase64Object } = require('../services/objectStorageService');
+
+const DEFAULT_RECEIPT_FOOTER = 'Barang yang sudah dibeli tidak dapat ditukar/dikembalikan';
 
 const normalizeOptionalText = (value) => {
   if (value === undefined || value === null) {
@@ -165,6 +168,28 @@ const parseBooleanSetting = (value, fallback = true) => {
   return fallback;
 };
 
+const resolveSettingsUploadKey = (req) => {
+  return (
+    req.headers['x-goldenity-settings-key'] ||
+    req.headers['x-settings-key'] ||
+    req.body?.settingsKey ||
+    req.body?.settings_key ||
+    ''
+  )
+    .toString()
+    .trim();
+};
+
+const ensureSettingsUploadAllowed = (req) => {
+  const configuredKey = (process.env.WEB_SETTINGS_UPLOAD_KEY || '').toString().trim();
+  if (!configuredKey) {
+    return true;
+  }
+
+  const providedKey = resolveSettingsUploadKey(req);
+  return providedKey.length > 0 && providedKey === configuredKey;
+};
+
 const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
   const normalizedTenantId = (tenantId || '').toString().trim();
   if (!normalizedTenantId) {
@@ -173,6 +198,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
       logoUrl: null,
       storeName: null,
       storeAddress: null,
+      receiptFooter: null,
       allowPayAtCashier: true,
       isPaymentProofMandatory: true,
     };
@@ -188,6 +214,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
         logoUrl: null,
         storeName: null,
         storeAddress: null,
+        receiptFooter: null,
         allowPayAtCashier: true,
         isPaymentProofMandatory: true,
       };
@@ -198,7 +225,8 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
       columnSet.has('qris_image_url') ||
       columnSet.has('logo_url') ||
       columnSet.has('store_name') ||
-      columnSet.has('address');
+      columnSet.has('address') ||
+      columnSet.has('receipt_footer');
 
     if (supportsWideColumns) {
       const whereParts = ['tenant_id = $1'];
@@ -228,6 +256,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
             ${columnSet.has('logo_url') ? `COALESCE(logo_url, '')` : `''`} AS logo_url,
             ${columnSet.has('store_name') ? `COALESCE(store_name, '')` : `''`} AS store_name,
             ${columnSet.has('address') ? `COALESCE(address, '')` : `''`} AS store_address,
+            ${columnSet.has('receipt_footer') ? `COALESCE(receipt_footer, '')` : `''`} AS receipt_footer,
             ${columnSet.has('allow_pay_at_cashier') ? 'allow_pay_at_cashier' : 'NULL::boolean'} AS allow_pay_at_cashier,
             ${columnSet.has('is_payment_proof_mandatory') ? 'is_payment_proof_mandatory' : 'NULL::boolean'} AS is_payment_proof_mandatory,
             ${columnSet.has('enable_qris_ocr') ? 'enable_qris_ocr' : 'NULL::boolean'} AS enable_qris_ocr
@@ -245,6 +274,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
           logoUrl: (row.logo_url || '').toString().trim() || null,
           storeName: (row.store_name || '').toString().trim() || null,
           storeAddress: (row.store_address || '').toString().trim() || null,
+          receiptFooter: (row.receipt_footer || '').toString().trim() || null,
           allowPayAtCashier: parseBooleanSetting(row.allow_pay_at_cashier, true),
           isPaymentProofMandatory: parseBooleanSetting(
             row.is_payment_proof_mandatory,
@@ -260,6 +290,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
         ['logo_url', ['logo_url', 'store_logo_url']],
         ['store_name', ['store_name', 'nama_toko', 'name']],
         ['store_address', ['address', 'store_address', 'alamat']],
+        ['receipt_footer', ['receipt_footer', 'receiptFooter']],
         ['allow_pay_at_cashier', ['allow_pay_at_cashier']],
         ['is_payment_proof_mandatory', ['is_payment_proof_mandatory', 'enable_qris_ocr']],
         ['enable_qris_ocr', ['enable_qris_ocr']],
@@ -277,6 +308,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
         logoUrl: null,
         storeName: null,
         storeAddress: null,
+        receiptFooter: null,
         allowPayAtCashier: true,
         isPaymentProofMandatory: true,
       };
@@ -301,6 +333,8 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
           profile.storeName = value;
         } else if (field === 'store_address') {
           profile.storeAddress = value;
+        } else if (field === 'receipt_footer') {
+          profile.receiptFooter = value;
         } else if (field === 'allow_pay_at_cashier') {
           profile.allowPayAtCashier = parseBooleanSetting(value, true);
         } else if (field === 'is_payment_proof_mandatory') {
@@ -324,6 +358,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
     logoUrl: null,
     storeName: null,
     storeAddress: null,
+    receiptFooter: null,
     allowPayAtCashier: true,
     isPaymentProofMandatory: true,
   };
@@ -337,6 +372,7 @@ const resolveTenantProfile = async ({ tenantId, branchId }) => {
       logoUrl: null,
       storeName: null,
       storeAddress: null,
+      receiptFooter: null,
       allowPayAtCashier: true,
       isPaymentProofMandatory: true,
     };
@@ -348,13 +384,9 @@ const resolveTenantProfile = async ({ tenantId, branchId }) => {
     branchId,
   });
 
-  if (storeProfile.qrisImageUrl) {
-    return storeProfile;
-  }
-
   try {
     const tenantResult = await pool.query(
-      `SELECT qris_image_url, logo_url, name
+      `SELECT qris_image_url, logo_url, name, receipt_footer
        FROM tenants
        WHERE id = $1
        LIMIT 1`,
@@ -364,12 +396,14 @@ const resolveTenantProfile = async ({ tenantId, branchId }) => {
     const tenantUrl = (tenantRow?.qris_image_url || '').toString().trim() || null;
     const tenantLogo = (tenantRow?.logo_url || '').toString().trim() || null;
     const tenantName = (tenantRow?.name || '').toString().trim() || null;
+    const tenantReceiptFooter = (tenantRow?.receipt_footer || '').toString().trim() || null;
 
     return {
       qrisImageUrl: tenantUrl || storeProfile.qrisImageUrl,
       logoUrl: storeProfile.logoUrl || tenantLogo,
       storeName: storeProfile.storeName || tenantName,
       storeAddress: storeProfile.storeAddress,
+      receiptFooter: storeProfile.receiptFooter || tenantReceiptFooter || DEFAULT_RECEIPT_FOOTER,
       allowPayAtCashier: storeProfile.allowPayAtCashier,
       isPaymentProofMandatory: storeProfile.isPaymentProofMandatory,
     };
@@ -407,6 +441,7 @@ const getSettings = async (req, res) => {
         logo_url: profile.logoUrl,
         store_name: profile.storeName,
         address: profile.storeAddress,
+        receipt_footer: profile.receiptFooter || DEFAULT_RECEIPT_FOOTER,
         endDate: subscriptionStatus.endDate,
         subscription_end_date: subscriptionStatus.subscription_end_date,
         api_version: '1.0.0',
@@ -450,6 +485,7 @@ const getTenantSettings = async (req, res) => {
         logo_url: profile.logoUrl,
         store_name: profile.storeName,
         address: profile.storeAddress,
+        receipt_footer: profile.receiptFooter || DEFAULT_RECEIPT_FOOTER,
         endDate: subscriptionStatus.endDate,
         subscription_end_date: subscriptionStatus.subscription_end_date,
         api_version: '1.0.0',
@@ -463,7 +499,143 @@ const getTenantSettings = async (req, res) => {
   }
 };
 
+/**
+ * POST /api/v1/settings/qris-image
+ * Uploads or sets the static QRIS image URL for a tenant.
+ */
+const updateTenantQrisImage = async (req, res) => {
+  try {
+    if (!ensureSettingsUploadAllowed(req)) {
+      return jsonError(res, 403, 'Kunci pengaturan QRIS tidak valid');
+    }
+
+    const tenantId = (
+      req.body?.tenantId ||
+      req.body?.tenant_id ||
+      req.user?.tenantId ||
+      req.user?.tenant_id ||
+      ''
+    )
+      .toString()
+      .trim();
+
+    if (!tenantId) {
+      return jsonError(res, 400, 'tenantId wajib diisi');
+    }
+
+    let qrisImageUrl = (
+      req.body?.qrisImageUrl ||
+      req.body?.qris_image_url ||
+      ''
+    )
+      .toString()
+      .trim();
+
+    const uploadedFile = req.file || null;
+    if (uploadedFile && uploadedFile.buffer) {
+      const fileName = (
+        req.body?.fileName ||
+        req.body?.file_name ||
+        `qris-${tenantId}-${Date.now()}.png`
+      )
+        .toString()
+        .trim();
+      const contentType = (
+        req.body?.contentType ||
+        req.body?.content_type ||
+        uploadedFile.mimetype ||
+        'image/png'
+      )
+        .toString()
+        .trim();
+      const uploaded = await uploadBase64Object({
+        bucket: process.env.PAYMENT_PROOF_BUCKET || 'payment-proofs',
+        fileName,
+        base64: uploadedFile.buffer.toString('base64'),
+        contentType,
+      });
+      qrisImageUrl = (uploaded?.url || '').toString().trim();
+    }
+
+    if (!qrisImageUrl) {
+      return jsonError(res, 400, 'qrisImageUrl atau file upload wajib diisi');
+    }
+
+    const pool = getSharedPool();
+    await pool.query(
+      `UPDATE tenants
+       SET qris_image_url = $1,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [qrisImageUrl, tenantId],
+    );
+
+    return jsonOk(res, {
+      tenantId,
+      qrisImageUrl,
+    }, 'QRIS static berhasil disimpan');
+  } catch (error) {
+    console.error('[settingsController.updateTenantQrisImage] Error:', error.message);
+    return jsonError(res, 500, 'Gagal menyimpan QRIS static', error.message);
+  }
+};
+
+/**
+ * POST /api/v1/settings/receipt-footer
+ * Updates receipt footer text for a tenant.
+ */
+const updateTenantReceiptFooter = async (req, res) => {
+  try {
+    if (!ensureSettingsUploadAllowed(req)) {
+      return jsonError(res, 403, 'Kunci pengaturan tidak valid');
+    }
+
+    const tenantId = (
+      req.body?.tenantId ||
+      req.body?.tenant_id ||
+      req.user?.tenantId ||
+      req.user?.tenant_id ||
+      ''
+    )
+      .toString()
+      .trim();
+
+    if (!tenantId) {
+      return jsonError(res, 400, 'tenantId wajib diisi');
+    }
+
+    const rawFooter = req.body?.receiptFooter ?? req.body?.receipt_footer;
+    const normalizedFooter = normalizeOptionalText(rawFooter) || DEFAULT_RECEIPT_FOOTER;
+    if (normalizedFooter.length > 500) {
+      return jsonError(res, 400, 'receiptFooter maksimal 500 karakter');
+    }
+
+    const pool = getSharedPool();
+    await pool.query(
+      `UPDATE tenants
+       SET receipt_footer = $1,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [normalizedFooter, tenantId],
+    );
+
+    return jsonOk(
+      res,
+      {
+        tenantId,
+        receiptFooter: normalizedFooter,
+      },
+      'Footer struk berhasil disimpan',
+    );
+  } catch (error) {
+    console.error('[settingsController.updateTenantReceiptFooter] Error:', error.message);
+    return jsonError(res, 500, 'Gagal menyimpan footer struk', error.message);
+  }
+};
+
 module.exports = {
   getSettings,
   getTenantSettings,
+  updateTenantQrisImage,
+  updateTenantReceiptFooter,
 };

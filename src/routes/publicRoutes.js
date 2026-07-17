@@ -5,6 +5,10 @@ const { login } = require('../controllers/authController');
 const imageProxyRoutes = require('./imageProxyRoutes');
 const settingsRoutes = require('./settingsRoutes');
 const {
+	updateTenantQrisImage,
+	updateTenantReceiptFooter,
+} = require('../controllers/settingsController');
+const {
 	getQrMenu,
 	createQrOrder,
 	checkoutQrOrder,
@@ -24,6 +28,8 @@ router.post('/auth/login', login);
 
 // Settings endpoint - used by Flutter app for Web Order URL configuration
 router.use('/api/v1/settings', settingsRoutes);
+router.post('/api/v1/settings/qris-image', paymentProofUpload.single('qrisImage'), updateTenantQrisImage);
+router.post('/api/v1/settings/receipt-footer', updateTenantReceiptFooter);
 
 router.get('/api/v1/qr-menu/:tenantId', getQrMenu);
 router.post('/api/v1/qr-orders', paymentProofUpload.single('payment_proof'), createQrOrder);

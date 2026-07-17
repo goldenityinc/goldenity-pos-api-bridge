@@ -80,6 +80,7 @@ model Tenant {
   bridgeApiUrl        String?           @map("bridge_api_url")
   logoUrl             String?           @map("logo_url")
   qrisImageUrl        String?           @map("qris_image_url")
+  receiptFooter       String?           @map("receipt_footer")
   allowPayAtCashier   Boolean           @default(true) @map("allow_pay_at_cashier")
   isPaymentProofMandatory Boolean       @default(true) @map("is_payment_proof_mandatory")
   logoObjectKey       String?           @map("logo_object_key")
