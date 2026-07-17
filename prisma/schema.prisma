@@ -580,6 +580,7 @@ model UserAppAccess {
   user          User       @relation(fields: [userId], references: [id])
   appInstance   AppInstance @relation(fields: [appInstanceId], references: [id])
 
+  @@index([userId])
   @@index([appInstanceId])
   @@map("user_app_accesses")
 }
