@@ -114,11 +114,36 @@ const resolveProductMutationTarget = async ({ tenantDb, table, idValue, payload,
 const normalizeProductPayload = (payload = {}, { isCreate = false } = {}) => {
   const next = { ...payload };
 
+  if (next.productType !== undefined && next.product_type === undefined) {
+    next.product_type = next.productType;
+  }
+
+  if (next.isService !== undefined && next.is_service === undefined) {
+    next.is_service = next.isService;
+  }
+
+  if (next.isStockTracked !== undefined && next.is_stock_tracked === undefined) {
+    next.is_stock_tracked = next.isStockTracked;
+  }
+
+  if (next.stockTracked !== undefined && next.stock_tracked === undefined) {
+    next.stock_tracked = next.stockTracked;
+  }
+
   if (next.imageUrl !== undefined && next.image_url === undefined) {
     next.image_url = next.imageUrl;
   }
 
+  if (next.categoryName !== undefined && next.category_name === undefined) {
+    next.category_name = next.categoryName;
+  }
+
   delete next.imageUrl;
+  delete next.productType;
+  delete next.isService;
+  delete next.isStockTracked;
+  delete next.stockTracked;
+  delete next.categoryName;
   return next;
 };
 
