@@ -138,6 +138,22 @@ const normalizeProductPayload = (payload = {}, { isCreate = false } = {}) => {
     next.category_name = next.categoryName;
   }
 
+  const normalizedType = (next.product_type ?? '').toString().trim().toLowerCase();
+  const isNonStockType =
+    normalizedType === 'non stok' ||
+    normalizedType === 'non-stok' ||
+    normalizedType === 'non_stock' ||
+    normalizedType === 'nonstock';
+
+  if (isNonStockType) {
+    // DB constraint only accepts canonical values, while non-stock behavior is tracked by flags.
+    next.product_type = 'Barang';
+    if (next.is_stock_tracked === undefined && next.stock_tracked === undefined) {
+      next.is_stock_tracked = false;
+      next.stock_tracked = false;
+    }
+  }
+
   delete next.imageUrl;
   delete next.productType;
   delete next.isService;
