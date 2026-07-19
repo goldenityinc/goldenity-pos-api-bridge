@@ -83,6 +83,7 @@ model Tenant {
   receiptFooter       String?           @map("receipt_footer")
   allowPayAtCashier   Boolean           @default(true) @map("allow_pay_at_cashier")
   isPaymentProofMandatory Boolean       @default(true) @map("is_payment_proof_mandatory")
+  printerConfigs      Json?             @map("printer_configs")
   logoObjectKey       String?           @map("logo_object_key")
   showInventoryImages Boolean           @default(true) @map("show_inventory_images")
 
@@ -167,6 +168,7 @@ model Product {
   updatedAt     DateTime? @default(now()) @map("updated_at")
   referenceId   String?   @map("reference_id")
   productType   String?   @map("product_type")
+  printDestination String? @default("CASHIER") @map("print_destination")
 
   tenant        Tenant?   @relation(fields: [tenantId], references: [id])
 
@@ -257,6 +259,7 @@ model SalesRecordItem {
   note          String?
   item_note     String?
   isService     Boolean     @default(false) @map("is_service")
+  batchSequence Int?        @map("batch_sequence")
   createdAt     DateTime?   @default(now()) @map("created_at")
   updatedAt     DateTime?   @default(now()) @map("updated_at")
 

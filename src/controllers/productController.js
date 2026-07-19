@@ -50,12 +50,18 @@ const normalizeProductAvailability = (product) => {
     .toString()
     .trim()
     .toLowerCase() || 'pcs';
+  const printDestination = (product.print_destination ?? product.printDestination ?? 'CASHIER')
+    .toString()
+    .trim()
+    .toUpperCase() || 'CASHIER';
 
   return {
     ...product,
     unit: normalizedUnit,
     unit_name: normalizedUnit,
     unitName: normalizedUnit,
+    print_destination: printDestination,
+    printDestination,
     is_available: availability,
     isAvailable: availability,
   };

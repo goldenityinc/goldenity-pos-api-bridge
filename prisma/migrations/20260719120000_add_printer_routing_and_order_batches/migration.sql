@@ -1,0 +1,8 @@
+ALTER TABLE IF EXISTS "tenants"
+  ADD COLUMN IF NOT EXISTS "printer_configs" JSONB;
+
+ALTER TABLE IF EXISTS "products"
+  ADD COLUMN IF NOT EXISTS "print_destination" TEXT NOT NULL DEFAULT 'CASHIER';
+
+ALTER TABLE IF EXISTS "sales_record_items"
+  ADD COLUMN IF NOT EXISTS "batch_sequence" INTEGER;

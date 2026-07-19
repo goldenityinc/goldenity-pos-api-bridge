@@ -13,6 +13,51 @@ const normalizeOptionalText = (value) => {
   return text || null;
 };
 
+const normalizePrinterConfigs = (value) => {
+  let parsed = value;
+
+  if (typeof parsed === 'string') {
+    const trimmed = parsed.trim();
+    if (!trimmed) {
+      return [];
+    }
+
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  if (!Array.isArray(parsed)) {
+    return [];
+  }
+
+  return parsed
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') {
+        return null;
+      }
+
+      const role = normalizeOptionalText(entry.role || entry.printerRole || entry.printer_role);
+      const type = normalizeOptionalText(entry.type || entry.printerType || entry.printer_type);
+      const address = normalizeOptionalText(
+        entry.address || entry.host || entry.macAddress || entry.mac_address || entry.ipAddress || entry.ip_address,
+      );
+
+      if (!role || !type || !address) {
+        return null;
+      }
+
+      return {
+        role: role.toUpperCase(),
+        type: type.toUpperCase(),
+        address,
+      };
+    })
+    .filter(Boolean);
+};
+
 const resolveSubscriptionEndDateCandidates = (row = {}) => {
   const candidates = [
     row.endDate,
@@ -199,6 +244,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
       storeName: null,
       storeAddress: null,
       receiptFooter: null,
+      printerConfigs: [],
       allowPayAtCashier: true,
       isPaymentProofMandatory: true,
     };
@@ -215,6 +261,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
         storeName: null,
         storeAddress: null,
         receiptFooter: null,
+        printerConfigs: [],
         allowPayAtCashier: true,
         isPaymentProofMandatory: true,
       };
@@ -257,6 +304,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
             ${columnSet.has('store_name') ? `COALESCE(store_name, '')` : `''`} AS store_name,
             ${columnSet.has('address') ? `COALESCE(address, '')` : `''`} AS store_address,
             ${columnSet.has('receipt_footer') ? `COALESCE(receipt_footer, '')` : `''`} AS receipt_footer,
+            ${columnSet.has('printer_configs') ? 'printer_configs' : 'NULL::jsonb'} AS printer_configs,
             ${columnSet.has('allow_pay_at_cashier') ? 'allow_pay_at_cashier' : 'NULL::boolean'} AS allow_pay_at_cashier,
             ${columnSet.has('is_payment_proof_mandatory') ? 'is_payment_proof_mandatory' : 'NULL::boolean'} AS is_payment_proof_mandatory,
             ${columnSet.has('enable_qris_ocr') ? 'enable_qris_ocr' : 'NULL::boolean'} AS enable_qris_ocr
@@ -275,6 +323,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
           storeName: (row.store_name || '').toString().trim() || null,
           storeAddress: (row.store_address || '').toString().trim() || null,
           receiptFooter: (row.receipt_footer || '').toString().trim() || null,
+          printerConfigs: normalizePrinterConfigs(row.printer_configs),
           allowPayAtCashier: parseBooleanSetting(row.allow_pay_at_cashier, true),
           isPaymentProofMandatory: parseBooleanSetting(
             row.is_payment_proof_mandatory,
@@ -309,6 +358,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
         storeName: null,
         storeAddress: null,
         receiptFooter: null,
+        printerConfigs: [],
         allowPayAtCashier: true,
         isPaymentProofMandatory: true,
       };
@@ -359,6 +409,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
     storeName: null,
     storeAddress: null,
     receiptFooter: null,
+    printerConfigs: [],
     allowPayAtCashier: true,
     isPaymentProofMandatory: true,
   };
@@ -373,6 +424,7 @@ const resolveTenantProfile = async ({ tenantId, branchId }) => {
       storeName: null,
       storeAddress: null,
       receiptFooter: null,
+      printerConfigs: [],
       allowPayAtCashier: true,
       isPaymentProofMandatory: true,
     };
@@ -385,8 +437,17 @@ const resolveTenantProfile = async ({ tenantId, branchId }) => {
   });
 
   try {
+    const tenantColumns = await getTableColumnSet(pool, 'tenants');
+    const tenantSelectColumns = [
+      'qris_image_url',
+      'logo_url',
+      'name',
+      'receipt_footer',
+      tenantColumns.has('printer_configs') ? 'printer_configs' : 'NULL::jsonb AS printer_configs',
+    ];
+
     const tenantResult = await pool.query(
-      `SELECT qris_image_url, logo_url, name, receipt_footer
+      `SELECT ${tenantSelectColumns.join(', ')}
        FROM tenants
        WHERE id = $1
        LIMIT 1`,
@@ -397,6 +458,7 @@ const resolveTenantProfile = async ({ tenantId, branchId }) => {
     const tenantLogo = (tenantRow?.logo_url || '').toString().trim() || null;
     const tenantName = (tenantRow?.name || '').toString().trim() || null;
     const tenantReceiptFooter = (tenantRow?.receipt_footer || '').toString().trim() || null;
+    const tenantPrinterConfigs = normalizePrinterConfigs(tenantRow?.printer_configs);
 
     return {
       qrisImageUrl: tenantUrl || storeProfile.qrisImageUrl,
@@ -404,6 +466,7 @@ const resolveTenantProfile = async ({ tenantId, branchId }) => {
       storeName: storeProfile.storeName || tenantName,
       storeAddress: storeProfile.storeAddress,
       receiptFooter: storeProfile.receiptFooter || tenantReceiptFooter || DEFAULT_RECEIPT_FOOTER,
+      printerConfigs: tenantPrinterConfigs.length > 0 ? tenantPrinterConfigs : storeProfile.printerConfigs,
       allowPayAtCashier: storeProfile.allowPayAtCashier,
       isPaymentProofMandatory: storeProfile.isPaymentProofMandatory,
     };
@@ -442,6 +505,7 @@ const getSettings = async (req, res) => {
         store_name: profile.storeName,
         address: profile.storeAddress,
         receipt_footer: profile.receiptFooter || DEFAULT_RECEIPT_FOOTER,
+        printer_configs: profile.printerConfigs,
         endDate: subscriptionStatus.endDate,
         subscription_end_date: subscriptionStatus.subscription_end_date,
         api_version: '1.0.0',
@@ -486,6 +550,7 @@ const getTenantSettings = async (req, res) => {
         store_name: profile.storeName,
         address: profile.storeAddress,
         receipt_footer: profile.receiptFooter || DEFAULT_RECEIPT_FOOTER,
+        printer_configs: profile.printerConfigs,
         endDate: subscriptionStatus.endDate,
         subscription_end_date: subscriptionStatus.subscription_end_date,
         api_version: '1.0.0',
@@ -633,9 +698,62 @@ const updateTenantReceiptFooter = async (req, res) => {
   }
 };
 
+/**
+ * POST /api/v1/settings/printer-configs
+ * Updates printer routing configuration for a tenant.
+ */
+const updateTenantPrinterConfigs = async (req, res) => {
+  try {
+    if (!ensureSettingsUploadAllowed(req)) {
+      return jsonError(res, 403, 'Kunci pengaturan tidak valid');
+    }
+
+    const tenantId = (
+      req.body?.tenantId ||
+      req.body?.tenant_id ||
+      req.user?.tenantId ||
+      req.user?.tenant_id ||
+      ''
+    )
+      .toString()
+      .trim();
+
+    if (!tenantId) {
+      return jsonError(res, 400, 'tenantId wajib diisi');
+    }
+
+    const printerConfigs = normalizePrinterConfigs(
+      req.body?.printerConfigs ?? req.body?.printer_configs ?? req.body?.value,
+    );
+
+    const pool = getSharedPool();
+    const tenantColumns = await getTableColumnSet(pool, 'tenants');
+    if (!(tenantColumns instanceof Set) || !tenantColumns.has('printer_configs')) {
+      return jsonError(res, 500, 'Kolom printer_configs belum tersedia di tenants');
+    }
+
+    await pool.query(
+      `UPDATE tenants
+       SET printer_configs = $1::jsonb,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [JSON.stringify(printerConfigs), tenantId],
+    );
+
+    return jsonOk(res, {
+      tenantId,
+      printerConfigs,
+    }, 'Konfigurasi printer berhasil disimpan');
+  } catch (error) {
+    console.error('[settingsController.updateTenantPrinterConfigs] Error:', error.message);
+    return jsonError(res, 500, 'Gagal menyimpan konfigurasi printer', error.message);
+  }
+};
+
 module.exports = {
   getSettings,
   getTenantSettings,
   updateTenantQrisImage,
   updateTenantReceiptFooter,
+  updateTenantPrinterConfigs,
 };

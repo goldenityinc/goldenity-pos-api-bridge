@@ -513,6 +513,36 @@ const parseJsonArraySafe = (raw) => {
   }
 };
 
+const parseBatchSequence = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
+  }
+  return Math.floor(parsed);
+};
+
+const getItemBatchSequence = (item) => {
+  if (!item || typeof item !== 'object') {
+    return 0;
+  }
+
+  return parseBatchSequence(
+    item.batch_sequence ??
+    item.batchSequence ??
+    item.batch ??
+    item.sequence,
+  );
+};
+
+const stampItemsWithBatchSequence = (items, batchSequence) => {
+  const sequence = parseBatchSequence(batchSequence) || 1;
+  return items.map((item) => ({
+    ...item,
+    batch_sequence: sequence,
+    batchSequence: sequence,
+  }));
+};
+
 const getQrMenu = async (req, res) => {
   try {
     const tenantId = parseTenantId(req.params.tenantId);
@@ -525,9 +555,11 @@ const getQrMenu = async (req, res) => {
     const softDeletePredicate = resolveSoftDeletePredicate(productColumns);
     const categoryColumns = await getTableColumnSet(pool, 'categories');
     const categorySoftDeletePredicate = resolveSoftDeletePredicate(categoryColumns);
+    const supportsPrintDestination = productColumns.has('print_destination');
 
     const result = await pool.query(
             `SELECT id, name, category, product_type, price, stock, image_url, unit,
+              ${supportsPrintDestination ? 'print_destination,' : 'NULL::text AS print_destination,'}
               COALESCE(is_service, false) AS is_service,
               COALESCE(is_available, true) AS is_available
        FROM products
@@ -677,6 +709,8 @@ const getQrMenu = async (req, res) => {
         unit: (row.unit || 'pcs').toString().trim() || 'pcs',
         unit_name: (row.unit || 'pcs').toString().trim() || 'pcs',
         price: Number(row.price || 0),
+        print_destination: (row.print_destination || 'CASHIER').toString().trim().toUpperCase() || 'CASHIER',
+        printDestination: (row.print_destination || 'CASHIER').toString().trim().toUpperCase() || 'CASHIER',
         is_available: row.is_available !== false,
         isAvailable: row.is_available !== false && (Number(row.stock || 0) > 0 || row.is_service === true),
         stock: Number(row.stock || 0),
@@ -967,9 +1001,37 @@ const createQrOrder = async (req, res) => {
     let responseStatusCode = 201;
 
     const existingSale = existingSaleResult.rows?.[0] || null;
+    const salesRecordItemColumns = await getTableColumnSet(client, 'sales_record_items');
+    const supportsBatchSequence = salesRecordItemColumns.has('batch_sequence');
+    let currentBatchSequence = 1;
+    let newItemsPayload = stampItemsWithBatchSequence(normalizedItems, currentBatchSequence);
+    let mergedItemsJsonPayload = [...newItemsPayload];
+
     if (existingSale) {
       orderAction = 'APPENDED_TO_EXISTING';
       responseStatusCode = 200;
+
+      const existingBatchFromItems = parseJsonArraySafe(existingSale.items_json)
+        .reduce((maxSequence, item) => Math.max(maxSequence, getItemBatchSequence(item)), 0);
+
+      let existingBatchFromRows = 0;
+      if (supportsBatchSequence) {
+        const existingBatchResult = await client.query(
+          `SELECT COALESCE(MAX(batch_sequence), 0) AS max_batch_sequence
+           FROM sales_record_items
+           WHERE tenant_id = $1
+             AND sales_record_id = $2`,
+          [tenantId, existingSale.id],
+        );
+        existingBatchFromRows = parseBatchSequence(existingBatchResult.rows?.[0]?.max_batch_sequence);
+      }
+
+      currentBatchSequence = Math.max(existingBatchFromItems, existingBatchFromRows) + 1;
+      newItemsPayload = stampItemsWithBatchSequence(normalizedItems, currentBatchSequence);
+      mergedItemsJsonPayload = [
+        ...parseJsonArraySafe(existingSale.items_json),
+        ...newItemsPayload,
+      ];
 
       const existingTotalAmount = Number(existingSale.total_amount ?? existingSale.total_price ?? 0) || 0;
       const mergedTotalAmount = existingTotalAmount + totalAmount;
@@ -986,10 +1048,7 @@ const createQrOrder = async (req, res) => {
       }
 
       const mergedItemsJson = supportsItemsJson
-        ? JSON.stringify([
-            ...parseJsonArraySafe(existingSale.items_json),
-            ...normalizedItems,
-          ])
+        ? JSON.stringify(mergedItemsJsonPayload)
         : null;
 
       const updateFields = [
@@ -1044,6 +1103,9 @@ const createQrOrder = async (req, res) => {
     } else {
       const referenceId = `qr_${Date.now()}`;
       const receiptNumber = generateReceiptNumber();
+      currentBatchSequence = 1;
+      newItemsPayload = stampItemsWithBatchSequence(normalizedItems, currentBatchSequence);
+      mergedItemsJsonPayload = [...newItemsPayload];
 
       const saleInsert = await client.query(
         `INSERT INTO sales_records (
@@ -1087,7 +1149,7 @@ const createQrOrder = async (req, res) => {
           totalAmount,
           customerName,
           'Online Order',
-          JSON.stringify(normalizedItems),
+          JSON.stringify(newItemsPayload),
           paymentState.paymentStatus === 'PAID' ? totalAmount : 0,
           ...(supportsPaymentProofUrl ? [paymentProofUrl] : []),
         ],
@@ -1101,9 +1163,21 @@ const createQrOrder = async (req, res) => {
       }
     }
 
-    for (const item of normalizedItems) {
-      await client.query(
-        `INSERT INTO sales_record_items (
+    const salesRecordItemInsertSql = supportsBatchSequence
+      ? `INSERT INTO sales_record_items (
+           tenant_id,
+           sales_record_id,
+           product_id,
+           product_name,
+           qty,
+           custom_price,
+           note,
+           is_service,
+           batch_sequence,
+           created_at,
+           updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())`
+      : `INSERT INTO sales_record_items (
            tenant_id,
            sales_record_id,
            product_id,
@@ -1114,17 +1188,33 @@ const createQrOrder = async (req, res) => {
            is_service,
            created_at,
            updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`,
-        [
-          tenantId,
-          sale.id,
-          item.productId,
-          item.productName,
-          item.qty,
-          item.customPrice,
-          item.note,
-          item.isService,
-        ],
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`;
+
+    for (const item of normalizedItems) {
+      await client.query(
+        salesRecordItemInsertSql,
+        supportsBatchSequence
+          ? [
+              tenantId,
+              sale.id,
+              item.productId,
+              item.productName,
+              item.qty,
+              item.customPrice,
+              item.note,
+              item.isService,
+              currentBatchSequence,
+            ]
+          : [
+              tenantId,
+              sale.id,
+              item.productId,
+              item.productName,
+              item.qty,
+              item.customPrice,
+              item.note,
+              item.isService,
+            ],
       );
 
       if (!item.isService) {
@@ -1172,9 +1262,23 @@ const createQrOrder = async (req, res) => {
     const totalItems = normalizedItems.reduce((sum, item) => sum + (Number(item.qty || 0) || 0), 0);
     const tableLabel = (tableResult.rows?.[0]?.table_number || '').toString().trim();
     const effectivePaymentProofUrl = (sale.payment_proof_url || paymentProofUrl || '').toString().trim() || null;
-
-    emitToTenant(tenantId, 'incoming_qr_order', {
-      tenantId,
+    const payloadItems = newItemsPayload.map((item) => ({
+      product_id: item.productId,
+      productId: item.productId,
+      product_name: item.productName,
+      productName: item.productName,
+      qty: Number(item.qty || 0) || 0,
+      custom_price: Number(item.customPrice || 0) || 0,
+      customPrice: Number(item.customPrice || 0) || 0,
+      note: item.note || '',
+      item_note: item.note || '',
+      notes: item.note || '',
+      is_service: item.isService === true,
+      isService: item.isService === true,
+      batch_sequence: currentBatchSequence,
+      batchSequence: currentBatchSequence,
+    }));
+    const orderPayload = {
       orderId: sale.id,
       orderAction,
       order_action: orderAction,
@@ -1184,10 +1288,16 @@ const createQrOrder = async (req, res) => {
       branchName: (branchMeta?.name || '').toString().trim() || null,
       branchCode: (branchMeta?.branch_code || '').toString().trim() || null,
       tableId,
+      table_id: tableId,
       tableName: tableLabel || String(tableId),
       table_number: tableLabel || null,
       orderType: 'DINE_IN',
       order_type: 'DINE_IN',
+      currentBatchSequence,
+      current_batch_sequence: currentBatchSequence,
+      new_items: payloadItems,
+      items: payloadItems,
+      items_json: mergedItemsJsonPayload,
       orderStatus: sale.order_status,
       paymentStatus: sale.payment_status,
       paymentMethod: sale.payment_method,
@@ -1199,49 +1309,19 @@ const createQrOrder = async (req, res) => {
       specialNote: orderNote || null,
       totalItems,
       grandTotal: Number(sale.total_amount || 0),
-      items: normalizedItems.map((item) => ({
-        product_id: item.productId,
-        product_name: item.productName,
-        qty: Number(item.qty || 0) || 0,
-        custom_price: Number(item.customPrice || 0) || 0,
-        note: item.note || '',
-        item_note: item.note || '',
-        notes: item.note || '',
-        is_service: item.isService === true,
-      })),
-      items_json: normalizedItems.map((item) => ({
-        product_id: item.productId,
-        product_name: item.productName,
-        qty: Number(item.qty || 0) || 0,
-        custom_price: Number(item.customPrice || 0) || 0,
-        note: item.note || '',
-        item_note: item.note || '',
-        notes: item.note || '',
-        is_service: item.isService === true,
-      })),
       created_at: new Date().toISOString(),
+    };
+
+    emitToTenant(tenantId, 'incoming_qr_order', {
+      tenantId,
+      ...orderPayload,
     });
 
     emitToTenant(tenantId, 'qr_order_payment_status', {
       tenantId,
-      orderId: sale.id,
-      orderAction,
-      order_action: orderAction,
-      referenceId: sale.reference_id,
-      receiptNumber: sale.receipt_number,
-      branchId: branchId,
-      tableId: tableId,
-      table_number: tableLabel || null,
-      orderType: 'DINE_IN',
+      ...orderPayload,
       orderNote: orderNote || null,
-      special_note: orderNote || null,
       paymentMethod,
-      paymentStatus: sale.payment_status,
-      orderStatus: sale.order_status,
-      paymentProofUrl: effectivePaymentProofUrl,
-      payment_proof_url: effectivePaymentProofUrl,
-      totalItems,
-      grandTotal: Number(sale.total_amount || 0),
       updatedAt: new Date().toISOString(),
     });
 
@@ -1249,14 +1329,7 @@ const createQrOrder = async (req, res) => {
       res,
       {
         ...sale,
-        orderAction,
-        order_action: orderAction,
-        table_id: tableId,
-        table_number: tableLabel || null,
-        order_type: 'DINE_IN',
-        special_note: orderNote || null,
-        order_note: orderNote || null,
-        payment_proof_url: effectivePaymentProofUrl,
+        ...orderPayload,
         branch_id: branchId,
         branch_name: (branchMeta?.name || '').toString().trim() || null,
         branch_code: (branchMeta?.branch_code || '').toString().trim() || null,

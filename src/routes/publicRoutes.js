@@ -7,6 +7,7 @@ const settingsRoutes = require('./settingsRoutes');
 const {
 	updateTenantQrisImage,
 	updateTenantReceiptFooter,
+	updateTenantPrinterConfigs,
 } = require('../controllers/settingsController');
 const {
 	getQrMenu,
@@ -30,6 +31,7 @@ router.post('/auth/login', login);
 router.use('/api/v1/settings', settingsRoutes);
 router.post('/api/v1/settings/qris-image', paymentProofUpload.single('qrisImage'), updateTenantQrisImage);
 router.post('/api/v1/settings/receipt-footer', updateTenantReceiptFooter);
+router.post('/api/v1/settings/printer-configs', updateTenantPrinterConfigs);
 
 router.get('/api/v1/qr-menu/:tenantId', getQrMenu);
 router.post('/api/v1/qr-orders', paymentProofUpload.single('payment_proof'), createQrOrder);
