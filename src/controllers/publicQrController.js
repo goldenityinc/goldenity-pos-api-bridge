@@ -543,6 +543,49 @@ const stampItemsWithBatchSequence = (items, batchSequence) => {
   }));
 };
 
+const toQrOrderPayloadItems = (items) => {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return null;
+      }
+
+      const productId = (item.productId ?? item.product_id ?? '').toString().trim();
+      const productName = (item.productName ?? item.product_name ?? '').toString().trim();
+      const qty = Number(item.qty || 0);
+      const customPrice = Number(item.customPrice ?? item.custom_price ?? 0);
+      const note = (item.note ?? item.item_note ?? item.notes ?? '').toString().trim();
+      const isService = item.isService === true || item.is_service === true;
+      const batchSequence = parseBatchSequence(item.batchSequence ?? item.batch_sequence ?? item.batch ?? item.sequence) || 1;
+
+      if ((!productId && !isService) || !Number.isFinite(qty) || qty <= 0) {
+        return null;
+      }
+
+      return {
+        product_id: productId || null,
+        productId: productId || null,
+        product_name: productName || null,
+        productName: productName || null,
+        qty,
+        custom_price: Number.isFinite(customPrice) ? customPrice : 0,
+        customPrice: Number.isFinite(customPrice) ? customPrice : 0,
+        note: note || '',
+        item_note: note || '',
+        notes: note || '',
+        is_service: isService,
+        isService,
+        batch_sequence: batchSequence,
+        batchSequence,
+      };
+    })
+    .filter(Boolean);
+};
+
 const getQrMenu = async (req, res) => {
   try {
     const tenantId = parseTenantId(req.params.tenantId);
@@ -962,6 +1005,7 @@ const createQrOrder = async (req, res) => {
     const supportsIsVoid = salesRecordColumns.has('is_void');
     const supportsAmountPaid = salesRecordColumns.has('amount_paid');
     const supportsItemsJson = salesRecordColumns.has('items_json');
+    const supportsItems = salesRecordColumns.has('items');
     const supportsSpecialNote = salesRecordColumns.has('special_note');
     const supportsPaymentProofUrl = salesRecordColumns.has('payment_proof_url');
     const activeSaleFilters = ['tenant_id = $1', 'table_id = $2'];
@@ -1004,6 +1048,7 @@ const createQrOrder = async (req, res) => {
               ${supportsPaymentStatus ? 'payment_status,' : 'NULL::text AS payment_status,'}
               payment_method,
               ${supportsItemsJson ? 'items_json,' : 'NULL::jsonb AS items_json,'}
+              ${supportsItems ? 'items,' : 'NULL::jsonb AS items,'}
               ${supportsAmountPaid ? 'amount_paid,' : 'NULL::numeric AS amount_paid,'}
               ${supportsSpecialNote ? 'special_note,' : 'NULL::text AS special_note,'}
               ${supportsPaymentProofUrl ? 'payment_proof_url,' : 'NULL::text AS payment_proof_url,'}
@@ -1031,7 +1076,7 @@ const createQrOrder = async (req, res) => {
       orderAction = 'APPENDED_TO_EXISTING';
       responseStatusCode = 200;
 
-      const existingBatchFromItems = parseJsonArraySafe(existingSale.items_json)
+      const existingBatchFromItems = parseJsonArraySafe(existingSale.items_json ?? existingSale.items)
         .reduce((maxSequence, item) => Math.max(maxSequence, getItemBatchSequence(item)), 0);
 
       let existingBatchFromRows = 0;
@@ -1048,9 +1093,13 @@ const createQrOrder = async (req, res) => {
 
       currentBatchSequence = Math.max(existingBatchFromItems, existingBatchFromRows) + 1;
       newItemsPayload = stampItemsWithBatchSequence(normalizedItems, currentBatchSequence);
+      const newItemsStructuredPayload = toQrOrderPayloadItems(newItemsPayload);
+      const existingItemsStructuredPayload = toQrOrderPayloadItems(
+        parseJsonArraySafe(existingSale.items_json ?? existingSale.items),
+      );
       mergedItemsJsonPayload = [
-        ...parseJsonArraySafe(existingSale.items_json),
-        ...newItemsPayload,
+        ...existingItemsStructuredPayload,
+        ...newItemsStructuredPayload,
       ];
 
       const existingTotalAmount = Number(existingSale.total_amount ?? existingSale.total_price ?? 0) || 0;
@@ -1067,7 +1116,7 @@ const createQrOrder = async (req, res) => {
         }
       }
 
-      const mergedItemsJson = supportsItemsJson
+      const mergedItemsJson = (supportsItemsJson || supportsItems)
         ? JSON.stringify(mergedItemsJsonPayload)
         : null;
 
@@ -1082,6 +1131,12 @@ const createQrOrder = async (req, res) => {
       if (supportsItemsJson) {
         paramIndex += 1;
         updateFields.push(`items_json = $${paramIndex}::jsonb`);
+        updateParams.push(mergedItemsJson);
+      }
+
+      if (supportsItems) {
+        paramIndex += 1;
+        updateFields.push(`items = $${paramIndex}`);
         updateParams.push(mergedItemsJson);
       }
 
@@ -1125,54 +1180,81 @@ const createQrOrder = async (req, res) => {
       const receiptNumber = generateReceiptNumber();
       currentBatchSequence = 1;
       newItemsPayload = stampItemsWithBatchSequence(normalizedItems, currentBatchSequence);
-      mergedItemsJsonPayload = [...newItemsPayload];
+      mergedItemsJsonPayload = toQrOrderPayloadItems(newItemsPayload);
+
+      const insertColumns = [
+        'tenant_id',
+        'branch_id',
+        'table_id',
+        'reference_id',
+        'receipt_number',
+        'payment_method',
+        'payment_status',
+        'order_type',
+        'order_status',
+        'total_price',
+        'total_amount',
+        'customer_name',
+        'cashier_name',
+      ];
+      const insertValues = [
+        tenantId,
+        branchId,
+        tableId,
+        referenceId,
+        receiptNumber,
+        paymentState.paymentMethodLabel,
+        paymentState.paymentStatus,
+        'DINE_IN',
+        paymentState.orderStatus,
+        totalAmount,
+        totalAmount,
+        customerName,
+        'Online Order',
+      ];
+
+      if (supportsItemsJson) {
+        insertColumns.push('items_json');
+        insertValues.push(JSON.stringify(mergedItemsJsonPayload));
+      }
+
+      if (supportsItems) {
+        insertColumns.push('items');
+        insertValues.push(JSON.stringify(mergedItemsJsonPayload));
+      }
+
+      insertColumns.push('amount_paid');
+      insertValues.push(paymentState.paymentStatus === 'PAID' ? totalAmount : 0);
+
+      if (supportsPaymentProofUrl) {
+        insertColumns.push('payment_proof_url');
+        insertValues.push(paymentProofUrl);
+      }
+
+      insertColumns.push('created_at');
+      insertColumns.push('updated_at');
+
+      const insertPlaceholders = insertValues.map((_, index) => {
+        const param = `$${index + 1}`;
+        const columnName = insertColumns[index];
+        if (columnName === 'items_json') {
+          return `${param}::jsonb`;
+        }
+        return param;
+      });
+
+      insertPlaceholders.push('NOW()');
+      insertPlaceholders.push('NOW()');
 
       const saleInsert = await client.query(
         `INSERT INTO sales_records (
-           tenant_id,
-           branch_id,
-           table_id,
-           reference_id,
-           receipt_number,
-           payment_method,
-           payment_status,
-           order_type,
-           order_status,
-           total_price,
-           total_amount,
-           customer_name,
-           cashier_name,
-           items_json,
-           amount_paid,
-           ${supportsPaymentProofUrl ? 'payment_proof_url,' : ''}
-           created_at,
-           updated_at
+           ${insertColumns.join(',\n           ')}
          )
          VALUES (
-           $1, $2, $3, $4, $5, $6, $7, $8, $9,
-           $10, $11, $12, $13, $14::jsonb, $15,
-           ${supportsPaymentProofUrl ? '$16,' : ''}
-           NOW(), NOW()
+           ${insertPlaceholders.join(', ')}
          )
          RETURNING id, reference_id, receipt_number, cashier_name, order_status, payment_status, payment_method, total_amount${supportsPaymentProofUrl ? ', payment_proof_url' : ''}`,
-        [
-          tenantId,
-          branchId,
-          tableId,
-          referenceId,
-          receiptNumber,
-          paymentState.paymentMethodLabel,
-          paymentState.paymentStatus,
-          'DINE_IN',
-          paymentState.orderStatus,
-          totalAmount,
-          totalAmount,
-          customerName,
-          'Online Order',
-          JSON.stringify(newItemsPayload),
-          paymentState.paymentStatus === 'PAID' ? totalAmount : 0,
-          ...(supportsPaymentProofUrl ? [paymentProofUrl] : []),
-        ],
+        insertValues,
       );
 
       sale = saleInsert.rows?.[0] || null;
@@ -1282,22 +1364,7 @@ const createQrOrder = async (req, res) => {
     const totalItems = normalizedItems.reduce((sum, item) => sum + (Number(item.qty || 0) || 0), 0);
     const tableLabel = (tableResult.rows?.[0]?.table_number || '').toString().trim();
     const effectivePaymentProofUrl = (sale.payment_proof_url || paymentProofUrl || '').toString().trim() || null;
-    const payloadItems = newItemsPayload.map((item) => ({
-      product_id: item.productId,
-      productId: item.productId,
-      product_name: item.productName,
-      productName: item.productName,
-      qty: Number(item.qty || 0) || 0,
-      custom_price: Number(item.customPrice || 0) || 0,
-      customPrice: Number(item.customPrice || 0) || 0,
-      note: item.note || '',
-      item_note: item.note || '',
-      notes: item.note || '',
-      is_service: item.isService === true,
-      isService: item.isService === true,
-      batch_sequence: currentBatchSequence,
-      batchSequence: currentBatchSequence,
-    }));
+    const payloadItems = toQrOrderPayloadItems(newItemsPayload);
     const orderPayload = {
       tenantId,
       tenant_id: tenantId,
