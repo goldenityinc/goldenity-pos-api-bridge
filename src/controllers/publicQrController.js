@@ -1299,6 +1299,8 @@ const createQrOrder = async (req, res) => {
       batchSequence: currentBatchSequence,
     }));
     const orderPayload = {
+      tenantId,
+      tenant_id: tenantId,
       orderId: sale.id,
       orderAction,
       order_action: orderAction,
@@ -1332,10 +1334,13 @@ const createQrOrder = async (req, res) => {
       created_at: new Date().toISOString(),
     };
 
-    emitToTenant(tenantId, 'incoming_qr_order', {
-      tenantId,
+    const incomingQrOrderPayload = {
       ...orderPayload,
-    });
+      orderAction: 'NEW_ORDER',
+      order_action: 'NEW_ORDER',
+    };
+
+    emitToTenant(tenantId, 'incoming_qr_order', incomingQrOrderPayload);
 
     emitToTenant(tenantId, 'qr_order_payment_status', {
       tenantId,
