@@ -998,189 +998,20 @@ const createQrOrder = async (req, res) => {
     }
 
     const salesRecordColumns = await getTableColumnSet(client, 'sales_records');
-    const supportsBranchIdOnSales = salesRecordColumns.has('branch_id');
-    const supportsOrderStatus = salesRecordColumns.has('order_status');
-    const supportsPaymentStatus = salesRecordColumns.has('payment_status');
-    const supportsStatus = salesRecordColumns.has('status');
-    const supportsIsVoid = salesRecordColumns.has('is_void');
-    const supportsAmountPaid = salesRecordColumns.has('amount_paid');
     const supportsItemsJson = salesRecordColumns.has('items_json');
     const supportsItems = salesRecordColumns.has('items');
     const supportsSpecialNote = salesRecordColumns.has('special_note');
     const supportsPaymentProofUrl = salesRecordColumns.has('payment_proof_url');
-    const activeSaleFilters = ['tenant_id = $1', 'table_id = $2'];
-    const activeSaleParams = [tenantId, tableId];
-
-    if (supportsBranchIdOnSales) {
-      if (branchId !== null) {
-        activeSaleFilters.push(`(branch_id = $${activeSaleParams.length + 1} OR branch_id IS NULL)`);
-        activeSaleParams.push(branchId);
-      }
-    }
-
-    if (supportsIsVoid) {
-      activeSaleFilters.push('COALESCE(is_void, false) = false');
-    }
-
-    const activeStatePredicates = [];
-    if (supportsStatus) {
-      activeStatePredicates.push("UPPER(COALESCE(status::text, '')) = 'ACTIVE'");
-    }
-    if (supportsPaymentStatus) {
-      activeStatePredicates.push("UPPER(COALESCE(payment_status::text, '')) IN ('UNPAID', 'PENDING_PAYMENT', 'PARTIAL', 'PARTIALLY_PAID')");
-    }
-    if (supportsOrderStatus) {
-      activeStatePredicates.push("UPPER(COALESCE(order_status::text, '')) IN ('PENDING', 'PREPARING', 'READY_FOR_PICKUP')");
-    }
-
-    if (activeStatePredicates.length > 0) {
-      activeSaleFilters.push(`(${activeStatePredicates.join(' OR ')})`);
-    }
-
-    const existingSaleResult = await client.query(
-      `SELECT id,
-              reference_id,
-              receipt_number,
-              cashier_name,
-              total_amount,
-              total_price,
-              ${supportsOrderStatus ? 'order_status,' : 'NULL::text AS order_status,'}
-              ${supportsPaymentStatus ? 'payment_status,' : 'NULL::text AS payment_status,'}
-              payment_method,
-              ${supportsItemsJson ? 'items_json,' : 'NULL::jsonb AS items_json,'}
-              ${supportsItems ? 'items,' : 'NULL::jsonb AS items,'}
-              ${supportsAmountPaid ? 'amount_paid,' : 'NULL::numeric AS amount_paid,'}
-              ${supportsSpecialNote ? 'special_note,' : 'NULL::text AS special_note,'}
-              ${supportsPaymentProofUrl ? 'payment_proof_url,' : 'NULL::text AS payment_proof_url,'}
-              customer_name
-       FROM sales_records
-       WHERE ${activeSaleFilters.join(' AND ')}
-       ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
-       LIMIT 1
-       FOR UPDATE`,
-      activeSaleParams,
-    );
-
     let sale = null;
     let orderAction = 'NEW_ORDER';
-    let responseStatusCode = 201;
-
-    const existingSale = existingSaleResult.rows?.[0] || null;
+    const responseStatusCode = 201;
     const salesRecordItemColumns = await getTableColumnSet(client, 'sales_record_items');
     const supportsBatchSequence = salesRecordItemColumns.has('batch_sequence');
-    let currentBatchSequence = 1;
-    let newItemsPayload = stampItemsWithBatchSequence(normalizedItems, currentBatchSequence);
-    let mergedItemsJsonPayload = [...newItemsPayload];
-
-    if (existingSale) {
-      orderAction = 'APPENDED_TO_EXISTING';
-      responseStatusCode = 200;
-
-      const existingBatchFromItems = parseJsonArraySafe(existingSale.items_json ?? existingSale.items)
-        .reduce((maxSequence, item) => Math.max(maxSequence, getItemBatchSequence(item)), 0);
-
-      let existingBatchFromRows = 0;
-      if (supportsBatchSequence) {
-        const existingBatchResult = await client.query(
-          `SELECT COALESCE(MAX(batch_sequence), 0) AS max_batch_sequence
-           FROM sales_record_items
-           WHERE tenant_id = $1
-             AND sales_record_id = $2`,
-          [tenantId, existingSale.id],
-        );
-        existingBatchFromRows = parseBatchSequence(existingBatchResult.rows?.[0]?.max_batch_sequence);
-      }
-
-      currentBatchSequence = Math.max(existingBatchFromItems, existingBatchFromRows) + 1;
-      newItemsPayload = stampItemsWithBatchSequence(normalizedItems, currentBatchSequence);
-      const newItemsStructuredPayload = toQrOrderPayloadItems(newItemsPayload);
-      const existingItemsStructuredPayload = toQrOrderPayloadItems(
-        parseJsonArraySafe(existingSale.items_json ?? existingSale.items),
-      );
-      mergedItemsJsonPayload = [
-        ...existingItemsStructuredPayload,
-        ...newItemsStructuredPayload,
-      ];
-
-      const existingTotalAmount = Number(existingSale.total_amount ?? existingSale.total_price ?? 0) || 0;
-      const mergedTotalAmount = existingTotalAmount + totalAmount;
-      const previousAmountPaid = Number(existingSale.amount_paid || 0) || 0;
-
-      let nextPaymentStatus = existingSale.payment_status;
-      if (supportsPaymentStatus && previousAmountPaid < mergedTotalAmount) {
-        const methodLabel = (existingSale.payment_method || paymentState.paymentMethodLabel || '').toString().toUpperCase();
-        if (methodLabel.includes('QRIS') || methodLabel.includes('DIGITAL')) {
-          nextPaymentStatus = 'PENDING_PAYMENT';
-        } else {
-          nextPaymentStatus = 'UNPAID';
-        }
-      }
-
-      const mergedItemsJson = (supportsItemsJson || supportsItems)
-        ? JSON.stringify(mergedItemsJsonPayload)
-        : null;
-
-      const updateFields = [
-        'total_price = $1',
-        'total_amount = $2',
-        'updated_at = NOW()',
-      ];
-      const updateParams = [mergedTotalAmount, mergedTotalAmount];
-      let paramIndex = updateParams.length;
-
-      if (supportsItemsJson) {
-        paramIndex += 1;
-        updateFields.push(`items_json = $${paramIndex}::jsonb`);
-        updateParams.push(mergedItemsJson);
-      }
-
-      if (supportsItems) {
-        paramIndex += 1;
-        updateFields.push(`items = $${paramIndex}`);
-        updateParams.push(mergedItemsJson);
-      }
-
-      if (supportsPaymentStatus) {
-        paramIndex += 1;
-        updateFields.push(`payment_status = $${paramIndex}`);
-        updateParams.push(nextPaymentStatus);
-      }
-
-      if (supportsPaymentProofUrl && paymentProofUrl) {
-        paramIndex += 1;
-        updateFields.push(`payment_proof_url = COALESCE(NULLIF(payment_proof_url, ''), $${paramIndex})`);
-        updateParams.push(paymentProofUrl);
-      }
-
-      paramIndex += 1;
-      updateParams.push(tenantId);
-      const tenantParamIndex = paramIndex;
-
-      paramIndex += 1;
-      updateParams.push(existingSale.id);
-      const idParamIndex = paramIndex;
-
-      const saleUpdate = await client.query(
-        `UPDATE sales_records
-         SET ${updateFields.join(', ')}
-         WHERE tenant_id = $${tenantParamIndex}
-           AND id = $${idParamIndex}
-         RETURNING id, reference_id, receipt_number, cashier_name, order_status, payment_status, payment_method, total_amount${supportsPaymentProofUrl ? ', payment_proof_url' : ''}`,
-        updateParams,
-      );
-
-      sale = saleUpdate.rows?.[0] || null;
-      if (!sale) {
-        const error = new Error('Gagal menambahkan item ke pesanan aktif');
-        error.statusCode = 500;
-        throw error;
-      }
-    } else {
-      const referenceId = `qr_${Date.now()}`;
-      const receiptNumber = generateReceiptNumber();
-      currentBatchSequence = 1;
-      newItemsPayload = stampItemsWithBatchSequence(normalizedItems, currentBatchSequence);
-      mergedItemsJsonPayload = toQrOrderPayloadItems(newItemsPayload);
+    const currentBatchSequence = 1;
+    const newItemsPayload = stampItemsWithBatchSequence(normalizedItems, currentBatchSequence);
+    const mergedItemsJsonPayload = toQrOrderPayloadItems(newItemsPayload);
+    const referenceId = `qr_${Date.now()}`;
+    const receiptNumber = generateReceiptNumber();
 
       const insertColumns = [
         'tenant_id',
@@ -1246,23 +1077,22 @@ const createQrOrder = async (req, res) => {
       insertPlaceholders.push('NOW()');
       insertPlaceholders.push('NOW()');
 
-      const saleInsert = await client.query(
-        `INSERT INTO sales_records (
-           ${insertColumns.join(',\n           ')}
-         )
-         VALUES (
-           ${insertPlaceholders.join(', ')}
-         )
-         RETURNING id, reference_id, receipt_number, cashier_name, order_status, payment_status, payment_method, total_amount${supportsPaymentProofUrl ? ', payment_proof_url' : ''}`,
-        insertValues,
-      );
+    const saleInsert = await client.query(
+      `INSERT INTO sales_records (
+         ${insertColumns.join(',\n           ')}
+       )
+       VALUES (
+         ${insertPlaceholders.join(', ')}
+       )
+       RETURNING id, reference_id, receipt_number, cashier_name, order_status, payment_status, payment_method, total_amount${supportsPaymentProofUrl ? ', payment_proof_url' : ''}`,
+      insertValues,
+    );
 
-      sale = saleInsert.rows?.[0] || null;
-      if (!sale) {
-        const error = new Error('Gagal membuat pesanan QR');
-        error.statusCode = 500;
-        throw error;
-      }
+    sale = saleInsert.rows?.[0] || null;
+    if (!sale) {
+      const error = new Error('Gagal membuat pesanan QR');
+      error.statusCode = 500;
+      throw error;
     }
 
     const salesRecordItemInsertSql = supportsBatchSequence
