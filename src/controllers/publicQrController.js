@@ -843,10 +843,16 @@ const createQrOrder = async (req, res) => {
     const productIds = items.map((item) => item.productId);
     const productColumns = await getTableColumnSet(client, 'products');
     const softDeletePredicate = resolveSoftDeletePredicate(productColumns);
+    const stockTrackedExpression = productColumns.has('is_stock_tracked')
+      ? 'COALESCE(is_stock_tracked, true)'
+      : productColumns.has('stock_tracked')
+        ? 'COALESCE(stock_tracked, true)'
+        : 'true';
     const productsResult = await client.query(
             `SELECT id, name, price,
               COALESCE(is_service, false) AS is_service,
               COALESCE(is_available, true) AS is_available,
+              ${stockTrackedExpression} AS is_stock_tracked,
               COALESCE(stock, 0) AS stock
        FROM products
        WHERE tenant_id = $1
@@ -869,6 +875,7 @@ const createQrOrder = async (req, res) => {
       }
 
       const isService = product.is_service === true;
+      const isStockTracked = product.is_stock_tracked !== false;
       const isAvailable = product.is_available !== false;
       if (!isAvailable) {
         const error = new Error(`Produk sedang habis/tidak tersedia: ${product.name}`);
@@ -876,7 +883,7 @@ const createQrOrder = async (req, res) => {
         throw error;
       }
       const availableStock = Number(product.stock || 0);
-      if (!isService && availableStock < item.qty) {
+      if (!isService && isStockTracked && availableStock < item.qty) {
         const error = new Error(`Stok tidak cukup untuk produk ${product.name}`);
         error.statusCode = 400;
         throw error;
@@ -895,6 +902,7 @@ const createQrOrder = async (req, res) => {
         customPrice: unitPrice,
         note: item.note,
         isService,
+        isStockTracked,
       };
     });
 
@@ -1229,7 +1237,7 @@ const createQrOrder = async (req, res) => {
             ],
       );
 
-      if (!item.isService) {
+      if (!item.isService && item.isStockTracked) {
         await client.query(
           `UPDATE products
            SET stock = COALESCE(stock, 0) - $1,
