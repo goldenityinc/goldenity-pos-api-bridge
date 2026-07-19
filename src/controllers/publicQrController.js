@@ -556,10 +556,21 @@ const getQrMenu = async (req, res) => {
     const categoryColumns = await getTableColumnSet(pool, 'categories');
     const categorySoftDeletePredicate = resolveSoftDeletePredicate(categoryColumns);
     const supportsPrintDestination = productColumns.has('print_destination');
+    const stockTrackedExpression = productColumns.has('is_stock_tracked')
+      ? 'COALESCE(is_stock_tracked, true)'
+      : productColumns.has('stock_tracked')
+        ? 'COALESCE(stock_tracked, true)'
+        : 'true';
+    const stockVisibilityPredicate = `(
+      COALESCE(is_service, false) = true
+      OR COALESCE(stock, 0) > 0
+      OR ${stockTrackedExpression} = false
+    )`;
 
     const result = await pool.query(
             `SELECT id, name, category, product_type, price, stock, image_url, unit,
               ${supportsPrintDestination ? 'print_destination,' : 'NULL::text AS print_destination,'}
+              ${stockTrackedExpression} AS is_stock_tracked,
               COALESCE(is_service, false) AS is_service,
               COALESCE(is_available, true) AS is_available
        FROM products
@@ -570,10 +581,7 @@ const getQrMenu = async (req, res) => {
          AND (
            UPPER(COALESCE(product_type, '')) = ANY($2::text[])
          )
-         AND (
-           COALESCE(is_service, false) = true
-           OR COALESCE(stock, 0) > 0
-         )
+         AND ${stockVisibilityPredicate}
        ORDER BY name ASC`,
       [tenantId, Array.from(FNB_PRODUCT_TYPES), branchId],
     );
@@ -582,6 +590,7 @@ const getQrMenu = async (req, res) => {
     if (rows.length === 0) {
       const fallbackResult = await pool.query(
         `SELECT id, name, category, product_type, price, stock, image_url, unit,
+          ${stockTrackedExpression} AS is_stock_tracked,
           COALESCE(is_service, false) AS is_service,
           COALESCE(is_available, true) AS is_available
          FROM products
@@ -589,10 +598,7 @@ const getQrMenu = async (req, res) => {
            AND ${softDeletePredicate}
            AND ($2::bigint IS NULL OR branch_id = $2)
            AND COALESCE(is_active, true) = true
-           AND (
-             COALESCE(is_service, false) = true
-             OR COALESCE(stock, 0) > 0
-           )
+           AND ${stockVisibilityPredicate}
          ORDER BY name ASC`,
         [tenantId, branchId],
       );
@@ -712,7 +718,13 @@ const getQrMenu = async (req, res) => {
         print_destination: (row.print_destination || 'CASHIER').toString().trim().toUpperCase() || 'CASHIER',
         printDestination: (row.print_destination || 'CASHIER').toString().trim().toUpperCase() || 'CASHIER',
         is_available: row.is_available !== false,
-        isAvailable: row.is_available !== false && (Number(row.stock || 0) > 0 || row.is_service === true),
+        isAvailable:
+          row.is_available !== false && (
+            Number(row.stock || 0) > 0 ||
+            row.is_service === true ||
+            row.is_stock_tracked === false
+          ),
+        is_stock_tracked: row.is_stock_tracked !== false,
         stock: Number(row.stock || 0),
         imageUrl: row.image_url || null,
         sortOrder: 0,
