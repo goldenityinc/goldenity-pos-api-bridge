@@ -21,6 +21,13 @@ const roleModules = [
   'pengaturan',
   'manajemen_user',
   'manajemen_kategori',
+  'manajemen_meja',
+  'laporan_akuntansi',
+  'laporan_shift',
+  'gaji_karyawan',
+  'manajemen_role',
+  'log_aktivitas',
+  'servis_perbaikan',
 ];
 
 const perms = (c, r, u, d) => ({ c, r, u, d });
