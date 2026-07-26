@@ -32,6 +32,177 @@ class BadRequestError extends Error {
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+const TABLE_CLEAR_STATUS = 'AVAILABLE';
+const ACTIVE_PAYMENT_STATUS_SET = new Set([
+  'UNPAID',
+  'OPEN',
+  'PENDING_PAYMENT',
+]);
+const ACTIVE_ORDER_STATUS_SET = new Set([
+  'UNPAID',
+  'OPEN',
+  'PENDING',
+  'PENDING_PAYMENT',
+  'PREPARING',
+  'READY_FOR_PICKUP',
+]);
+const NON_CANCELLABLE_ORDER_STATUS_SET = new Set([
+  'PAID',
+  'SETTLED',
+  'SETTLEMENT',
+  'SUCCESS',
+  'COMPLETED',
+  'LUNAS',
+  'VOID',
+  'VOIDED',
+  'CANCELLED',
+  'CANCELED',
+  'FAILED',
+  'EXPIRED',
+  'DENIED',
+  'BATAL',
+  'DIBATALKAN',
+]);
+
+const normalizeStatusToken = (value) => (value ?? '').toString().trim().toUpperCase();
+
+const shouldAutoCancelOrdersBeforeClearingTable = (table, payload = {}) => {
+  if (table !== 'tables' || !payload || typeof payload !== 'object') {
+    return false;
+  }
+
+  return normalizeStatusToken(payload.status) === TABLE_CLEAR_STATUS;
+};
+
+const isOpenLinkedTableOrder = (row = {}) => {
+  if (!row || typeof row !== 'object') {
+    return false;
+  }
+
+  if (row.is_void === true || row.isVoid === true) {
+    return false;
+  }
+
+  const status = normalizeStatusToken(row.status);
+  const orderStatus = normalizeStatusToken(row.order_status ?? row.orderStatus);
+  const transactionStatus = normalizeStatusToken(
+    row.transaction_status ?? row.transactionStatus,
+  );
+  const paymentStatus = normalizeStatusToken(row.payment_status ?? row.paymentStatus);
+  const tokens = [status, orderStatus, transactionStatus, paymentStatus].filter(Boolean);
+
+  if (tokens.some((token) => NON_CANCELLABLE_ORDER_STATUS_SET.has(token))) {
+    return false;
+  }
+
+  if (ACTIVE_PAYMENT_STATUS_SET.has(paymentStatus)) {
+    return true;
+  }
+
+  return [status, orderStatus, transactionStatus].some((token) => (
+    ACTIVE_ORDER_STATUS_SET.has(token)
+  ));
+};
+
+const cancelLinkedOrdersForClearedTable = async ({
+  db,
+  tenantId,
+  tableId,
+}) => {
+  await ensureTenantScopedTable(db, 'sales_records', tenantId);
+  const columnDefinitions = await getTableColumnDefinitions(db, 'sales_records');
+  const columnSet = new Set(columnDefinitions.keys());
+
+  if (!columnSet.has('table_id')) {
+    return [];
+  }
+
+  const selectValues = [tableId];
+  let selectSql = 'SELECT * FROM "sales_records" WHERE "table_id" = $1';
+  if (columnSet.has('tenant_id')) {
+    selectValues.push(tenantId);
+    selectSql += ` AND "tenant_id" = $${selectValues.length}`;
+  }
+
+  const existingOrdersResult = await db.query(selectSql, selectValues);
+  const ordersToCancel = (existingOrdersResult.rows || []).filter(isOpenLinkedTableOrder);
+
+  if (ordersToCancel.length === 0) {
+    return [];
+  }
+
+  const updateEntries = [];
+  const addUpdate = (columnName, value) => {
+    if (!columnSet.has(columnName)) {
+      return;
+    }
+
+    updateEntries.push({ columnName, value });
+  };
+
+  const nowIso = new Date().toISOString();
+  addUpdate('status', 'CANCELLED');
+  addUpdate('order_status', 'CANCELLED');
+  addUpdate('transaction_status', 'VOID');
+  addUpdate('payment_status', 'CANCELLED');
+  addUpdate('is_void', true);
+  addUpdate('isVoid', true);
+  addUpdate('void_reason', 'TABLE_CLEARED');
+  addUpdate('voided_at', nowIso);
+  addUpdate('updated_at', nowIso);
+
+  if (updateEntries.length === 0) {
+    return [];
+  }
+
+  const cancelledIds = ordersToCancel
+    .map((row) => Number.parseInt((row?.id ?? '').toString(), 10))
+    .filter((value) => Number.isFinite(value) && value > 0);
+
+  if (cancelledIds.length === 0) {
+    return [];
+  }
+
+  const updateValues = [];
+  const setClauses = updateEntries.map(({ columnName, value }, index) => {
+    updateValues.push(value);
+    return `"${columnName}" = $${index + 1}`;
+  });
+
+  updateValues.push(cancelledIds);
+  const idParamPosition = updateValues.length;
+  let updateSql = `UPDATE "sales_records"
+                   SET ${setClauses.join(', ')}
+                   WHERE "id" = ANY($${idParamPosition}::bigint[])`;
+
+  if (columnSet.has('tenant_id')) {
+    updateValues.push(tenantId);
+    updateSql += ` AND "tenant_id" = $${updateValues.length}`;
+  }
+
+  updateSql += ' RETURNING *';
+
+  const cancelledResult = await db.query(updateSql, updateValues);
+  return cancelledResult.rows || [];
+};
+
+const getQueryableClient = async (tenantDb) => {
+  if (tenantDb && typeof tenantDb.connect === 'function') {
+    const client = await tenantDb.connect();
+    return {
+      db: client,
+      release: () => client.release(),
+      supportsTransactions: true,
+    };
+  }
+
+  return {
+    db: tenantDb,
+    release: () => {},
+    supportsTransactions: false,
+  };
+};
+
 const isIntegerColumnDefinition = (columnDefinition = {}) => {
   const dataType = `${columnDefinition.dataType || ''}`.toLowerCase();
   const udtName = `${columnDefinition.udtName || ''}`.toLowerCase();
@@ -419,6 +590,63 @@ const createCrudController = (table) => ({
         return jsonOk(res, existing || null, 'Updated');
       }
       const columnSet = new Set(columnDefinitions.keys());
+      if (shouldAutoCancelOrdersBeforeClearingTable(table, filteredPayload)) {
+        const { db, release, supportsTransactions } = await getQueryableClient(req.tenantDb);
+
+        try {
+          let cancelledOrders = [];
+          if (supportsTransactions) {
+            await db.query('BEGIN');
+          }
+
+          cancelledOrders = await cancelLinkedOrdersForClearedTable({
+            db,
+            tenantId,
+            tableId: req.params.id,
+          });
+
+          const { sql, values } = buildUpdateQuery(
+            table,
+            filteredPayload,
+            idField,
+            req.params.id,
+            { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
+          );
+          const result = await db.query(sql, values);
+
+          if (supportsTransactions) {
+            await db.query('COMMIT');
+          }
+
+          for (const cancelledOrder of cancelledOrders) {
+            emitTableMutation(req, {
+              table: 'sales_records',
+              action: 'UPDATE',
+              record: cancelledOrder,
+              extra: {
+                mutationType: 'TRANSACTION_CANCELLED',
+                reason: 'table_cleared',
+              },
+            });
+          }
+
+          emitTableMutation(req, {
+            table,
+            action: 'UPDATE',
+            record: result.rows[0] || null,
+            id: req.params.id,
+          });
+          return jsonOk(res, result.rows[0] || null, 'Updated');
+        } catch (error) {
+          if (supportsTransactions) {
+            await db.query('ROLLBACK').catch(() => {});
+          }
+          throw error;
+        } finally {
+          release();
+        }
+      }
+
       const { sql, values } = buildUpdateQuery(
         table,
         filteredPayload,
