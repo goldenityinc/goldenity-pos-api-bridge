@@ -7,6 +7,13 @@ const { normalizeTenantId, getTableColumnSet } = require('../utils/sqlHelpers');
 const { emitToTenant } = require('../services/socketServer');
 const { uploadBase64Object } = require('../services/objectStorageService');
 const { validatePaymentProof } = require('../utils/receiptScanner');
+const {
+  isTransientDbError,
+  withRetries,
+  getClientFromPool,
+  runTransaction,
+  storeFailedPayload,
+} = require('../utils/dbSafe');
 
 const FNB_PRODUCT_TYPES = new Set(['FOOD', 'BEVERAGE', 'FNB', 'F&B', 'MENU']);
 const PAYMENT_METHOD_CASHIER = 'CASHIER';
@@ -799,99 +806,271 @@ const getQrMenu = async (req, res) => {
   }
 };
 
+const generateReferenceId = (clientProvided = '') => {
+  const trimmed = (clientProvided || '').toString().trim();
+  if (trimmed) return trimmed;
+  const stamp = Date.now();
+  const rand = crypto.randomBytes(6).toString('hex');
+  return `qr_${stamp}_${rand}`;
+};
+
+const findExistingSaleByReferenceId = async (clientOrPool, { tenantId, referenceId, hasTenantColumn }) => {
+  const sql = hasTenantColumn
+    ? 'SELECT * FROM sales_records WHERE reference_id = $1 AND tenant_id = $2 ORDER BY id DESC LIMIT 1'
+    : 'SELECT * FROM sales_records WHERE reference_id = $1 ORDER BY id DESC LIMIT 1';
+  const params = hasTenantColumn ? [referenceId, tenantId] : [referenceId];
+  const result = await clientOrPool.query(sql, params);
+  return result.rows?.[0] || null;
+};
+
+const buildQrOrderPayload = ({
+  tenantId,
+  branchMeta,
+  tableId,
+  tableResult,
+  normalizedItems,
+  newItemsPayload,
+  mergedItemsJsonPayload,
+  paymentState,
+  sale,
+  paymentProofUrl,
+  customerName,
+  orderNote,
+  orderAction,
+  currentBatchSequence,
+}) => {
+  const totalItems = normalizedItems.reduce((sum, item) => sum + (Number(item.qty || 0) || 0), 0);
+  const tableLabel = (tableResult.rows?.[0]?.table_number || '').toString().trim();
+  const effectivePaymentProofUrl = (sale.payment_proof_url || paymentProofUrl || '').toString().trim() || null;
+  const payloadItems = toQrOrderPayloadItems(newItemsPayload);
+  const branchId = branchMeta?.id ?? null;
+  const orderPayload = {
+    tenantId,
+    tenant_id: tenantId,
+    orderId: sale.id,
+    orderAction,
+    order_action: orderAction,
+    referenceId: sale.reference_id,
+    receiptNumber: sale.receipt_number,
+    branchId,
+    branchName: (branchMeta?.name || '').toString().trim() || null,
+    branchCode: (branchMeta?.branch_code || '').toString().trim() || null,
+    tableId,
+    table_id: tableId,
+    tableName: tableLabel || String(tableId),
+    table_number: tableLabel || null,
+    orderType: 'DINE_IN',
+    order_type: 'DINE_IN',
+    currentBatchSequence,
+    current_batch_sequence: currentBatchSequence,
+    new_items: payloadItems,
+    items: payloadItems,
+    items_json: mergedItemsJsonPayload,
+    orderStatus: sale.order_status,
+    paymentStatus: sale.payment_status,
+    paymentMethod: sale.payment_method,
+    paymentProofUrl: effectivePaymentProofUrl,
+    payment_proof_url: effectivePaymentProofUrl,
+    customerName,
+    orderNote,
+    special_note: orderNote || null,
+    specialNote: orderNote || null,
+    totalItems,
+    grandTotal: Number(sale.total_amount || 0),
+    created_at: new Date().toISOString(),
+  };
+
+  return {
+    orderPayload,
+    payloadItems,
+    totalItems,
+    effectivePaymentProofUrl,
+    tableLabel,
+  };
+};
+
 const createQrOrder = async (req, res) => {
   const pool = getSharedPool();
-  const client = await pool.connect();
 
-  try {
-    const tenantId = parseTenantId(req.body.tenantId || req.body.tenant_id);
-    const tableId = parseTableId(req.body.tableId || req.body.table_id);
-    const branchId = parseOptionalBranchId(req.body.branchId || req.body.branch_id);
-    const rawItems = parseRawItems(req.body.items ?? req.body.orderItems);
-    const items = parseOrderItems(rawItems);
-    const customerName = (req.body.customerName || req.body.customer_name || 'Guest').toString().trim() || 'Guest';
-    const orderNote = (
-      req.body.orderNote ??
-      req.body.order_note ??
-      req.body.special_note ??
-      req.body.specialNote ??
-      req.body.customerNote ??
-      req.body.customer_note ??
-      req.body.note ??
-      req.body.notes ??
-      ''
-    ).toString().trim();
-    const paymentMethod = normalizePaymentMethod(
-      req.body.paymentMethod || req.body.payment_method,
-    );
-    const qrOrderSettings = await resolveQrOrderSettings({
-      client,
-      tenantId,
-      branchId,
-    });
-    const paymentProofPayload = resolvePaymentProofPayload({ req });
-    const validationBase64Data = resolveValidationBase64Data(paymentProofPayload);
-    const hasUploadedProofImage = Boolean(validationBase64Data);
-    const hasPaymentProof =
-      hasUploadedProofImage ||
-      Boolean((paymentProofPayload.paymentProofUrl || '').toString().trim());
-    let paymentProofUrl = paymentProofPayload.paymentProofUrl || null;
-    let paymentState = resolvePaymentState(paymentMethod);
-    let branchMeta = null;
-
-    if (branchId !== null) {
-      try {
-        const branchResult = await client.query(
-          `SELECT id, name, branch_code
-           FROM branches
-           WHERE tenant_id = $1 AND id = $2
-           LIMIT 1`,
-          [tenantId, branchId],
-        );
-        branchMeta = branchResult.rows?.[0] || null;
-      } catch (branchError) {
-        console.warn('[publicQrController] Branch lookup skipped:', branchError.message);
+  const incomingBody = (req.body && typeof req.body === 'object')
+    ? { ...req.body }
+    : {};
+  const fileMeta = req.file
+    ? {
+        fieldName: req.file.fieldname,
+        originalName: req.file.originalname,
+        mimeType: req.file.mimetype,
+        sizeBytes: req.file.size,
       }
-    }
+    : null;
+  const tenantIdForLog = normalizeTenantId(
+    incomingBody.tenantId ||
+    incomingBody.tenant_id ||
+    req.user?.tenantId ||
+    req.tenant?.tenantId ||
+    '',
+  );
+  let persistedReferenceId = '';
+  let persistedOrderId = '';
+  const requestId = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
 
-    if (paymentMethod === PAYMENT_METHOD_CASHIER && !qrOrderSettings.allowPayAtCashier) {
-      const error = new Error('Pembayaran di kasir sedang dinonaktifkan untuk web ordering.');
-      error.statusCode = 400;
-      throw error;
-    }
+  const runOrderCreation = async () => {
+    const client = await getClientFromPool(pool);
+    try {
+      const tenantId = parseTenantId(incomingBody.tenantId || incomingBody.tenant_id);
+      const tableId = parseTableId(incomingBody.tableId || incomingBody.table_id);
+      const branchId = parseOptionalBranchId(incomingBody.branchId || incomingBody.branch_id);
+      const rawItems = parseRawItems(incomingBody.items ?? incomingBody.orderItems);
+      const items = parseOrderItems(rawItems);
+      const customerName = (
+        incomingBody.customerName ||
+        incomingBody.customer_name ||
+        'Guest'
+      ).toString().trim() || 'Guest';
+      const orderNote = (
+        incomingBody.orderNote ??
+        incomingBody.order_note ??
+        incomingBody.special_note ??
+        incomingBody.specialNote ??
+        incomingBody.customerNote ??
+        incomingBody.customer_note ??
+        incomingBody.note ??
+        incomingBody.notes ??
+        ''
+      ).toString().trim();
+      const paymentMethod = normalizePaymentMethod(
+        incomingBody.paymentMethod || incomingBody.payment_method,
+      );
+      const clientProvidedReferenceId = (
+        incomingBody.referenceId ||
+        incomingBody.reference_id ||
+        incomingBody.localId ||
+        incomingBody.local_id ||
+        incomingBody.idempotencyKey ||
+        incomingBody.idempotency_key ||
+        ''
+      ).toString().trim();
+      const qrOrderSettings = await resolveQrOrderSettings({
+        client,
+        tenantId,
+        branchId,
+      });
+      const paymentProofPayload = resolvePaymentProofPayload({ req });
+      const validationBase64Data = resolveValidationBase64Data(paymentProofPayload);
+      const hasUploadedProofImage = Boolean(validationBase64Data);
+      const hasPaymentProof =
+        hasUploadedProofImage ||
+        Boolean((paymentProofPayload.paymentProofUrl || '').toString().trim());
+      let paymentProofUrl = paymentProofPayload.paymentProofUrl || null;
+      let paymentState = resolvePaymentState(paymentMethod);
+      let branchMeta = null;
 
-    if (paymentMethod === PAYMENT_METHOD_QRIS && qrOrderSettings.isPaymentProofMandatory && !hasPaymentProof) {
-      const error = new Error('Upload bukti transfer QRIS wajib sebelum pesanan dikirim.');
-      error.statusCode = 400;
-      throw error;
-    }
+      if (branchId !== null) {
+        try {
+          const branchResult = await client.query(
+            `SELECT id, name, branch_code
+             FROM branches
+             WHERE tenant_id = $1 AND id = $2
+             LIMIT 1`,
+            [tenantId, branchId],
+          );
+          branchMeta = branchResult.rows?.[0] || null;
+        } catch (branchError) {
+          console.warn('[publicQrController] Branch lookup skipped:', branchError.message);
+        }
+      }
 
-    await client.query('BEGIN');
+      if (paymentMethod === PAYMENT_METHOD_CASHIER && !qrOrderSettings.allowPayAtCashier) {
+        const error = new Error('Pembayaran di kasir sedang dinonaktifkan untuk web ordering.');
+        error.statusCode = 400;
+        throw error;
+      }
 
-    const tableResult = await client.query(
-      `SELECT id, status, table_number
-       FROM tables
-       WHERE id = $1 AND tenant_id = $2
-       LIMIT 1
-       FOR UPDATE`,
-      [tableId, tenantId],
-    );
+      if (paymentMethod === PAYMENT_METHOD_QRIS && qrOrderSettings.isPaymentProofMandatory && !hasPaymentProof) {
+        const error = new Error('Upload bukti transfer QRIS wajib sebelum pesanan dikirim.');
+        error.statusCode = 400;
+        throw error;
+      }
 
-    if ((tableResult.rowCount || 0) === 0) {
-      const error = new Error('Meja tidak ditemukan untuk tenant ini');
-      error.statusCode = 404;
-      throw error;
-    }
+      const salesRecordColumns = await getTableColumnSet(client, 'sales_records');
+      const hasTenantColumn = salesRecordColumns.has('tenant_id');
+      const supportsItemsJson = salesRecordColumns.has('items_json');
+      const supportsItems = salesRecordColumns.has('items');
+      const supportsSpecialNote = salesRecordColumns.has('special_note');
+      const supportsPaymentProofUrl = salesRecordColumns.has('payment_proof_url');
+      const supportsReferenceId = salesRecordColumns.has('reference_id');
+      const saleForIdempotency = {
+        tenantId,
+        branchId,
+        tableId,
+        paymentMethod,
+        paymentProofUrl,
+        customerName,
+        items,
+        orderNote,
+      };
+      const referenceId = generateReferenceId(
+        supportsReferenceId ? clientProvidedReferenceId : '',
+      );
+      persistedReferenceId = referenceId;
 
-    const productIds = items.map((item) => item.productId);
-    const productColumns = await getTableColumnSet(client, 'products');
-    const softDeletePredicate = resolveSoftDeletePredicate(productColumns);
-    const stockTrackedExpression = productColumns.has('is_stock_tracked')
-      ? 'COALESCE(is_stock_tracked, true)'
-      : productColumns.has('stock_tracked')
-        ? 'COALESCE(stock_tracked, true)'
-        : 'true';
-    const productsResult = await client.query(
+      const transactionResult = await runTransaction(
+        client,
+        async (txClient) => {
+          const tableResult = await txClient.query(
+            `SELECT id, status, table_number
+             FROM tables
+             WHERE id = $1 AND tenant_id = $2
+             LIMIT 1
+             FOR UPDATE`,
+            [tableId, tenantId],
+          );
+
+          if ((tableResult.rowCount || 0) === 0) {
+            const error = new Error('Meja tidak ditemukan untuk tenant ini');
+            error.statusCode = 404;
+            throw error;
+          }
+
+          if (supportsReferenceId && referenceId) {
+            const existing = await findExistingSaleByReferenceId(
+              txClient,
+              {
+                tenantId,
+                referenceId,
+                hasTenantColumn,
+              },
+            );
+            if (existing) {
+              return {
+                sale: existing,
+                tableResult,
+                isIdempotentHit: true,
+                normalizedItems: [],
+                mergedItemsJsonPayload: [],
+                newItemsPayload: [],
+                paymentState: {
+                  paymentStatus: existing.payment_status || null,
+                  orderStatus: existing.order_status || null,
+                },
+                paymentProofUrl: existing.payment_proof_url || paymentProofUrl,
+                orderAction: 'NEW_ORDER_IDEMPOTENT_HIT',
+                currentBatchSequence: Number(existing.current_batch_sequence || 1) || 1,
+                supportsSpecialNote,
+                saleForIdempotency,
+              };
+            }
+          }
+
+          const productIds = items.map((item) => item.productId);
+          const productColumns = await getTableColumnSet(txClient, 'products');
+          const softDeletePredicate = resolveSoftDeletePredicate(productColumns);
+          const stockTrackedExpression = productColumns.has('is_stock_tracked')
+            ? 'COALESCE(is_stock_tracked, true)'
+            : productColumns.has('stock_tracked')
+              ? 'COALESCE(stock_tracked, true)'
+              : 'true';
+          const productsResult = await txClient.query(
             `SELECT id, name, price,
               COALESCE(is_service, false) AS is_service,
               COALESCE(is_available, true) AS is_available,
@@ -902,598 +1081,998 @@ const createQrOrder = async (req, res) => {
          AND id = ANY($2::text[])
          AND ${softDeletePredicate}
          AND ($3::bigint IS NULL OR branch_id = $3)
-         AND COALESCE(is_active, true) = true`,
-      [tenantId, productIds, branchId],
-    );
+         AND COALESCE(is_active, true) = true
+       FOR UPDATE OF products`,
+            [tenantId, productIds, branchId],
+          );
 
-    const productMap = new Map((productsResult.rows || []).map((row) => [row.id, row]));
+          const productMap = new Map((productsResult.rows || []).map((row) => [row.id, row]));
 
-    let totalAmount = 0;
-    const normalizedItems = items.map((item) => {
-      const product = productMap.get(item.productId);
-      if (!product) {
-        const error = new Error(`Produk tidak ditemukan: ${item.productId}`);
-        error.statusCode = 404;
-        throw error;
-      }
+          let totalAmount = 0;
+          const normalizedItems = items.map((item) => {
+            const product = productMap.get(item.productId);
+            if (!product) {
+              const error = new Error(`Produk tidak ditemukan: ${item.productId}`);
+              error.statusCode = 404;
+              throw error;
+            }
 
-      const isService = product.is_service === true;
-      const isStockTracked = product.is_stock_tracked !== false;
-      const isAvailable = product.is_available !== false;
-      if (!isAvailable) {
-        const error = new Error(`Produk sedang habis/tidak tersedia: ${product.name}`);
-        error.statusCode = 400;
-        throw error;
-      }
-      const availableStock = Number(product.stock || 0);
-      if (!isService && isStockTracked && availableStock < item.qty) {
-        const error = new Error(`Stok tidak cukup untuk produk ${product.name}`);
-        error.statusCode = 400;
-        throw error;
-      }
+            const isService = product.is_service === true;
+            const isStockTracked = product.is_stock_tracked !== false;
+            const isAvailable = product.is_available !== false;
+            if (!isAvailable) {
+              const error = new Error(`Produk sedang habis/tidak tersedia: ${product.name}`);
+              error.statusCode = 400;
+              throw error;
+            }
+            const availableStock = Number(product.stock || 0);
+            if (!isService && isStockTracked && availableStock < item.qty) {
+              const error = new Error(`Stok tidak cukup untuk produk ${product.name}`);
+              error.statusCode = 400;
+              throw error;
+            }
 
-      const unitPrice = item.customPrice !== undefined
-        ? item.customPrice
-        : Number(product.price || 0);
+            const unitPrice = item.customPrice !== undefined
+              ? item.customPrice
+              : Number(product.price || 0);
 
-      totalAmount += unitPrice * item.qty;
+            totalAmount += unitPrice * item.qty;
 
-      return {
-        productId: item.productId,
-        productName: product.name,
-        qty: item.qty,
-        customPrice: unitPrice,
-        note: item.note,
-        isService,
-        isStockTracked,
-      };
-    });
+            return {
+              productId: item.productId,
+              productName: product.name,
+              qty: item.qty,
+              customPrice: unitPrice,
+              note: item.note,
+              isService,
+              isStockTracked,
+            };
+          });
 
-    if (
-      paymentMethod === PAYMENT_METHOD_QRIS &&
-      qrOrderSettings.isPaymentProofMandatory &&
-      hasUploadedProofImage &&
-      validationBase64Data
-    ) {
-      const validation = await validatePaymentProof(
-        validationBase64Data,
-        paymentProofPayload.uploadMimeType || 'image/jpeg',
-        totalAmount,
+          if (
+            paymentMethod === PAYMENT_METHOD_QRIS &&
+            qrOrderSettings.isPaymentProofMandatory &&
+            hasUploadedProofImage &&
+            validationBase64Data
+          ) {
+            const validation = await validatePaymentProof(
+              validationBase64Data,
+              paymentProofPayload.uploadMimeType || 'image/jpeg',
+              totalAmount,
+            );
+
+            const detectedAmount = Number(validation?.transferredAmount);
+            if (Number.isFinite(detectedAmount) && detectedAmount < totalAmount) {
+              const insufficientError = new Error(
+                `Nominal transfer (${Math.trunc(detectedAmount)}) lebih kecil dari total pesanan (${Math.trunc(totalAmount)}).`,
+              );
+              insufficientError.statusCode = 400;
+              insufficientError.code = 'INSUFFICIENT_TRANSFER_AMOUNT';
+              throw insufficientError;
+            }
+
+            if (!validation?.isValid) {
+              const proofError = new Error(validation?.reason || 'Bukti pembayaran tidak valid.');
+              proofError.statusCode = 400;
+              proofError.code = 'INVALID_PAYMENT_PROOF';
+              throw proofError;
+            }
+          }
+
+          if (!paymentProofUrl && paymentProofPayload.uploadBuffer && paymentProofPayload.uploadMimeType) {
+            paymentProofUrl = await uploadPaymentProof({
+              tenantId,
+              buffer: paymentProofPayload.uploadBuffer,
+              mimeType: paymentProofPayload.uploadMimeType,
+              req,
+            });
+          }
+
+          if (paymentMethod === PAYMENT_METHOD_QRIS && paymentProofUrl) {
+            paymentState = {
+              paymentMethodLabel: 'QRIS',
+              paymentStatus: 'PAID',
+              orderStatus: 'PREPARING',
+            };
+          }
+
+          const salesRecordItemColumns = await getTableColumnSet(txClient, 'sales_record_items');
+          const supportsBatchSequence = salesRecordItemColumns.has('batch_sequence');
+          const currentBatchSequence = 1;
+          const newItemsPayload = stampItemsWithBatchSequence(normalizedItems, currentBatchSequence);
+          const mergedItemsJsonPayload = toQrOrderPayloadItems(newItemsPayload);
+          const receiptNumber = generateReceiptNumber();
+
+          const insertColumns = [
+            'tenant_id',
+            'branch_id',
+            'table_id',
+            'receipt_number',
+            'payment_method',
+            'payment_status',
+            'order_type',
+            'order_status',
+            'total_price',
+            'total_amount',
+            'customer_name',
+            'cashier_name',
+          ];
+          const insertValues = [
+            tenantId,
+            branchId,
+            tableId,
+            receiptNumber,
+            paymentState.paymentMethodLabel,
+            paymentState.paymentStatus,
+            'DINE_IN',
+            paymentState.orderStatus,
+            totalAmount,
+            totalAmount,
+            customerName,
+            'Online Order',
+          ];
+
+          if (supportsReferenceId) {
+            insertColumns.unshift('reference_id');
+            insertValues.unshift(referenceId);
+          }
+
+          if (supportsItemsJson) {
+            insertColumns.push('items_json');
+            insertValues.push(JSON.stringify(mergedItemsJsonPayload));
+          }
+
+          if (supportsItems) {
+            insertColumns.push('items');
+            insertValues.push(JSON.stringify(mergedItemsJsonPayload));
+          }
+
+          insertColumns.push('amount_paid');
+          insertValues.push(paymentState.paymentStatus === 'PAID' ? totalAmount : 0);
+
+          if (supportsPaymentProofUrl) {
+            insertColumns.push('payment_proof_url');
+            insertValues.push(paymentProofUrl);
+          }
+
+          if (supportsSpecialNote && orderNote) {
+            insertColumns.push('special_note');
+            insertValues.push(orderNote);
+          }
+
+          insertColumns.push('created_at');
+          insertColumns.push('updated_at');
+
+          const insertPlaceholders = insertValues.map((_, index) => {
+            const param = `$${index + 1}`;
+            const columnName = insertColumns[index];
+            if (columnName === 'items_json') {
+              return `${param}::jsonb`;
+            }
+            return param;
+          });
+
+          insertPlaceholders.push('NOW()');
+          insertPlaceholders.push('NOW()');
+
+          const saleInsert = await txClient.query(
+            `INSERT INTO sales_records (
+               ${insertColumns.join(',\n                 ')}
+             )
+             VALUES (
+               ${insertPlaceholders.join(', ')}
+             )
+             RETURNING *`,
+            insertValues,
+          );
+
+          const sale = saleInsert.rows?.[0] || null;
+          if (!sale) {
+            const error = new Error('Gagal membuat pesanan QR');
+            error.statusCode = 500;
+            throw error;
+          }
+
+          const salesRecordItemInsertSql = supportsBatchSequence
+            ? `INSERT INTO sales_record_items (
+                 tenant_id,
+                 sales_record_id,
+                 product_id,
+                 product_name,
+                 qty,
+                 custom_price,
+                 note,
+                 is_service,
+                 batch_sequence,
+                 created_at,
+                 updated_at
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())`
+            : `INSERT INTO sales_record_items (
+                 tenant_id,
+                 sales_record_id,
+                 product_id,
+                 product_name,
+                 qty,
+                 custom_price,
+                 note,
+                 is_service,
+                 created_at,
+                 updated_at
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`;
+
+          for (const item of normalizedItems) {
+            await txClient.query(
+              salesRecordItemInsertSql,
+              supportsBatchSequence
+                ? [
+                    tenantId,
+                    sale.id,
+                    item.productId,
+                    item.productName,
+                    item.qty,
+                    item.customPrice,
+                    item.note,
+                    item.isService,
+                    currentBatchSequence,
+                  ]
+                : [
+                    tenantId,
+                    sale.id,
+                    item.productId,
+                    item.productName,
+                    item.qty,
+                    item.customPrice,
+                    item.note,
+                    item.isService,
+                  ],
+            );
+
+            if (!item.isService && item.isStockTracked) {
+              const stockUpdate = await txClient.query(
+                `UPDATE products
+                 SET stock = COALESCE(stock, 0) - $1,
+                     updated_at = NOW()
+                 WHERE tenant_id = $2 AND id = $3
+                 RETURNING id`,
+                [item.qty, tenantId, item.productId],
+              );
+              if ((stockUpdate.rowCount || 0) === 0) {
+                throw new Error(
+                  `Stok update produk gagal (row kosong): ${item.productId}`,
+                );
+              }
+            }
+          }
+
+          const tableUpdate = await txClient.query(
+            `UPDATE tables
+             SET status = 'OCCUPIED',
+                 updated_at = NOW()
+             WHERE tenant_id = $1 AND id = $2
+             RETURNING id`,
+            [tenantId, tableId],
+          );
+          if ((tableUpdate.rowCount || 0) === 0) {
+            throw new Error(
+              `Update status meja gagal (row kosong): tenant=${tenantId} table=${tableId}`,
+            );
+          }
+
+          return {
+            sale,
+            tableResult,
+            isIdempotentHit: false,
+            normalizedItems,
+            mergedItemsJsonPayload,
+            newItemsPayload,
+            paymentState,
+            paymentProofUrl,
+            orderAction: 'NEW_ORDER',
+            currentBatchSequence,
+            supportsSpecialNote,
+            saleForIdempotency,
+          };
+        },
+        {
+          label: `create_qr_order:${tenantId || 'unknown'}:${referenceId || 'noref'}`,
+          maxAttempts: 4,
+        },
       );
 
-      const detectedAmount = Number(validation?.transferredAmount);
-      if (Number.isFinite(detectedAmount) && detectedAmount < totalAmount) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({
-          success: false,
-          error: `Nominal transfer (${Math.trunc(detectedAmount)}) lebih kecil dari total pesanan (${Math.trunc(totalAmount)}).`,
-          code: 'INSUFFICIENT_TRANSFER_AMOUNT',
-        });
+      const {
+        sale,
+        tableResult,
+        isIdempotentHit,
+        normalizedItems,
+        mergedItemsJsonPayload,
+        newItemsPayload,
+        paymentProofUrl: finalPaymentProofUrl,
+        orderAction,
+        currentBatchSequence,
+      } = transactionResult;
+
+      persistedOrderId = `${sale?.id ?? ''}`;
+
+      if (supportsSpecialNote && orderNote && !isIdempotentHit && sale?.id) {
+        try {
+          await client.query(
+            `UPDATE sales_records
+             SET special_note = CASE
+                   WHEN COALESCE(TRIM(special_note), '') = '' THEN $1
+                   WHEN POSITION($1 IN special_note) > 0 THEN special_note
+                   ELSE special_note || E'\n' || $1
+                 END,
+                 updated_at = NOW()
+             WHERE tenant_id = $2
+               AND id = $3`,
+            [orderNote, tenantIdForLog || sale.tenant_id || '', sale.id],
+          );
+        } catch (_) {}
       }
 
-      if (!validation?.isValid) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({
-          success: false,
-          error: validation?.reason || 'Bukti pembayaran tidak valid.',
-        });
-      }
-    }
-
-    if (!paymentProofUrl && paymentProofPayload.uploadBuffer && paymentProofPayload.uploadMimeType) {
-      paymentProofUrl = await uploadPaymentProof({
-        tenantId,
-        buffer: paymentProofPayload.uploadBuffer,
-        mimeType: paymentProofPayload.uploadMimeType,
-        req,
-      });
-    }
-
-    if (paymentMethod === PAYMENT_METHOD_QRIS && paymentProofUrl) {
-      paymentState = {
-        paymentMethodLabel: 'QRIS',
-        paymentStatus: 'PAID',
-        orderStatus: 'PREPARING',
-      };
-    }
-
-    const salesRecordColumns = await getTableColumnSet(client, 'sales_records');
-    const supportsItemsJson = salesRecordColumns.has('items_json');
-    const supportsItems = salesRecordColumns.has('items');
-    const supportsSpecialNote = salesRecordColumns.has('special_note');
-    const supportsPaymentProofUrl = salesRecordColumns.has('payment_proof_url');
-    let sale = null;
-    let orderAction = 'NEW_ORDER';
-    const responseStatusCode = 201;
-    const salesRecordItemColumns = await getTableColumnSet(client, 'sales_record_items');
-    const supportsBatchSequence = salesRecordItemColumns.has('batch_sequence');
-    const currentBatchSequence = 1;
-    const newItemsPayload = stampItemsWithBatchSequence(normalizedItems, currentBatchSequence);
-    const mergedItemsJsonPayload = toQrOrderPayloadItems(newItemsPayload);
-    const referenceId = `qr_${Date.now()}`;
-    const receiptNumber = generateReceiptNumber();
-
-      const insertColumns = [
-        'tenant_id',
-        'branch_id',
-        'table_id',
-        'reference_id',
-        'receipt_number',
-        'payment_method',
-        'payment_status',
-        'order_type',
-        'order_status',
-        'total_price',
-        'total_amount',
-        'customer_name',
-        'cashier_name',
-      ];
-      const insertValues = [
-        tenantId,
-        branchId,
+      const { orderPayload } = buildQrOrderPayload({
+        tenantId: tenantIdForLog || sale?.tenant_id || '',
+        branchMeta,
         tableId,
-        referenceId,
-        receiptNumber,
-        paymentState.paymentMethodLabel,
-        paymentState.paymentStatus,
-        'DINE_IN',
-        paymentState.orderStatus,
-        totalAmount,
-        totalAmount,
+        tableResult,
+        normalizedItems,
+        newItemsPayload,
+        mergedItemsJsonPayload,
+        paymentState: transactionResult.paymentState,
+        sale,
+        paymentProofUrl: finalPaymentProofUrl,
         customerName,
-        'Online Order',
-      ];
-
-      if (supportsItemsJson) {
-        insertColumns.push('items_json');
-        insertValues.push(JSON.stringify(mergedItemsJsonPayload));
-      }
-
-      if (supportsItems) {
-        insertColumns.push('items');
-        insertValues.push(JSON.stringify(mergedItemsJsonPayload));
-      }
-
-      insertColumns.push('amount_paid');
-      insertValues.push(paymentState.paymentStatus === 'PAID' ? totalAmount : 0);
-
-      if (supportsPaymentProofUrl) {
-        insertColumns.push('payment_proof_url');
-        insertValues.push(paymentProofUrl);
-      }
-
-      insertColumns.push('created_at');
-      insertColumns.push('updated_at');
-
-      const insertPlaceholders = insertValues.map((_, index) => {
-        const param = `$${index + 1}`;
-        const columnName = insertColumns[index];
-        if (columnName === 'items_json') {
-          return `${param}::jsonb`;
-        }
-        return param;
+        orderNote,
+        orderAction,
+        currentBatchSequence,
       });
 
-      insertPlaceholders.push('NOW()');
-      insertPlaceholders.push('NOW()');
-
-    const saleInsert = await client.query(
-      `INSERT INTO sales_records (
-         ${insertColumns.join(',\n           ')}
-       )
-       VALUES (
-         ${insertPlaceholders.join(', ')}
-       )
-       RETURNING id, reference_id, receipt_number, cashier_name, order_status, payment_status, payment_method, total_amount${supportsPaymentProofUrl ? ', payment_proof_url' : ''}`,
-      insertValues,
-    );
-
-    sale = saleInsert.rows?.[0] || null;
-    if (!sale) {
-      const error = new Error('Gagal membuat pesanan QR');
-      error.statusCode = 500;
-      throw error;
-    }
-
-    const salesRecordItemInsertSql = supportsBatchSequence
-      ? `INSERT INTO sales_record_items (
-           tenant_id,
-           sales_record_id,
-           product_id,
-           product_name,
-           qty,
-           custom_price,
-           note,
-           is_service,
-           batch_sequence,
-           created_at,
-           updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())`
-      : `INSERT INTO sales_record_items (
-           tenant_id,
-           sales_record_id,
-           product_id,
-           product_name,
-           qty,
-           custom_price,
-           note,
-           is_service,
-           created_at,
-           updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`;
-
-    for (const item of normalizedItems) {
-      await client.query(
-        salesRecordItemInsertSql,
-        supportsBatchSequence
-          ? [
-              tenantId,
-              sale.id,
-              item.productId,
-              item.productName,
-              item.qty,
-              item.customPrice,
-              item.note,
-              item.isService,
-              currentBatchSequence,
-            ]
-          : [
-              tenantId,
-              sale.id,
-              item.productId,
-              item.productName,
-              item.qty,
-              item.customPrice,
-              item.note,
-              item.isService,
-            ],
-      );
-
-      if (!item.isService && item.isStockTracked) {
-        await client.query(
-          `UPDATE products
-           SET stock = COALESCE(stock, 0) - $1,
-               updated_at = NOW()
-           WHERE tenant_id = $2 AND id = $3`,
-          [item.qty, tenantId, item.productId],
-        );
-      }
-    }
-
-    await client.query(
-      `UPDATE tables
-       SET status = 'OCCUPIED',
-           updated_at = NOW()
-       WHERE tenant_id = $1 AND id = $2`,
-      [tenantId, tableId],
-    );
-
-    await client.query('COMMIT');
-
-    // Keep order-note persistence best-effort and outside transaction.
-    // A failed statement inside transaction marks PostgreSQL tx as aborted.
-    if (orderNote && supportsSpecialNote) {
-      try {
-        await client.query(
-          `UPDATE sales_records
-           SET special_note = CASE
-                 WHEN COALESCE(TRIM(special_note), '') = '' THEN $1
-                 WHEN POSITION($1 IN special_note) > 0 THEN special_note
-                 ELSE special_note || E'\n' || $1
-               END,
-               updated_at = NOW()
-           WHERE tenant_id = $2
-             AND id = $3`,
-          [orderNote, tenantId, sale.id],
-        );
-      } catch (_) {
-        // Backward compatible when sales_records.special_note is not available yet.
-      }
-    }
-
-    const totalItems = normalizedItems.reduce((sum, item) => sum + (Number(item.qty || 0) || 0), 0);
-    const tableLabel = (tableResult.rows?.[0]?.table_number || '').toString().trim();
-    const effectivePaymentProofUrl = (sale.payment_proof_url || paymentProofUrl || '').toString().trim() || null;
-    const payloadItems = toQrOrderPayloadItems(newItemsPayload);
-    const orderPayload = {
-      tenantId,
-      tenant_id: tenantId,
-      orderId: sale.id,
-      orderAction,
-      order_action: orderAction,
-      referenceId: sale.reference_id,
-      receiptNumber: sale.receipt_number,
-      branchId,
-      branchName: (branchMeta?.name || '').toString().trim() || null,
-      branchCode: (branchMeta?.branch_code || '').toString().trim() || null,
-      tableId,
-      table_id: tableId,
-      tableName: tableLabel || String(tableId),
-      table_number: tableLabel || null,
-      orderType: 'DINE_IN',
-      order_type: 'DINE_IN',
-      currentBatchSequence,
-      current_batch_sequence: currentBatchSequence,
-      new_items: payloadItems,
-      items: payloadItems,
-      items_json: mergedItemsJsonPayload,
-      orderStatus: sale.order_status,
-      paymentStatus: sale.payment_status,
-      paymentMethod: sale.payment_method,
-      paymentProofUrl: effectivePaymentProofUrl,
-      payment_proof_url: effectivePaymentProofUrl,
-      customerName,
-      orderNote,
-      special_note: orderNote || null,
-      specialNote: orderNote || null,
-      totalItems,
-      grandTotal: Number(sale.total_amount || 0),
-      created_at: new Date().toISOString(),
-    };
-
-    const incomingQrOrderPayload = {
-      ...orderPayload,
-      orderAction: 'NEW_ORDER',
-      order_action: 'NEW_ORDER',
-    };
-
-    emitToTenant(tenantId, 'incoming_qr_order', incomingQrOrderPayload);
-
-    emitToTenant(tenantId, 'qr_order_payment_status', {
-      tenantId,
-      ...orderPayload,
-      orderNote: orderNote || null,
-      paymentMethod,
-      updatedAt: new Date().toISOString(),
-    });
-
-    return jsonOk(
-      res,
-      {
-        ...sale,
+      const incomingQrOrderPayload = {
         ...orderPayload,
-        branch_id: branchId,
-        branch_name: (branchMeta?.name || '').toString().trim() || null,
-        branch_code: (branchMeta?.branch_code || '').toString().trim() || null,
+        orderAction: isIdempotentHit ? (sale.order_status ? 'NEW_ORDER_REPLAYED' : 'NEW_ORDER') : 'NEW_ORDER',
+        order_action: isIdempotentHit ? (sale.order_status ? 'NEW_ORDER_REPLAYED' : 'NEW_ORDER') : 'NEW_ORDER',
+      };
+      emitToTenant(tenantIdForLog || sale?.tenant_id || '', 'incoming_qr_order', incomingQrOrderPayload);
+
+      emitToTenant(tenantIdForLog || sale?.tenant_id || '', 'qr_order_payment_status', {
+        tenantId: tenantIdForLog || sale?.tenant_id || '',
+        ...orderPayload,
+        orderNote: orderNote || null,
+        paymentMethod,
+        updatedAt: new Date().toISOString(),
+      });
+
+      return jsonOk(
+        res,
+        {
+          ...sale,
+          ...orderPayload,
+          branch_id: branchMeta?.id ?? null,
+          branch_name: (branchMeta?.name || '').toString().trim() || null,
+          branch_code: (branchMeta?.branch_code || '').toString().trim() || null,
+        },
+        orderAction === 'APPENDED_TO_EXISTING'
+          ? 'Pesanan QR ditambahkan ke transaksi aktif meja'
+          : 'Pesanan QR berhasil dibuat',
+        isIdempotentHit ? 200 : 201,
+      );
+    } finally {
+      client.release();
+    }
+  };
+
+  try {
+    return await withRetries(
+      runOrderCreation,
+      {
+        label: `create_qr_order:${requestId}`,
+        maxAttempts: 2,
+        baseDelayMs: 200,
+        maxDelayMs: 1200,
+        shouldRetry: (error, attempt) => {
+          if ((error?.statusCode && error.statusCode >= 400 && error.statusCode < 500)) {
+            return false;
+          }
+          if (attempt >= 2) return false;
+          return isTransientDbError(error);
+        },
       },
-      orderAction === 'APPENDED_TO_EXISTING'
-        ? 'Pesanan QR ditambahkan ke transaksi aktif meja'
-        : 'Pesanan QR berhasil dibuat',
-      responseStatusCode,
     );
   } catch (error) {
-    await client.query('ROLLBACK');
-    return jsonError(res, error.statusCode || 500, error.message || 'Internal server error', error.message);
-  } finally {
-    client.release();
+    try {
+      await storeFailedPayload(
+        'qr_order_create',
+        {
+          requestId,
+          tenantId: tenantIdForLog,
+          referenceId: persistedReferenceId,
+          orderId: persistedOrderId,
+          body: incomingBody,
+          fileMeta,
+          query: req.query || null,
+        },
+        error,
+        {
+          url: req.url,
+          method: req.method,
+          headers: req.headers
+            ? Object.fromEntries(
+                Object.entries(req.headers).filter(([k]) => !/authorization|cookie|secret|signature/i.test(k)),
+              )
+            : null,
+        },
+      );
+    } catch (_) {}
+
+    if (error?.code === '23505' && persistedReferenceId) {
+      try {
+        const client = await getClientFromPool(pool);
+        try {
+          const hasTenantColumn = !!(await (async () => {
+            try {
+              const cols = await getTableColumnSet(client, 'sales_records');
+              return cols.has('tenant_id');
+            } catch (_) {
+              return false;
+            }
+          })());
+          const existing = await findExistingSaleByReferenceId(
+            client,
+            {
+              tenantId: tenantIdForLog,
+              referenceId: persistedReferenceId,
+              hasTenantColumn,
+            },
+          );
+          if (existing) {
+            return jsonOk(
+              res,
+              existing,
+              'Pesanan QR sudah tersimpan (idempotent recovery)',
+              200,
+            );
+          }
+        } finally {
+          client.release();
+        }
+      } catch (_) {}
+    }
+
+    if (error?.code === 'INSUFFICIENT_TRANSFER_AMOUNT') {
+      const truncated = error.message || 'INSUFFICIENT_TRANSFER_AMOUNT';
+      return res.status(400).json({
+        success: false,
+        error: truncated,
+        code: 'INSUFFICIENT_TRANSFER_AMOUNT',
+        message: truncated,
+      });
+    }
+
+    if (error?.code === 'INVALID_PAYMENT_PROOF') {
+      const truncated = error.message || 'INVALID_PAYMENT_PROOF';
+      return res.status(400).json({
+        success: false,
+        error: truncated,
+        message: truncated,
+      });
+    }
+
+    console.error('[publicQrController] createQrOrder failed:', {
+      requestId,
+      tenantId: tenantIdForLog,
+      referenceId: persistedReferenceId,
+      orderId: persistedOrderId,
+      message: error?.message || error,
+      code: error?.code || null,
+      statusCode: error?.statusCode || null,
+      stack: error?.stack || null,
+    });
+
+    return jsonError(
+      res,
+      error?.statusCode || 500,
+      error?.message || 'Internal server error',
+      error?.message || error,
+    );
   }
 };
 
 const checkoutQrOrder = async (req, res) => {
-  const client = await getSharedPool().connect();
+  const pool = getSharedPool();
+  const requestId = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const incomingBody = (req.body && typeof req.body === 'object')
+    ? { ...req.body }
+    : {};
+  let tenantIdForLog = normalizeTenantId(
+    incomingBody.tenantId ||
+    incomingBody.tenant_id ||
+    req.user?.tenantId ||
+    req.tenant?.tenantId ||
+    '',
+  );
+  let orderLookup = {
+    orderId: '',
+    referenceId: '',
+    receiptNumber: '',
+  };
+
   try {
-    const tenantId = parseTenantId(req.body.tenantId || req.body.tenant_id);
-    const branchId = parseOptionalBranchId(req.body.branchId || req.body.branch_id);
-    const orderId = (req.body.orderId || req.body.order_id || req.body.salesRecordId || '').toString().trim();
-    const referenceId = (req.body.referenceId || req.body.reference_id || '').toString().trim();
-    const receiptNumber = (req.body.receiptNumber || req.body.receipt_number || '').toString().trim();
-    const paymentMethod = normalizePaymentMethod(req.body.paymentMethod || req.body.payment_method);
-    const paymentState = resolvePaymentState(paymentMethod);
+    return await withRetries(
+      async () => {
+        const client = await getClientFromPool(pool);
+        try {
+          const tenantId = parseTenantId(incomingBody.tenantId || incomingBody.tenant_id);
+          tenantIdForLog = tenantIdForLog || tenantId;
+          const branchId = parseOptionalBranchId(incomingBody.branchId || incomingBody.branch_id);
+          const orderId = (
+            incomingBody.orderId ||
+            incomingBody.order_id ||
+            incomingBody.salesRecordId ||
+            ''
+          ).toString().trim();
+          const referenceId = (
+            incomingBody.referenceId ||
+            incomingBody.reference_id ||
+            ''
+          ).toString().trim();
+          const receiptNumber = (
+            incomingBody.receiptNumber ||
+            incomingBody.receipt_number ||
+            ''
+          ).toString().trim();
+          orderLookup = { orderId, referenceId, receiptNumber };
+          const paymentMethod = normalizePaymentMethod(
+            incomingBody.paymentMethod || incomingBody.payment_method,
+          );
+          const paymentState = resolvePaymentState(paymentMethod);
 
-    if (!orderId && !referenceId && !receiptNumber) {
-      const error = new Error('orderId/referenceId/receiptNumber wajib diisi');
-      error.statusCode = 400;
-      throw error;
-    }
-
-    await client.query('BEGIN');
-
-    const lookup = await client.query(
-      `SELECT id, reference_id, receipt_number,
-              payment_status, order_status, payment_method,
-              total_amount, total_price,
-              branch_id,
-              table_id,
-              table_number,
-              order_type,
-              customer_name,
-              special_note
-       FROM sales_records
-       WHERE tenant_id = $1
-         AND ($2::bigint IS NULL OR branch_id = $2)
-         AND (
-           ($3::text <> '' AND id::text = $3)
-           OR ($4::text <> '' AND reference_id = $4)
-           OR ($5::text <> '' AND receipt_number = $5)
-         )
-       ORDER BY created_at DESC
-       LIMIT 1`,
-      [tenantId, branchId, orderId, referenceId, receiptNumber],
-    );
-
-    const sale = lookup.rows?.[0];
-    if (!sale) {
-      const error = new Error('Pesanan tidak ditemukan');
-      error.statusCode = 404;
-      throw error;
-    }
-
-    const updatedResult = await client.query(
-      `UPDATE sales_records
-       SET payment_method = $1,
-           payment_status = $2,
-           order_status = $3,
-           updated_at = NOW()
-       WHERE tenant_id = $4
-         AND id = $5
-       RETURNING id, reference_id, receipt_number,
-                 payment_method, payment_status, order_status,
-                 total_amount, total_price,
-                 branch_id,
-                 table_id,
-                 table_number,
-                 order_type,
-                 customer_name,
-                 special_note`,
-      [
-        paymentState.paymentMethodLabel,
-        paymentState.paymentStatus,
-        paymentState.orderStatus,
-        tenantId,
-        sale.id,
-      ],
-    );
-
-    await client.query('COMMIT');
-
-    const updated = updatedResult.rows?.[0] || sale;
-    const responsePayload = {
-      ...updated,
-      payment_method_code: paymentMethod,
-      order_note: (updated.special_note || '').toString().trim() || null,
-      specialNote: (updated.special_note || '').toString().trim() || null,
-      paymentGateway: paymentMethod === PAYMENT_METHOD_DIGITAL
-        ? {
-            mode: 'HYBRID',
-            status: 'PENDING_PAYMENT',
-            actionRequired: 'WAIT_WEBHOOK',
+          if (!orderId && !referenceId && !receiptNumber) {
+            const error = new Error('orderId/referenceId/receiptNumber wajib diisi');
+            error.statusCode = 400;
+            throw error;
           }
-        : null,
-    };
 
-    emitToTenant(tenantId, 'qr_order_payment_status', {
-      tenantId,
-      orderId: updated.id,
-      referenceId: updated.reference_id,
-      receiptNumber: updated.receipt_number,
-      branchId: updated.branch_id ?? null,
-      tableId: updated.table_id ?? null,
-      table_number: (updated.table_number || '').toString().trim() || null,
-      orderType: (updated.order_type || '').toString().trim() || null,
-      orderNote: (updated.special_note || '').toString().trim() || null,
-      special_note: (updated.special_note || '').toString().trim() || null,
-      paymentMethod,
-      paymentStatus: updated.payment_status,
-      orderStatus: updated.order_status,
-      updatedAt: new Date().toISOString(),
+          const result = await runTransaction(
+            client,
+            async (txClient) => {
+              const lookup = await txClient.query(
+                `SELECT id, reference_id, receipt_number,
+                        payment_status, order_status, payment_method,
+                        total_amount, total_price,
+                        branch_id,
+                        table_id,
+                        table_number,
+                        order_type,
+                        customer_name,
+                        special_note
+                 FROM sales_records
+                 WHERE tenant_id = $1
+                   AND ($2::bigint IS NULL OR branch_id = $2)
+                   AND (
+                     ($3::text <> '' AND id::text = $3)
+                     OR ($4::text <> '' AND reference_id = $4)
+                     OR ($5::text <> '' AND receipt_number = $5)
+                   )
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                 FOR UPDATE`,
+                [tenantId, branchId, orderId, referenceId, receiptNumber],
+              );
+
+              const sale = lookup.rows?.[0];
+              if (!sale) {
+                const error = new Error('Pesanan tidak ditemukan');
+                error.statusCode = 404;
+                throw error;
+              }
+
+              const updatedResult = await txClient.query(
+                `UPDATE sales_records
+                 SET payment_method = $1,
+                     payment_status = $2,
+                     order_status = $3,
+                     updated_at = NOW()
+                 WHERE tenant_id = $4
+                   AND id = $5
+                 RETURNING id, reference_id, receipt_number,
+                           payment_method, payment_status, order_status,
+                           total_amount, total_price,
+                           branch_id,
+                           table_id,
+                           table_number,
+                           order_type,
+                           customer_name,
+                           special_note`,
+                [
+                  paymentState.paymentMethodLabel,
+                  paymentState.paymentStatus,
+                  paymentState.orderStatus,
+                  tenantId,
+                  sale.id,
+                ],
+              );
+
+              return {
+                sale,
+                updated: updatedResult.rows?.[0] || sale,
+                branchId,
+                paymentMethod,
+                tenantId,
+              };
+            },
+            {
+              label: `checkout_qr_order:${tenantId}:${orderId || referenceId || receiptNumber || 'noid'}`,
+              maxAttempts: 4,
+            },
+          );
+
+          const { updated } = result;
+          const updatedForResponse = updated;
+          const responsePayload = {
+            ...updatedForResponse,
+            payment_method_code: paymentMethod,
+            order_note: (updatedForResponse.special_note || '').toString().trim() || null,
+            specialNote: (updatedForResponse.special_note || '').toString().trim() || null,
+            paymentGateway: paymentMethod === PAYMENT_METHOD_DIGITAL
+              ? {
+                  mode: 'HYBRID',
+                  status: 'PENDING_PAYMENT',
+                  actionRequired: 'WAIT_WEBHOOK',
+                }
+              : null,
+          };
+
+          emitToTenant(tenantId, 'qr_order_payment_status', {
+            tenantId,
+            orderId: updatedForResponse.id,
+            referenceId: updatedForResponse.reference_id,
+            receiptNumber: updatedForResponse.receipt_number,
+            branchId: updatedForResponse.branch_id ?? branchId ?? null,
+            tableId: updatedForResponse.table_id ?? null,
+            table_number: (updatedForResponse.table_number || '').toString().trim() || null,
+            orderType: (updatedForResponse.order_type || '').toString().trim() || null,
+            orderNote: (updatedForResponse.special_note || '').toString().trim() || null,
+            special_note: (updatedForResponse.special_note || '').toString().trim() || null,
+            paymentMethod,
+            paymentStatus: updatedForResponse.payment_status,
+            orderStatus: updatedForResponse.order_status,
+            updatedAt: new Date().toISOString(),
+          });
+
+          return jsonOk(res, responsePayload, 'Checkout QR berhasil diproses', 200);
+        } finally {
+          client.release();
+        }
+      },
+      {
+        label: `checkout_qr_order:${requestId}`,
+        maxAttempts: 2,
+        baseDelayMs: 200,
+        maxDelayMs: 1200,
+        shouldRetry: (error, attempt) => {
+          if (error?.statusCode && error.statusCode >= 400 && error.statusCode < 500) {
+            return false;
+          }
+          if (attempt >= 2) return false;
+          return isTransientDbError(error);
+        },
+      },
+    );
+  } catch (error) {
+    try {
+      await storeFailedPayload(
+        'qr_order_checkout',
+        {
+          requestId,
+          tenantId: tenantIdForLog,
+          ...orderLookup,
+          body: incomingBody,
+          query: req.query || null,
+        },
+        error,
+        {
+          url: req.url,
+          method: req.method,
+          headers: req.headers
+            ? Object.fromEntries(
+                Object.entries(req.headers).filter(([k]) => !/authorization|cookie|secret|signature/i.test(k)),
+              )
+            : null,
+        },
+      );
+    } catch (_) {}
+
+    console.error('[publicQrController] checkoutQrOrder failed:', {
+      requestId,
+      tenantId: tenantIdForLog,
+      ...orderLookup,
+      message: error?.message || error,
+      code: error?.code || null,
+      statusCode: error?.statusCode || null,
+      stack: error?.stack || null,
     });
 
-    return jsonOk(res, responsePayload, 'Checkout QR berhasil diproses', 200);
-  } catch (error) {
-    await client.query('ROLLBACK');
-    return jsonError(res, error.statusCode || 500, error.message || 'Internal server error', error.message);
-  } finally {
-    client.release();
+    return jsonError(
+      res,
+      error?.statusCode || 500,
+      error?.message || 'Internal server error',
+      error?.message || error,
+    );
   }
 };
 
 const handlePaymentWebhook = async (req, res) => {
-  const client = await getSharedPool().connect();
+  const pool = getSharedPool();
+  const requestId = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const gatewayTrace = {
+    requestId,
+    receivedAt: new Date().toISOString(),
+    ip: (
+      (req.headers?.['x-forwarded-for'] || '').toString().split(',')[0] ||
+      req.ip ||
+      req.socket?.remoteAddress ||
+      ''
+    ).toString().trim() || null,
+    userAgent: (req.headers?.['user-agent'] || '').toString().trim() || null,
+  };
+  const incomingBody = (req.body && typeof req.body === 'object')
+    ? { ...req.body }
+    : {};
+  let tenantIdForLog = normalizeTenantId(
+    incomingBody.tenantId ||
+    incomingBody.tenant_id ||
+    req.user?.tenantId ||
+    req.tenant?.tenantId ||
+    '',
+  );
+  let orderLookup = {
+    orderId: '',
+    referenceId: '',
+    receiptNumber: '',
+  };
+
+  const sendResponse = (status, payload) => {
+    try {
+      if (!res.headersSent) {
+        return res.status(status).json(payload);
+      }
+      return res;
+    } catch (_) {
+      return res;
+    }
+  };
+
+  const ackSuccess = (data) => {
+    const acknowledgeAt = new Date().toISOString();
+    const payload = {
+      success: true,
+      message: 'Webhook pembayaran diterima',
+      receivedAt: gatewayTrace.receivedAt,
+      acknowledgeAt,
+      requestId: gatewayTrace.requestId,
+      data: data || null,
+    };
+    return sendResponse(200, payload);
+  };
+
   try {
-    const tenantId = parseTenantId(req.body.tenantId || req.body.tenant_id);
-    const orderId = (req.body.orderId || req.body.order_id || req.body.salesRecordId || '').toString().trim();
-    const referenceId = (req.body.referenceId || req.body.reference_id || '').toString().trim();
-    const receiptNumber = (req.body.receiptNumber || req.body.receipt_number || '').toString().trim();
-    const gatewayStatus =
-      req.body.paymentStatus ||
-      req.body.payment_status ||
-      req.body.transactionStatus ||
-      req.body.transaction_status ||
-      req.body.status;
-    const paidAmount = Number(req.body.paidAmount ?? req.body.paid_amount ?? req.body.amount_paid ?? 0) || 0;
+    return await withRetries(
+      async () => {
+        const client = await getClientFromPool(pool);
+        try {
+          const tenantId = parseTenantId(incomingBody.tenantId || incomingBody.tenant_id);
+          tenantIdForLog = tenantIdForLog || tenantId;
+          const orderId = (
+            incomingBody.orderId ||
+            incomingBody.order_id ||
+            incomingBody.salesRecordId ||
+            ''
+          ).toString().trim();
+          const referenceId = (
+            incomingBody.referenceId ||
+            incomingBody.reference_id ||
+            ''
+          ).toString().trim();
+          const receiptNumber = (
+            incomingBody.receiptNumber ||
+            incomingBody.receipt_number ||
+            ''
+          ).toString().trim();
+          orderLookup = { orderId, referenceId, receiptNumber };
+          const gatewayStatus =
+            incomingBody.paymentStatus ||
+            incomingBody.payment_status ||
+            incomingBody.transactionStatus ||
+            incomingBody.transaction_status ||
+            incomingBody.status;
+          const paidAmount = Number(
+            incomingBody.paidAmount ??
+            incomingBody.paid_amount ??
+            incomingBody.amount_paid ??
+            0,
+          ) || 0;
+          const externalTrace = {
+            externalOrderId: (incomingBody.external_order_id || incomingBody.externalOrderId || incomingBody.external_id || '').toString().trim() || null,
+            externalPaymentId: (incomingBody.external_payment_id || incomingBody.externalPaymentId || incomingBody.transaction_id || incomingBody.transactionId || '').toString().trim() || null,
+            gateway: (incomingBody.gateway || incomingBody.provider || incomingBody.channel || '').toString().trim() || null,
+          };
 
-    if (!orderId && !referenceId && !receiptNumber) {
-      const error = new Error('orderId/referenceId/receiptNumber wajib diisi');
-      error.statusCode = 400;
-      throw error;
-    }
+          if (!orderId && !referenceId && !receiptNumber) {
+            const error = new Error('orderId/referenceId/receiptNumber wajib diisi');
+            error.statusCode = 400;
+            throw error;
+          }
 
-    await client.query('BEGIN');
+          const result = await runTransaction(
+            client,
+            async (txClient) => {
+              const lookup = await txClient.query(
+                `SELECT id, reference_id, receipt_number,
+                        payment_method, payment_status, order_status,
+                        payment_proof_url,
+                        total_amount,
+                        branch_id,
+                        table_id,
+                        table_number,
+                        order_type,
+                        special_note
+                 FROM sales_records
+                 WHERE tenant_id = $1
+                   AND (
+                     ($2::text <> '' AND id::text = $2)
+                     OR ($3::text <> '' AND reference_id = $3)
+                     OR ($4::text <> '' AND receipt_number = $4)
+                   )
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                 FOR UPDATE`,
+                [tenantId, orderId, referenceId, receiptNumber],
+              );
 
-    const lookup = await client.query(
-      `SELECT id, reference_id, receipt_number,
-              payment_method, payment_status, order_status,
-              payment_proof_url,
-              total_amount,
-              branch_id,
-              table_id,
-              table_number,
-              order_type,
-              special_note
-       FROM sales_records
-       WHERE tenant_id = $1
-         AND (
-           ($2::text <> '' AND id::text = $2)
-           OR ($3::text <> '' AND reference_id = $3)
-           OR ($4::text <> '' AND receipt_number = $4)
-         )
-       ORDER BY created_at DESC
-       LIMIT 1`,
-      [tenantId, orderId, referenceId, receiptNumber],
+              const sale = lookup.rows?.[0];
+              if (!sale) {
+                const error = new Error('Pesanan tidak ditemukan untuk webhook pembayaran');
+                error.statusCode = 404;
+                throw error;
+              }
+
+              const paymentState = resolveWebhookPaymentState(gatewayStatus);
+              const safePaidAmount = paidAmount > 0 ? paidAmount : null;
+
+              const updatedResult = await txClient.query(
+                `UPDATE sales_records
+                 SET payment_status = $1,
+                     order_status = $2,
+                     amount_paid = COALESCE($3, amount_paid),
+                     updated_at = NOW()
+                 WHERE tenant_id = $4
+                   AND id = $5
+                 RETURNING id, reference_id, receipt_number,
+                           payment_method, payment_status, order_status,
+                           payment_proof_url,
+                           amount_paid, total_amount,
+                           branch_id,
+                           table_id,
+                           table_number,
+                           order_type,
+                           special_note`,
+                [paymentState.paymentStatus, paymentState.orderStatus, safePaidAmount, tenantId, sale.id],
+              );
+
+              return {
+                sale,
+                updated: updatedResult.rows?.[0] || sale,
+                paymentState,
+                tenantId,
+              };
+            },
+            {
+              label: `payment_webhook:${tenantId}:${orderId || referenceId || receiptNumber || 'noid'}`,
+              maxAttempts: 5,
+              baseDelayMs: 150,
+              maxDelayMs: 2500,
+            },
+          );
+
+          const { updated, paymentState } = result;
+          const updatedForEmit = updated;
+
+          emitToTenant(tenantId, 'qr_order_payment_status', {
+            tenantId,
+            orderId: updatedForEmit.id,
+            referenceId: updatedForEmit.reference_id,
+            receiptNumber: updatedForEmit.receipt_number,
+            branchId: updatedForEmit.branch_id ?? null,
+            tableId: updatedForEmit.table_id ?? null,
+            table_number: (updatedForEmit.table_number || '').toString().trim() || null,
+            orderType: (updatedForEmit.order_type || '').toString().trim() || null,
+            orderNote: (updatedForEmit.special_note || '').toString().trim() || null,
+            special_note: (updatedForEmit.special_note || '').toString().trim() || null,
+            paymentMethod: (updatedForEmit.payment_method || '').toString().trim() || null,
+            paymentStatus: updatedForEmit.payment_status,
+            orderStatus: updatedForEmit.order_status,
+            paymentProofUrl: (updatedForEmit.payment_proof_url || '').toString().trim() || null,
+            payment_proof_url: (updatedForEmit.payment_proof_url || '').toString().trim() || null,
+            amountPaid: updatedForEmit.amount_paid,
+            grandTotal: Number(updatedForEmit.total_amount || 0),
+            updatedAt: new Date().toISOString(),
+            source: 'payment_webhook',
+            requestId: gatewayTrace.requestId,
+            ...gatewayTrace,
+          });
+
+          return ackSuccess(updatedForEmit);
+        } finally {
+          client.release();
+        }
+      },
+      {
+        label: `payment_webhook:${requestId}`,
+        maxAttempts: 3,
+        baseDelayMs: 200,
+        maxDelayMs: 1500,
+        shouldRetry: (error, attempt) => {
+          if (error?.statusCode && error.statusCode >= 400 && error.statusCode < 500) {
+            return false;
+          }
+          if (attempt >= 3) return false;
+          return isTransientDbError(error);
+        },
+      },
     );
+  } catch (error) {
+    try {
+      await storeFailedPayload(
+        'payment_webhook',
+        {
+          ...gatewayTrace,
+          tenantId: tenantIdForLog,
+          ...orderLookup,
+          body: incomingBody,
+          query: req.query || null,
+        },
+        error,
+        {
+          url: req.url,
+          method: req.method,
+          headers: req.headers
+            ? Object.fromEntries(
+                Object.entries(req.headers).filter(([k]) => !/authorization|cookie|secret|signature/i.test(k)),
+              )
+            : null,
+        },
+      );
+    } catch (_) {}
 
-    const sale = lookup.rows?.[0];
-    if (!sale) {
-      const error = new Error('Pesanan tidak ditemukan untuk webhook pembayaran');
-      error.statusCode = 404;
-      throw error;
-    }
+    const status = error?.statusCode && error.statusCode >= 400 && error.statusCode < 600
+      ? error.statusCode
+      : 500;
 
-    const paymentState = resolveWebhookPaymentState(gatewayStatus);
-    const safePaidAmount = paidAmount > 0 ? paidAmount : null;
-
-    const updatedResult = await client.query(
-      `UPDATE sales_records
-       SET payment_status = $1,
-           order_status = $2,
-           amount_paid = COALESCE($3, amount_paid),
-           updated_at = NOW()
-       WHERE tenant_id = $4
-         AND id = $5
-       RETURNING id, reference_id, receipt_number,
-                 payment_method, payment_status, order_status,
-                 payment_proof_url,
-                 amount_paid, total_amount,
-                 branch_id,
-                 table_id,
-                 table_number,
-                 order_type,
-                 special_note`,
-      [paymentState.paymentStatus, paymentState.orderStatus, safePaidAmount, tenantId, sale.id],
-    );
-
-    await client.query('COMMIT');
-
-    const updated = updatedResult.rows?.[0] || sale;
-
-    emitToTenant(tenantId, 'qr_order_payment_status', {
-      tenantId,
-      orderId: updated.id,
-      referenceId: updated.reference_id,
-      receiptNumber: updated.receipt_number,
-      branchId: updated.branch_id ?? null,
-      tableId: updated.table_id ?? null,
-      table_number: (updated.table_number || '').toString().trim() || null,
-      orderType: (updated.order_type || '').toString().trim() || null,
-      orderNote: (updated.special_note || '').toString().trim() || null,
-      special_note: (updated.special_note || '').toString().trim() || null,
-      paymentMethod: (updated.payment_method || '').toString().trim() || null,
-      paymentStatus: updated.payment_status,
-      orderStatus: updated.order_status,
-      paymentProofUrl: (updated.payment_proof_url || '').toString().trim() || null,
-      payment_proof_url: (updated.payment_proof_url || '').toString().trim() || null,
-      amountPaid: updated.amount_paid,
-      grandTotal: Number(updated.total_amount || 0),
-      updatedAt: new Date().toISOString(),
-      source: 'payment_webhook',
+    console.error('[publicQrController] handlePaymentWebhook failed:', {
+      ...gatewayTrace,
+      tenantId: tenantIdForLog,
+      ...orderLookup,
+      message: error?.message || error,
+      code: error?.code || null,
+      statusCode: status,
+      stack: error?.stack || null,
     });
 
-    return jsonOk(res, updated, 'Webhook pembayaran diproses', 200);
-  } catch (error) {
-    await client.query('ROLLBACK');
-    return jsonError(res, error.statusCode || 500, error.message || 'Internal server error', error.message);
-  } finally {
-    client.release();
+    try {
+      return sendResponse(status, {
+        success: false,
+        message: error?.message || 'Internal server error',
+        error: error?.message || error,
+        requestId: gatewayTrace.requestId,
+        receivedAt: gatewayTrace.receivedAt,
+      });
+    } catch (_) {
+      return sendResponse(status, {
+        success: false,
+        message: 'Internal server error',
+        requestId: gatewayTrace.requestId,
+      });
+    }
   }
 };
 

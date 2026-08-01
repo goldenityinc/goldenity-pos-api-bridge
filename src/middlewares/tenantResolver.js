@@ -7,7 +7,82 @@ const createSharedPool = () => {
     throw new Error('DATABASE_URL belum dikonfigurasi untuk shared database bridge');
   }
 
-  const pool = new Pool({ connectionString });
+  const parsePositiveInt = (raw, fallback) => {
+    const value = Number.parseInt(`${raw}`, 10);
+    if (!Number.isFinite(value) || value <= 0) return fallback;
+    return value;
+  };
+
+  const min = parsePositiveInt(process.env.DB_POOL_MIN, 4);
+  const max = parsePositiveInt(process.env.DB_POOL_MAX, 40);
+  const idleTimeoutMs = parsePositiveInt(process.env.DB_IDLE_TIMEOUT_MS, 30 * 1000);
+  const connectionTimeoutMs = parsePositiveInt(process.env.DB_CONNECTION_TIMEOUT_MS, 5000);
+  const acquireTimeoutMs = parsePositiveInt(process.env.DB_ACQUIRE_TIMEOUT_MS, 10000);
+  const statementTimeoutMs = parsePositiveInt(process.env.DB_STATEMENT_TIMEOUT_MS || process.env.STATEMENT_TIMEOUT_MS, 0);
+  const safeMax = Math.max(min + 1, max);
+
+  const pool = new Pool({
+    connectionString,
+    min,
+    max: safeMax,
+    idleTimeoutMillis: idleTimeoutMs,
+    connectionTimeoutMillis: connectionTimeoutMs,
+    statement_timeout: statementTimeoutMs > 0 ? statementTimeoutMs : undefined,
+  });
+
+  pool.on('connect', (client) => {
+    try {
+      if (statementTimeoutMs > 0) {
+        client.query(`SET statement_timeout = ${statementTimeoutMs}`).catch(() => {});
+      }
+    } catch (_) {}
+  });
+
+  pool.on('acquire', (client) => {
+    try {
+      client.__goldenityAcquiredAt = Date.now();
+    } catch (_) {}
+  });
+
+  pool.on('error', (error, client) => {
+    console.error('[tenantResolver] Shared pool client error:', {
+      message: error?.message || error,
+      code: error?.code || null,
+      clientProcessId: client?.processID || null,
+    });
+  });
+
+  pool.on('release', (error, client) => {
+    if (!error) return;
+    const acquiredAt = client?.__goldenityAcquiredAt || 0;
+    const heldMs = acquiredAt > 0 ? Date.now() - acquiredAt : null;
+    console.warn('[tenantResolver] Pool client released with error:', {
+      message: error?.message || error,
+      code: error?.code || null,
+      heldMs,
+    });
+  });
+
+  let poolPendingLogged = 0;
+  setInterval(() => {
+    try {
+      const waiting = pool.waitingCount;
+      const total = pool.totalCount;
+      const idle = pool.idleCount;
+      if ((waiting > 0 && poolPendingLogged < 1) || (waiting > 0 && waiting % 5 === 0)) {
+        console.warn('[tenantResolver] Shared pool pressure:', {
+          waiting,
+          total,
+          idle,
+          max: safeMax,
+        });
+        poolPendingLogged += 1;
+      } else if (waiting === 0) {
+        poolPendingLogged = 0;
+      }
+    } catch (_) {}
+  }, 5000).unref?.();
+
   global.__goldenitySharedPool = pool;
   return pool;
 };

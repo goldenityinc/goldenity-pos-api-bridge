@@ -1,6 +1,7 @@
 const { jsonOk, jsonError } = require('../utils/http');
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 const {
   buildInsertQuery,
   getTableColumnDefinitions,
@@ -16,6 +17,13 @@ const {
   emitTransactionCreated,
   emitTransactionUpdated,
 } = require('../services/realtimeEmitter');
+const {
+  isTransientDbError,
+  withRetries,
+  getClientFromPool,
+  runTransaction,
+  storeFailedPayload,
+} = require('../utils/dbSafe');
 
 const normalizePaymentType = (value) => (value || '').toString().trim().toUpperCase();
 
@@ -761,326 +769,436 @@ const listActiveKasBon = async (req, res) => {
 };
 
 const createTransaction = async (req, res) => {
-  const client = await req.tenantDb.connect();
+  const requestId = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const incomingBody = (req.body && typeof req.body === 'object')
+    ? { ...req.body }
+    : {};
   let referenceId = '';
-  let tenantId = '';
+  let tenantIdForLog = resolveTenantIdFromRequest(req);
   let hasSalesTenantColumn = false;
 
-  try {
-    tenantId = resolveTenantIdFromRequest(req);
-    const payload = { ...req.body };
-    const clientProvidedId = typeof payload.id === 'string'
-      ? payload.id.trim()
-      : '';
-    const existingTransactionIdToUpdate = (
-      payload.existing_transaction_id ?? payload.existingTransactionId ?? ''
-    )
-      .toString()
-      .trim();
-    const existingReceiptNumberToUpdate = (
-      payload.existing_receipt_number ?? payload.existingReceiptNumber ?? ''
-    )
-      .toString()
-      .trim();
-    if (clientProvidedId) {
-      delete payload.id;
-    }
-    delete payload.existing_transaction_id;
-    delete payload.existingTransactionId;
-    delete payload.existing_receipt_number;
-    delete payload.existingReceiptNumber;
-    referenceId = normalizeReferenceId(payload, clientProvidedId);
-    if (referenceId) {
-      payload.reference_id = referenceId;
-    }
-    const isKasBonTransaction = normalizePaymentType(
-      payload.payment_method ?? payload.payment_type,
-    ) === 'KAS BON';
-    if (isKasBonTransaction) {
-      if (!hasMeaningfulValue(payload.payment_status)) {
-        payload.payment_status = 'Belum Lunas';
+  const runTransactionCore = async () => {
+    const client = await getClientFromPool(req.tenantDb);
+    let referenceIdLocal = '';
+    let tenantIdLocal = '';
+    let hasSalesTenantColumnLocal = false;
+    try {
+      tenantIdLocal = resolveTenantIdFromRequest(req);
+      tenantIdForLog = tenantIdForLog || tenantIdLocal;
+      const payload = { ...incomingBody };
+      const clientProvidedId = typeof payload.id === 'string'
+        ? payload.id.trim()
+        : '';
+      const existingTransactionIdToUpdate = (
+        payload.existing_transaction_id ?? payload.existingTransactionId ?? ''
+      )
+        .toString()
+        .trim();
+      const existingReceiptNumberToUpdate = (
+        payload.existing_receipt_number ?? payload.existingReceiptNumber ?? ''
+      )
+        .toString()
+        .trim();
+      if (clientProvidedId) {
+        delete payload.id;
       }
-
-      const resolvedBalance = toNumber(
-        payload.remaining_balance ??
-        payload.outstanding_balance ??
-        payload.total_price ??
-        payload.total_amount,
-      );
-      if (Number.isFinite(resolvedBalance)) {
-        if (!hasMeaningfulValue(payload.remaining_balance)) {
-          payload.remaining_balance = resolvedBalance;
-        }
-        if (!hasMeaningfulValue(payload.outstanding_balance)) {
-          payload.outstanding_balance = resolvedBalance;
-        }
+      delete payload.existing_transaction_id;
+      delete payload.existingTransactionId;
+      delete payload.existing_receipt_number;
+      delete payload.existingReceiptNumber;
+      referenceIdLocal = normalizeReferenceId(payload, clientProvidedId);
+      referenceId = referenceIdLocal;
+      if (referenceIdLocal) {
+        payload.reference_id = referenceIdLocal;
       }
-    }
-    const inventoryUpdates = [];
-    const inputItems = Array.isArray(payload.items) && payload.items.length > 0
-      ? payload.items
-      : payload.orderItems;
-    const transactionItems = normalizeTransactionItems(inputItems);
-    const storedItems = toStoredSalesRecordItems(inputItems);
-
-    await client.query('BEGIN');
-    await ensureSalesRecordsReferenceIdColumn(client);
-    await ensureSalesRecordsReceiptNumberColumn(client);
-    await ensureSalesRecordsCashierColumns(client);
-    await ensureSalesRecordsCustomerColumn(client);
-    await ensureSalesRecordsKasBonColumns(client);
-    await ensureSalesRecordsFinancialColumns(client);
-    await ensureSalesRecordsItemsColumn(client);
-    await ensureSalesRecordsNoteColumns(client);
-    await ensureSalesRecordItemsTable(client);
-    await ensureSalesRecordItemsMechanicIdColumn(client);
-    await ensureTenantScopedTable(client, 'sales_records', tenantId);
-    await ensureTenantScopedTable(client, 'products', tenantId);
-    const salesRecordColumnDefinitions = await getTableColumnDefinitions(client, 'sales_records');
-    const salesRecordColumnSet = new Set(salesRecordColumnDefinitions.keys());
-    hasSalesTenantColumn = salesRecordColumnSet.has('tenant_id');
-    const productsColumnSet = await getTableColumnSet(client, 'products');
-    const hasProductsTenantColumn = productsColumnSet.has('tenant_id');
-
-    if (existingTransactionIdToUpdate || existingReceiptNumberToUpdate) {
-      const existingRecordResult = await client.query(
-        existingTransactionIdToUpdate
-          ? (hasSalesTenantColumn
-            ? 'SELECT * FROM sales_records WHERE id = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
-            : 'SELECT * FROM sales_records WHERE id = $1 LIMIT 1 FOR UPDATE')
-          : (hasSalesTenantColumn
-            ? 'SELECT * FROM sales_records WHERE receipt_number = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
-            : 'SELECT * FROM sales_records WHERE receipt_number = $1 LIMIT 1 FOR UPDATE'),
-        hasSalesTenantColumn
-          ? [
-            existingTransactionIdToUpdate || existingReceiptNumberToUpdate,
-            tenantId,
-          ]
-          : [existingTransactionIdToUpdate || existingReceiptNumberToUpdate],
-      );
-
-      if ((existingRecordResult.rowCount || 0) === 0) {
-        throw new Error('Transaksi target untuk update tidak ditemukan');
-      }
-
-      const existingRecord = existingRecordResult.rows[0] || null;
-      const existingSalesRecordId = existingRecord?.id;
-      if (!existingSalesRecordId) {
-        throw new Error('ID transaksi target tidak valid');
-      }
-
-      if (isVoidedSalesRecord(existingRecord)) {
-        await client.query('COMMIT');
-
-        const preservedTransaction = existingRecord;
-        if (preservedTransaction) {
-          const hydratedItems = await loadSalesRecordItems(
-            req.tenantDb,
-            preservedTransaction.id,
-            tenantId,
-          );
-          preservedTransaction.items = hydratedItems.length > 0
-            ? hydratedItems
-            : parseItemsFromJsonField(preservedTransaction.items_json);
-        }
-
-        emitTransactionUpdated(req, preservedTransaction, {
-          transactionId: existingSalesRecordId,
-          action: 'UPDATE',
-          mutationType: 'CHECKOUT_UPDATE_SKIPPED_ALREADY_CANCELLED',
-        });
-
-        return jsonOk(
-          res,
-          preservedTransaction,
-          'Transaction already cancelled; terminal status preserved',
-        );
-      }
-
-      const tenantScopedPayload = enforceTenantIdOnPayload(
-        payload,
-        tenantId,
-        salesRecordColumnDefinitions,
-      );
-      const filteredPayload = normalizePayloadByColumnDefinitions(
-        tenantScopedPayload,
-        salesRecordColumnDefinitions,
-      );
-      delete filteredPayload.id;
-
-      if (storedItems.length > 0) {
-        filteredPayload.items_json = JSON.stringify(storedItems);
-      }
-
-      const updateEntries = Object.entries(filteredPayload).filter(
-        ([, value]) => value !== undefined,
-      );
-
-      let updatedRow = existingRecord;
-      if (updateEntries.length > 0) {
-        const setClause = updateEntries
-          .map(([column], index) => `${column} = $${index + 1}`)
-          .join(', ');
-        const updateValues = updateEntries.map(([, value]) => (
-          value === undefined ? null : value
-        ));
-        const targetParam = updateValues.length + 1;
-        const tenantParam = updateValues.length + 2;
-        const updateSql = `UPDATE sales_records
-                           SET ${setClause}
-                           WHERE id = $${targetParam}
-                           ${hasSalesTenantColumn ? `AND tenant_id = $${tenantParam}` : ''}
-                           RETURNING *`;
-        const updateResult = await client.query(
-          updateSql,
-          hasSalesTenantColumn
-            ? [...updateValues, existingSalesRecordId, tenantId]
-            : [...updateValues, existingSalesRecordId],
-        );
-        updatedRow = updateResult.rows?.[0] || existingRecord;
-      }
-
-      await syncSalesRecordItems(client, existingSalesRecordId, tenantId, storedItems);
-      await client.query('COMMIT');
-
-      const savedTransaction = updatedRow || null;
-      if (savedTransaction) {
-        const hydratedItems = await loadSalesRecordItems(
-          req.tenantDb,
-          savedTransaction.id,
-          tenantId,
-        );
-        savedTransaction.items = hydratedItems.length > 0
-          ? hydratedItems
-          : parseItemsFromJsonField(savedTransaction.items_json);
-      }
-
-      emitTransactionUpdated(req, savedTransaction, {
-        transactionId: existingSalesRecordId,
-        action: 'UPDATE',
-        mutationType: 'CHECKOUT_UPDATE_EXISTING',
-      });
+      const isKasBonTransaction = normalizePaymentType(
+        payload.payment_method ?? payload.payment_type,
+      ) === 'KAS BON';
       if (isKasBonTransaction) {
-        emitKasBonUpdated(req, savedTransaction, {
-          transactionId: existingSalesRecordId,
-          paymentStatus: payload.payment_status,
-          remainingBalance: payload.remaining_balance ?? payload.outstanding_balance,
-        });
-      }
+        if (!hasMeaningfulValue(payload.payment_status)) {
+          payload.payment_status = 'Belum Lunas';
+        }
 
-      return jsonOk(res, savedTransaction, 'Transaction updated');
-    }
-
-    if (referenceId) {
-      const existingResult = await client.query(
-        hasSalesTenantColumn
-          ? 'SELECT * FROM sales_records WHERE reference_id = $1 AND tenant_id = $2 LIMIT 1'
-          : 'SELECT * FROM sales_records WHERE reference_id = $1 LIMIT 1',
-        hasSalesTenantColumn ? [referenceId, tenantId] : [referenceId],
-      );
-
-      if ((existingResult.rowCount || 0) > 0) {
-        await client.query('ROLLBACK');
-        return jsonOk(res, existingResult.rows[0] || null, 'Transaction already exists');
-      }
-    }
-
-    for (const item of transactionItems) {
-      if (item.isService) {
-        continue;
-      }
-
-      const currentResult = await client.query(
-        hasProductsTenantColumn
-          ? 'SELECT id, name, stock, is_service FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
-          : 'SELECT id, name, stock, is_service FROM "products" WHERE id = $1 LIMIT 1 FOR UPDATE',
-        hasProductsTenantColumn ? [item.productId, tenantId] : [item.productId],
-      );
-
-      if ((currentResult.rowCount || 0) === 0) {
-        throw new Error(`Produk ${item.productName || item.productId} tidak ditemukan`);
-      }
-
-      const currentProduct = currentResult.rows[0];
-      if (currentProduct.is_service === true) {
-        continue;
-      }
-
-      const currentStock = Number(currentProduct.stock ?? 0);
-      if (!Number.isFinite(currentStock)) {
-        throw new Error(`Stok produk ${item.productId} tidak valid`);
-      }
-
-      const nextStock = currentStock - item.qty;
-      if (nextStock < 0) {
-        console.warn(
-          `⚠️ STOCK INSUFFICIENT: Product=${currentProduct.name}, ID=${item.productId}, Current=${currentStock}, Requested=${item.qty}, Tenant=${tenantId}`,
+        const resolvedBalance = toNumber(
+          payload.remaining_balance ??
+          payload.outstanding_balance ??
+          payload.total_price ??
+          payload.total_amount,
         );
-        throw new Error(`Stok produk ${currentProduct.name || item.productId} tidak mencukupi`);
+        if (Number.isFinite(resolvedBalance)) {
+          if (!hasMeaningfulValue(payload.remaining_balance)) {
+            payload.remaining_balance = resolvedBalance;
+          }
+          if (!hasMeaningfulValue(payload.outstanding_balance)) {
+            payload.outstanding_balance = resolvedBalance;
+          }
+        }
+      }
+      const inventoryUpdates = [];
+      const inputItems = Array.isArray(payload.items) && payload.items.length > 0
+        ? payload.items
+        : payload.orderItems;
+      const transactionItems = normalizeTransactionItems(inputItems);
+      const storedItems = toStoredSalesRecordItems(inputItems);
+
+      let committedResponse = null;
+
+      await runTransaction(
+        client,
+        async (txClient) => {
+          await ensureSalesRecordsReferenceIdColumn(txClient);
+          await ensureSalesRecordsReceiptNumberColumn(txClient);
+          await ensureSalesRecordsCashierColumns(txClient);
+          await ensureSalesRecordsCustomerColumn(txClient);
+          await ensureSalesRecordsKasBonColumns(txClient);
+          await ensureSalesRecordsFinancialColumns(txClient);
+          await ensureSalesRecordsItemsColumn(txClient);
+          await ensureSalesRecordsNoteColumns(txClient);
+          await ensureSalesRecordItemsTable(txClient);
+          await ensureSalesRecordItemsMechanicIdColumn(txClient);
+          await ensureTenantScopedTable(txClient, 'sales_records', tenantIdLocal);
+          await ensureTenantScopedTable(txClient, 'products', tenantIdLocal);
+          const salesRecordColumnDefinitions = await getTableColumnDefinitions(txClient, 'sales_records');
+          const salesRecordColumnSet = new Set(salesRecordColumnDefinitions.keys());
+          hasSalesTenantColumnLocal = salesRecordColumnSet.has('tenant_id');
+          hasSalesTenantColumn = hasSalesTenantColumnLocal;
+          const productsColumnSet = await getTableColumnSet(txClient, 'products');
+          const hasProductsTenantColumn = productsColumnSet.has('tenant_id');
+
+          if (existingTransactionIdToUpdate || existingReceiptNumberToUpdate) {
+            const existingRecordResult = await txClient.query(
+              existingTransactionIdToUpdate
+                ? (hasSalesTenantColumnLocal
+                  ? 'SELECT * FROM sales_records WHERE id = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
+                  : 'SELECT * FROM sales_records WHERE id = $1 LIMIT 1 FOR UPDATE')
+                : (hasSalesTenantColumnLocal
+                  ? 'SELECT * FROM sales_records WHERE receipt_number = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
+                  : 'SELECT * FROM sales_records WHERE receipt_number = $1 LIMIT 1 FOR UPDATE'),
+              hasSalesTenantColumnLocal
+                ? [
+                  existingTransactionIdToUpdate || existingReceiptNumberToUpdate,
+                  tenantIdLocal,
+                ]
+                : [existingTransactionIdToUpdate || existingReceiptNumberToUpdate],
+            );
+
+            if ((existingRecordResult.rowCount || 0) === 0) {
+              const error = new Error('Transaksi target untuk update tidak ditemukan');
+              error.statusCode = 404;
+              throw error;
+            }
+
+            const existingRecord = existingRecordResult.rows[0] || null;
+            const existingSalesRecordId = existingRecord?.id;
+            if (!existingSalesRecordId) {
+              const error = new Error('ID transaksi target tidak valid');
+              error.statusCode = 400;
+              throw error;
+            }
+
+            if (isVoidedSalesRecord(existingRecord)) {
+              const preservedTransaction = existingRecord;
+              if (preservedTransaction) {
+                const hydratedItems = await loadSalesRecordItems(
+                  req.tenantDb,
+                  preservedTransaction.id,
+                  tenantIdLocal,
+                );
+                preservedTransaction.items = hydratedItems.length > 0
+                  ? hydratedItems
+                  : parseItemsFromJsonField(preservedTransaction.items_json);
+              }
+
+              committedResponse = {
+                body: preservedTransaction,
+                message: 'Transaction already cancelled; terminal status preserved',
+                status: 200,
+                emit: () => {
+                  emitTransactionUpdated(req, preservedTransaction, {
+                    transactionId: existingSalesRecordId,
+                    action: 'UPDATE',
+                    mutationType: 'CHECKOUT_UPDATE_SKIPPED_ALREADY_CANCELLED',
+                  });
+                },
+              };
+              return;
+            }
+
+            const tenantScopedPayload = enforceTenantIdOnPayload(
+              payload,
+              tenantIdLocal,
+              salesRecordColumnDefinitions,
+            );
+            const filteredPayload = normalizePayloadByColumnDefinitions(
+              tenantScopedPayload,
+              salesRecordColumnDefinitions,
+            );
+            delete filteredPayload.id;
+
+            if (storedItems.length > 0) {
+              filteredPayload.items_json = JSON.stringify(storedItems);
+            }
+
+            const updateEntries = Object.entries(filteredPayload).filter(
+              ([, value]) => value !== undefined,
+            );
+
+            let updatedRow = existingRecord;
+            if (updateEntries.length > 0) {
+              const setClause = updateEntries
+                .map(([column], index) => `${column} = $${index + 1}`)
+                .join(', ');
+              const updateValues = updateEntries.map(([, value]) => (
+                value === undefined ? null : value
+              ));
+              const targetParam = updateValues.length + 1;
+              const tenantParam = updateValues.length + 2;
+              const updateSql = `UPDATE sales_records
+                                 SET ${setClause}
+                                 WHERE id = $${targetParam}
+                                 ${hasSalesTenantColumnLocal ? `AND tenant_id = $${tenantParam}` : ''}
+                                 RETURNING *`;
+              const updateResult = await txClient.query(
+                updateSql,
+                hasSalesTenantColumnLocal
+                  ? [...updateValues, existingSalesRecordId, tenantIdLocal]
+                  : [...updateValues, existingSalesRecordId],
+              );
+              updatedRow = updateResult.rows?.[0] || existingRecord;
+            }
+
+            await syncSalesRecordItems(txClient, existingSalesRecordId, tenantIdLocal, storedItems);
+
+            const savedTransaction = updatedRow || null;
+            if (savedTransaction) {
+              const hydratedItems = await loadSalesRecordItems(
+                req.tenantDb,
+                savedTransaction.id,
+                tenantIdLocal,
+              );
+              savedTransaction.items = hydratedItems.length > 0
+                ? hydratedItems
+                : parseItemsFromJsonField(savedTransaction.items_json);
+            }
+
+            committedResponse = {
+              body: savedTransaction,
+              message: 'Transaction updated',
+              status: 200,
+              emit: () => {
+                emitTransactionUpdated(req, savedTransaction, {
+                  transactionId: existingSalesRecordId,
+                  action: 'UPDATE',
+                  mutationType: 'CHECKOUT_UPDATE_EXISTING',
+                });
+                if (isKasBonTransaction) {
+                  emitKasBonUpdated(req, savedTransaction, {
+                    transactionId: existingSalesRecordId,
+                    paymentStatus: payload.payment_status,
+                    remainingBalance: payload.remaining_balance ?? payload.outstanding_balance,
+                  });
+                }
+              },
+            };
+            return;
+          }
+
+          if (referenceIdLocal) {
+            const existingResult = await txClient.query(
+              hasSalesTenantColumnLocal
+                ? 'SELECT * FROM sales_records WHERE reference_id = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
+                : 'SELECT * FROM sales_records WHERE reference_id = $1 LIMIT 1 FOR UPDATE',
+              hasSalesTenantColumnLocal ? [referenceIdLocal, tenantIdLocal] : [referenceIdLocal],
+            );
+
+            if ((existingResult.rowCount || 0) > 0) {
+              const existingRow = existingResult.rows[0] || null;
+              if (existingRow) {
+                const hydratedItems = await loadSalesRecordItems(
+                  req.tenantDb,
+                  existingRow.id,
+                  tenantIdLocal,
+                );
+                existingRow.items = hydratedItems.length > 0
+                  ? hydratedItems
+                  : parseItemsFromJsonField(existingRow.items_json);
+              }
+              committedResponse = {
+                body: existingRow,
+                message: 'Transaction already exists',
+                status: 200,
+                emit: () => {},
+              };
+              return;
+            }
+          }
+
+          for (const item of transactionItems) {
+            if (item.isService) {
+              continue;
+            }
+
+            const currentResult = await txClient.query(
+              hasProductsTenantColumn
+                ? 'SELECT id, name, stock, is_service FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
+                : 'SELECT id, name, stock, is_service FROM "products" WHERE id = $1 LIMIT 1 FOR UPDATE',
+              hasProductsTenantColumn ? [item.productId, tenantIdLocal] : [item.productId],
+            );
+
+            if ((currentResult.rowCount || 0) === 0) {
+              const error = new Error(`Produk ${item.productName || item.productId} tidak ditemukan`);
+              error.statusCode = 404;
+              throw error;
+            }
+
+            const currentProduct = currentResult.rows[0];
+            if (currentProduct.is_service === true) {
+              continue;
+            }
+
+            const currentStock = Number(currentProduct.stock ?? 0);
+            if (!Number.isFinite(currentStock)) {
+              throw new Error(`Stok produk ${item.productId} tidak valid`);
+            }
+
+            const nextStock = currentStock - item.qty;
+            if (nextStock < 0) {
+              console.warn(
+                `⚠️ STOCK INSUFFICIENT: Product=${currentProduct.name}, ID=${item.productId}, Current=${currentStock}, Requested=${item.qty}, Tenant=${tenantIdLocal}`,
+              );
+              const error = new Error(`Stok produk ${currentProduct.name || item.productId} tidak mencukupi`);
+              error.statusCode = 400;
+              throw error;
+            }
+
+            const updateResult = await txClient.query(
+              hasProductsTenantColumn
+                ? 'UPDATE "products" SET stock = $1 WHERE id = $2 AND tenant_id = $3 RETURNING *'
+                : 'UPDATE "products" SET stock = $1 WHERE id = $2 RETURNING *',
+              hasProductsTenantColumn ? [nextStock, item.productId, tenantIdLocal] : [nextStock, item.productId],
+            );
+            if ((updateResult.rowCount || 0) > 0) {
+              inventoryUpdates.push(updateResult.rows[0]);
+            }
+          }
+
+          const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantIdLocal, salesRecordColumnDefinitions);
+          const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, salesRecordColumnDefinitions);
+
+          if (storedItems.length > 0) {
+            filteredPayload.items_json = JSON.stringify(storedItems);
+          }
+
+          if (Object.keys(filteredPayload).length === 0) {
+            throw new Error('Payload transaksi tidak cocok dengan schema sales_records tenant');
+          }
+
+          const { sql, values } = buildInsertQuery('sales_records', filteredPayload);
+          const result = await txClient.query(sql, values);
+
+          const insertedSalesRecordId = result.rows?.[0]?.id;
+          if (insertedSalesRecordId !== undefined && insertedSalesRecordId !== null) {
+            await syncSalesRecordItems(txClient, insertedSalesRecordId, tenantIdLocal, storedItems);
+          }
+
+          const savedTransaction = result.rows[0] || null;
+          if (savedTransaction) {
+            const hydratedItems = await loadSalesRecordItems(
+              req.tenantDb,
+              savedTransaction.id,
+              tenantIdLocal,
+            );
+            savedTransaction.items = hydratedItems.length > 0
+              ? hydratedItems
+              : parseItemsFromJsonField(savedTransaction.items_json);
+          }
+
+          committedResponse = {
+            body: savedTransaction,
+            message: 'Transaction saved',
+            status: 201,
+            emit: () => {
+              emitTransactionCreated(req, savedTransaction, {
+                inventoryUpdates,
+              });
+              if (isKasBonTransaction) {
+                emitKasBonCreated(req, savedTransaction, {
+                  paymentStatus: payload.payment_status,
+                  remainingBalance: payload.remaining_balance ?? payload.outstanding_balance,
+                });
+              }
+            },
+          };
+        },
+        {
+          label: `create_transaction:${tenantIdLocal || 'unknown'}:${referenceIdLocal || 'noref'}`,
+          maxAttempts: 4,
+          baseDelayMs: 150,
+          maxDelayMs: 2500,
+        },
+      );
+
+      if (!committedResponse) {
+        throw new Error('Internal inconsistency: transaction completed without committedResponse');
       }
 
-      const updateResult = await client.query(
-        hasProductsTenantColumn
-          ? 'UPDATE "products" SET stock = $1 WHERE id = $2 AND tenant_id = $3 RETURNING *'
-          : 'UPDATE "products" SET stock = $1 WHERE id = $2 RETURNING *',
-        hasProductsTenantColumn ? [nextStock, item.productId, tenantId] : [nextStock, item.productId],
-      );
-      if ((updateResult.rowCount || 0) > 0) {
-        inventoryUpdates.push(updateResult.rows[0]);
+      if (typeof committedResponse.emit === 'function') {
+        try { committedResponse.emit(); } catch (_) {}
       }
+
+      return jsonOk(res, committedResponse.body, committedResponse.message, committedResponse.status);
+    } finally {
+      client.release();
     }
+  };
 
-    const tenantScopedPayload = enforceTenantIdOnPayload(payload, tenantId, salesRecordColumnDefinitions);
-    const filteredPayload = normalizePayloadByColumnDefinitions(tenantScopedPayload, salesRecordColumnDefinitions);
-
-    if (storedItems.length > 0) {
-      filteredPayload.items_json = JSON.stringify(storedItems);
-    }
-
-    if (Object.keys(filteredPayload).length === 0) {
-      throw new Error('Payload transaksi tidak cocok dengan schema sales_records tenant');
-    }
-
-    const { sql, values } = buildInsertQuery('sales_records', filteredPayload);
-    const result = await client.query(sql, values);
-
-    const insertedSalesRecordId = result.rows?.[0]?.id;
-    if (insertedSalesRecordId !== undefined && insertedSalesRecordId !== null) {
-      await syncSalesRecordItems(client, insertedSalesRecordId, tenantId, storedItems);
-    }
-
-    await client.query('COMMIT');
-
-    const savedTransaction = result.rows[0] || null;
-    if (savedTransaction) {
-      const hydratedItems = await loadSalesRecordItems(
-        req.tenantDb,
-        savedTransaction.id,
-        tenantId,
-      );
-      savedTransaction.items = hydratedItems.length > 0
-        ? hydratedItems
-        : parseItemsFromJsonField(savedTransaction.items_json);
-    }
-    emitTransactionCreated(req, savedTransaction, {
-      inventoryUpdates,
-    });
-    if (isKasBonTransaction) {
-      emitKasBonCreated(req, savedTransaction, {
-        paymentStatus: payload.payment_status,
-        remainingBalance: payload.remaining_balance ?? payload.outstanding_balance,
-      });
-    }
-
-    return jsonOk(res, savedTransaction, 'Transaction saved', 201);
+  try {
+    return await withRetries(
+      runTransactionCore,
+      {
+        label: `create_transaction:${requestId}`,
+        maxAttempts: 3,
+        baseDelayMs: 200,
+        maxDelayMs: 1500,
+        shouldRetry: (error, attempt) => {
+          if (error?.statusCode && error.statusCode >= 400 && error.statusCode < 500) {
+            return false;
+          }
+          if (attempt >= 3) return false;
+          return isTransientDbError(error);
+        },
+      },
+    );
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
+    try {
+      await storeFailedPayload(
+        'pos_transaction_create',
+        {
+          requestId,
+          tenantId: tenantIdForLog,
+          referenceId,
+          body: incomingBody,
+          query: req.query || null,
+        },
+        error,
+        {
+          url: req.url,
+          method: req.method,
+          headers: req.headers
+            ? Object.fromEntries(
+                Object.entries(req.headers).filter(([k]) => !/authorization|cookie|secret|signature/i.test(k)),
+              )
+            : null,
+        },
+      );
+    } catch (_) {}
 
     console.error(
-      `❌ Transaction Creation Error [Tenant=${tenantId}, Ref=${referenceId}]: ${error.message}`,
+      `❌ Transaction Creation Error [requestId=${requestId}, Tenant=${tenantIdForLog}, Ref=${referenceId}]: ${error.message}`,
       {
         code: error?.code,
         constraint: error?.constraint,
+        statusCode: error?.statusCode || null,
         stack: error?.stack,
       },
     );
@@ -1091,7 +1209,7 @@ const createTransaction = async (req, res) => {
           hasSalesTenantColumn
             ? 'SELECT * FROM sales_records WHERE reference_id = $1 AND tenant_id = $2 LIMIT 1'
             : 'SELECT * FROM sales_records WHERE reference_id = $1 LIMIT 1',
-          hasSalesTenantColumn ? [referenceId, tenantId] : [referenceId],
+          hasSalesTenantColumn ? [referenceId, tenantIdForLog] : [referenceId],
         );
 
         if ((existingResult.rowCount || 0) > 0) {
@@ -1100,380 +1218,429 @@ const createTransaction = async (req, res) => {
             const hydratedItems = await loadSalesRecordItems(
               req.tenantDb,
               existingRow.id,
-              tenantId,
+              tenantIdForLog,
             );
             existingRow.items = hydratedItems.length > 0
               ? hydratedItems
               : parseItemsFromJsonField(existingRow.items_json);
           }
-          return jsonOk(res, existingRow, 'Transaction already exists');
+          return jsonOk(res, existingRow, 'Transaction already exists (23505 idempotent recovery)');
         }
       } catch (_) {}
     }
 
-    return jsonError(res, 500, error.message || 'Internal server error', error.message);
-  } finally {
-    client.release();
+    return jsonError(
+      res,
+      error?.statusCode || 500,
+      error.message || 'Internal server error',
+      error.message,
+    );
   }
 };
 
 const settleKasBon = async (req, res) => {
-  const client = await req.tenantDb.connect();
-  let settlePhase = 'init';
+  const requestId = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const incomingBody = (req.body && typeof req.body === 'object')
+    ? { ...req.body }
+    : {};
+  const id = req.params.id;
+  let tenantIdForLog = resolveTenantIdFromRequest(req);
 
-  try {
-    settlePhase = 'resolve_tenant';
-    const tenantId = resolveTenantIdFromRequest(req);
-    settlePhase = 'ensure_sales_records_tenant_scope';
-    await ensureTenantScopedTable(client, 'sales_records', tenantId);
-    settlePhase = 'ensure_sales_records_kasbon_columns';
-    await ensureSalesRecordsKasBonColumns(client);
-    const id = req.params.id;
-    const paidAmountRaw = req.body?.paid_amount ?? req.body?.amount ?? req.body?.amount_paid;
-    const paidAmount = toNumber(paidAmountRaw);
-    const settlementMethodInput =
-      req.body?.settlement_method ?? req.body?.payment_method ?? 'Cash';
-    const settlementMethod = (settlementMethodInput ?? 'Cash').toString().trim() || 'Cash';
-    const settlementNoteInput =
-      req.body?.payment_note ?? req.body?.note ?? req.body?.settlement_note ?? null;
-    const settlementNote = settlementNoteInput === null || settlementNoteInput === undefined
-      ? null
-      : settlementNoteInput.toString().trim() || null;
-    const pb1AmountRaw = req.body?.tax_pb1_amount ?? req.body?.pb1_amount ?? 0;
-    const pb1Amount = Number.parseInt(pb1AmountRaw, 10);
-    const normalizedPb1Amount = Number.isFinite(pb1Amount) ? pb1Amount : 0;
-    const paidAt = req.body?.paid_at ? new Date(req.body.paid_at) : new Date();
-    const safeTenantId = (tenantId || '').toString().trim() || null;
-    const salesRecordId = Number.parseInt((id || '').toString(), 10);
-    const safeSalesRecordId = Number.isFinite(salesRecordId) ? salesRecordId : null;
+  const runSettleCore = async () => {
+    const client = await getClientFromPool(req.tenantDb);
+    try {
+      const tenantId = resolveTenantIdFromRequest(req);
+      tenantIdForLog = tenantIdForLog || tenantId;
 
-    if (!id || safeSalesRecordId === null) {
-      return jsonError(res, 400, 'id transaksi wajib diisi');
-    }
+      const paidAmountRaw = incomingBody.paid_amount ?? incomingBody.amount ?? incomingBody.amount_paid;
+      const paidAmount = toNumber(paidAmountRaw);
+      const settlementMethodInput =
+        incomingBody.settlement_method ?? incomingBody.payment_method ?? 'Cash';
+      const settlementMethod = (settlementMethodInput ?? 'Cash').toString().trim() || 'Cash';
+      const settlementNoteInput =
+        incomingBody.payment_note ?? incomingBody.note ?? incomingBody.settlement_note ?? null;
+      const settlementNote = settlementNoteInput === null || settlementNoteInput === undefined
+        ? null
+        : settlementNoteInput.toString().trim() || null;
+      const pb1AmountRaw = incomingBody.tax_pb1_amount ?? incomingBody.pb1_amount ?? 0;
+      const pb1Amount = Number.parseInt(pb1AmountRaw, 10);
+      const normalizedPb1Amount = Number.isFinite(pb1Amount) ? pb1Amount : 0;
+      const paidAt = incomingBody.paid_at ? new Date(incomingBody.paid_at) : new Date();
+      const safeTenantId = (tenantId || '').toString().trim() || null;
+      const salesRecordId = Number.parseInt((id || '').toString(), 10);
+      const safeSalesRecordId = Number.isFinite(salesRecordId) ? salesRecordId : null;
 
-    if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
-      return jsonError(res, 400, 'Nominal pembayaran harus lebih dari 0');
-    }
-
-    settlePhase = 'begin_transaction';
-    await client.query('BEGIN');
-
-    // Use current_schemas(false) so the lookup works regardless of whether the
-    // tenant's tables live in the 'public' schema or a custom search_path schema.
-    settlePhase = 'load_sales_records_columns';
-    const columnsResult = await client.query(
-      `SELECT column_name
-       FROM information_schema.columns
-       WHERE table_schema = ANY(current_schemas(false))
-         AND table_name = 'sales_records'`,
-    );
-    const columns = new Set(columnsResult.rows.map((row) => row.column_name));
-
-    const paymentColumn = columns.has('payment_method')
-      ? 'payment_method'
-      : (columns.has('payment_type') ? 'payment_type' : null);
-    const amountColumn = columns.has('total_price')
-      ? 'total_price'
-      : (columns.has('total_amount') ? 'total_amount' : null);
-
-    if (!paymentColumn || !amountColumn) {
-      await client.query('ROLLBACK');
-      return jsonError(res, 500, 'Kolom pembayaran sales_records tidak lengkap');
-    }
-
-    settlePhase = 'lock_sales_record';
-    const transactionResult = await client.query(
-      `SELECT id,
-              ${paymentColumn} AS payment_value,
-              ${amountColumn} AS amount_value,
-              ${columns.has('payment_status') ? 'payment_status,' : "NULL::TEXT AS payment_status,"}
-              ${columns.has('amount_paid') ? 'amount_paid,' : 'NULL::NUMERIC AS amount_paid,'}
-              ${columns.has('outstanding_balance') ? 'outstanding_balance,' : 'NULL::NUMERIC AS outstanding_balance,'}
-              remaining_balance
-       FROM sales_records
-       WHERE id = $1::bigint
-         ${columns.has('tenant_id') ? 'AND tenant_id = $2::text' : ''}
-       FOR UPDATE`,
-      columns.has('tenant_id') ? [safeSalesRecordId, safeTenantId || ''] : [safeSalesRecordId],
-    );
-
-    if (transactionResult.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return jsonError(res, 404, 'Data transaksi tidak ditemukan');
-    }
-
-
-    const transaction = transactionResult.rows[0];
-    const paymentType = normalizePaymentType(transaction.payment_value);
-    const paymentStatus = normalizePaymentType(transaction.payment_status);
-
-    if (paymentType !== 'KAS BON') {
-      await client.query('ROLLBACK');
-      return jsonError(res, 400, 'Transaksi ini bukan tipe pembayaran KAS BON');
-    }
-
-    if (paymentStatus === 'LUNAS') {
-      await client.query('ROLLBACK');
-      return jsonError(res, 400, 'Kas Bon ini sudah dilunasi sebelumnya!');
-    }
-
-    const fallbackBalance = toNumber(transaction.amount_value);
-    const currentBalance = Number.isFinite(toNumber(transaction.remaining_balance))
-      ? toNumber(transaction.remaining_balance)
-      : (Number.isFinite(toNumber(transaction.outstanding_balance))
-        ? toNumber(transaction.outstanding_balance)
-        : fallbackBalance);
-    const currentAmountPaid = Number.isFinite(toNumber(transaction.amount_paid))
-      ? toNumber(transaction.amount_paid)
-      : Math.max(0, (Number.isFinite(fallbackBalance) ? fallbackBalance : 0) - currentBalance);
-
-    if (currentBalance <= 0) {
-      await client.query('ROLLBACK');
-      return jsonError(res, 400, 'Kas Bon ini sudah dilunasi sebelumnya!');
-    }
-
-    if (!Number.isFinite(currentBalance) || currentBalance < 0) {
-      await client.query('ROLLBACK');
-      return jsonError(res, 400, 'Nilai remaining_balance tidak valid pada transaksi');
-    }
-
-    if (paidAmount > currentBalance) {
-      await client.query('ROLLBACK');
-      return jsonError(res, 400, 'Nominal pembayaran melebihi sisa kas bon');
-    }
-
-    const normalizedPaidAmount = Number.isFinite(paidAmount)
-      ? Number(paidAmount.toFixed(2))
-      : 0;
-    const nextBalanceRaw = currentBalance - normalizedPaidAmount;
-    const nextBalance = Number(nextBalanceRaw.toFixed(2));
-    const isLunas = nextBalance <= 0;
-    const normalizedBalance = isLunas ? 0 : nextBalance;
-    const safeCurrentBalance = Number.isFinite(currentBalance)
-      ? Number(currentBalance.toFixed(2))
-      : 0;
-    const safeRemainingBalance = Number.isFinite(normalizedBalance)
-      ? normalizedBalance
-      : 0;
-    const nextAmountPaid = Number((currentAmountPaid + normalizedPaidAmount).toFixed(2));
-    const safeNextAmountPaid = Number.isFinite(nextAmountPaid) ? nextAmountPaid : 0;
-
-    settlePhase = 'ensure_kasbon_history_table';
-    await ensureKasBonHistoryTable(client);
-    settlePhase = 'ensure_kasbon_history_tenant_scope';
-    await ensureTenantScopedTable(client, 'kas_bon_payment_history', tenantId);
-
-    settlePhase = 'insert_kasbon_payment_history';
-    await client.query(
-      `INSERT INTO kas_bon_payment_history (
-         tenant_id,
-         sales_record_id,
-         paid_amount,
-         previous_balance,
-         remaining_balance,
-         payment_method,
-         paid_at,
-         note
-       ) VALUES (
-         $1::text,
-         $2::bigint,
-         $3::numeric,
-         $4::numeric,
-         $5::numeric,
-         $6::text,
-         $7::timestamptz,
-         $8::text
-       )`,
-      [
-        safeTenantId,
-        safeSalesRecordId,
-        normalizedPaidAmount || 0,
-        safeCurrentBalance || 0,
-        safeRemainingBalance || 0,
-        settlementMethod || 'Cash',
-        paidAt || new Date(),
-        settlementNote || null,
-      ],
-    );
-
-    const updateClauses = ['remaining_balance = $1::numeric', 'amount_paid = $3::numeric'];
-    if (columns.has('outstanding_balance')) {
-      updateClauses.push('outstanding_balance = $1::numeric');
-    }
-    if (columns.has('payment_method')) {
-      const hasLastPaymentMethodColumn = columns.has('last_payment_method');
-      const finalPaymentMethod = isLunas
-        ? `Lunas - ${settlementMethod}`
-        : 'Kas Bon';
-      const paymentMethodToSave = (finalPaymentMethod || '').toString().trim() || 'Cash';
-
-      const values = [
-        safeRemainingBalance || 0,
-        safeSalesRecordId,
-        safeNextAmountPaid || 0,
-      ];
-
-      if (hasLastPaymentMethodColumn) {
-        updateClauses.push('last_payment_method = $4::text');
-        values.push((settlementMethod || 'Cash').toString().trim() || 'Cash');
+      if (!id || safeSalesRecordId === null) {
+        const error = new Error('id transaksi wajib diisi');
+        error.statusCode = 400;
+        throw error;
       }
 
-      const paymentMethodParamPosition = values.length + 1;
-      updateClauses.push(
-        hasLastPaymentMethodColumn
-          ? 'payment_method = $5::text'
-          : `payment_method = $${paymentMethodParamPosition}::text`,
-      );
-      values.push(paymentMethodToSave || 'Cash');
-
-      if (hasLastPaymentMethodColumn) {
-        const lastPaymentAmountParamPosition = values.length + 1;
-        updateClauses.push(`last_payment_amount = $${lastPaymentAmountParamPosition}::numeric`);
-        values.push(normalizedPaidAmount || 0);
+      if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
+        const error = new Error('Nominal pembayaran harus lebih dari 0');
+        error.statusCode = 400;
+        throw error;
       }
 
-      if (columns.has('payment_status')) {
-        const paramPosition = values.length + 1;
-        updateClauses.push(`payment_status = $${paramPosition}::text`);
-        values.push(isLunas ? 'LUNAS' : 'BELUM LUNAS');
-      }
+      let committedResponse = null;
 
-      const updateSql = `
-      UPDATE sales_records
-      SET ${updateClauses.join(', ')}
-      WHERE id = $2::bigint
-        ${columns.has('tenant_id') ? `AND tenant_id = $${values.length + 1}::text` : ''}
-      RETURNING *
-    `;
+      await runTransaction(
+        client,
+        async (txClient) => {
+          await ensureTenantScopedTable(txClient, 'sales_records', tenantId);
+          await ensureSalesRecordsKasBonColumns(txClient);
 
-      settlePhase = 'update_sales_records_payment_method_branch';
-      const updateResult = await client.query(
-        updateSql,
-        columns.has('tenant_id') ? [...values, safeTenantId || ''] : values,
-      );
-      settlePhase = 'commit_payment_method_branch';
-      await client.query('COMMIT');
+          const columnsResult = await txClient.query(
+            `SELECT column_name
+             FROM information_schema.columns
+             WHERE table_schema = ANY(current_schemas(false))
+               AND table_name = 'sales_records'`,
+          );
+          const columns = new Set(columnsResult.rows.map((row) => row.column_name));
 
-      const updatedTransaction = updateResult.rows[0] || null;
+          const paymentColumn = columns.has('payment_method')
+            ? 'payment_method'
+            : (columns.has('payment_type') ? 'payment_type' : null);
+          const amountColumn = columns.has('total_price')
+            ? 'total_price'
+            : (columns.has('total_amount') ? 'total_amount' : null);
 
-      emitKasBonUpdated(req, updatedTransaction, {
-        transactionId: id,
-        paidAmount: normalizedPaidAmount,
-        remainingBalance: safeRemainingBalance,
-        status: isLunas ? 'Lunas' : 'Belum Lunas',
-        paymentMethod: settlementMethod || 'Cash',
-      });
+          if (!paymentColumn || !amountColumn) {
+            const error = new Error('Kolom pembayaran sales_records tidak lengkap');
+            error.statusCode = 500;
+            throw error;
+          }
 
-      emitTransactionUpdated(req, updatedTransaction, {
-        transactionId: id,
-        action: 'UPDATE',
-        mutationType: 'KASBON_SETTLED',
-        paymentHistory: {
-          sales_record_id: id,
-          paid_amount: normalizedPaidAmount,
-          previous_balance: safeCurrentBalance,
-          remaining_balance: safeRemainingBalance,
-          payment_method: settlementMethod || 'Cash',
-          paid_at: paidAt,
-          note: settlementNote,
+          const transactionResult = await txClient.query(
+            `SELECT id,
+                    ${paymentColumn} AS payment_value,
+                    ${amountColumn} AS amount_value,
+                    ${columns.has('payment_status') ? 'payment_status,' : "NULL::TEXT AS payment_status,"}
+                    ${columns.has('amount_paid') ? 'amount_paid,' : 'NULL::NUMERIC AS amount_paid,'}
+                    ${columns.has('outstanding_balance') ? 'outstanding_balance,' : 'NULL::NUMERIC AS outstanding_balance,'}
+                    remaining_balance
+             FROM sales_records
+             WHERE id = $1::bigint
+               ${columns.has('tenant_id') ? 'AND tenant_id = $2::text' : ''}
+             FOR UPDATE`,
+            columns.has('tenant_id') ? [safeSalesRecordId, safeTenantId || ''] : [safeSalesRecordId],
+          );
+
+          if (transactionResult.rowCount === 0) {
+            const error = new Error('Data transaksi tidak ditemukan');
+            error.statusCode = 404;
+            throw error;
+          }
+
+          const transaction = transactionResult.rows[0];
+          const paymentType = normalizePaymentType(transaction.payment_value);
+          const paymentStatus = normalizePaymentType(transaction.payment_status);
+
+          if (paymentType !== 'KAS BON') {
+            const error = new Error('Transaksi ini bukan tipe pembayaran KAS BON');
+            error.statusCode = 400;
+            throw error;
+          }
+
+          if (paymentStatus === 'LUNAS') {
+            const error = new Error('Kas Bon ini sudah dilunasi sebelumnya!');
+            error.statusCode = 400;
+            throw error;
+          }
+
+          const fallbackBalance = toNumber(transaction.amount_value);
+          const currentBalance = Number.isFinite(toNumber(transaction.remaining_balance))
+            ? toNumber(transaction.remaining_balance)
+            : (Number.isFinite(toNumber(transaction.outstanding_balance))
+              ? toNumber(transaction.outstanding_balance)
+              : fallbackBalance);
+          const currentAmountPaid = Number.isFinite(toNumber(transaction.amount_paid))
+            ? toNumber(transaction.amount_paid)
+            : Math.max(0, (Number.isFinite(fallbackBalance) ? fallbackBalance : 0) - currentBalance);
+
+          if (currentBalance <= 0) {
+            const error = new Error('Kas Bon ini sudah dilunasi sebelumnya!');
+            error.statusCode = 400;
+            throw error;
+          }
+
+          if (!Number.isFinite(currentBalance) || currentBalance < 0) {
+            const error = new Error('Nilai remaining_balance tidak valid pada transaksi');
+            error.statusCode = 400;
+            throw error;
+          }
+
+          if (paidAmount > currentBalance) {
+            const error = new Error('Nominal pembayaran melebihi sisa kas bon');
+            error.statusCode = 400;
+            throw error;
+          }
+
+          const normalizedPaidAmount = Number.isFinite(paidAmount)
+            ? Number(paidAmount.toFixed(2))
+            : 0;
+          const nextBalanceRaw = currentBalance - normalizedPaidAmount;
+          const nextBalance = Number(nextBalanceRaw.toFixed(2));
+          const isLunas = nextBalance <= 0;
+          const normalizedBalance = isLunas ? 0 : nextBalance;
+          const safeCurrentBalance = Number.isFinite(currentBalance)
+            ? Number(currentBalance.toFixed(2))
+            : 0;
+          const safeRemainingBalance = Number.isFinite(normalizedBalance)
+            ? normalizedBalance
+            : 0;
+          const nextAmountPaid = Number((currentAmountPaid + normalizedPaidAmount).toFixed(2));
+          const safeNextAmountPaid = Number.isFinite(nextAmountPaid) ? nextAmountPaid : 0;
+
+          await ensureKasBonHistoryTable(txClient);
+          await ensureTenantScopedTable(txClient, 'kas_bon_payment_history', tenantId);
+
+          await txClient.query(
+            `INSERT INTO kas_bon_payment_history (
+               tenant_id,
+               sales_record_id,
+               paid_amount,
+               previous_balance,
+               remaining_balance,
+               payment_method,
+               paid_at,
+               note
+             ) VALUES (
+               $1::text,
+               $2::bigint,
+               $3::numeric,
+               $4::numeric,
+               $5::numeric,
+               $6::text,
+               $7::timestamptz,
+               $8::text
+             )`,
+            [
+              safeTenantId,
+              safeSalesRecordId,
+              normalizedPaidAmount || 0,
+              safeCurrentBalance || 0,
+              safeRemainingBalance || 0,
+              settlementMethod || 'Cash',
+              paidAt || new Date(),
+              settlementNote || null,
+            ],
+          );
+
+          const updateClauses = ['remaining_balance = $1::numeric', 'amount_paid = $3::numeric'];
+          if (columns.has('outstanding_balance')) {
+            updateClauses.push('outstanding_balance = $1::numeric');
+          }
+
+          let updatedTransaction = null;
+          let responseBody = null;
+
+          if (columns.has('payment_method')) {
+            const hasLastPaymentMethodColumn = columns.has('last_payment_method');
+            const finalPaymentMethod = isLunas
+              ? `Lunas - ${settlementMethod}`
+              : 'Kas Bon';
+            const paymentMethodToSave = (finalPaymentMethod || '').toString().trim() || 'Cash';
+
+            const values = [
+              safeRemainingBalance || 0,
+              safeSalesRecordId,
+              safeNextAmountPaid || 0,
+            ];
+
+            if (hasLastPaymentMethodColumn) {
+              updateClauses.push('last_payment_method = $4::text');
+              values.push((settlementMethod || 'Cash').toString().trim() || 'Cash');
+            }
+
+            const paymentMethodParamPosition = values.length + 1;
+            updateClauses.push(
+              hasLastPaymentMethodColumn
+                ? 'payment_method = $5::text'
+                : `payment_method = $${paymentMethodParamPosition}::text`,
+            );
+            values.push(paymentMethodToSave || 'Cash');
+
+            if (hasLastPaymentMethodColumn) {
+              const lastPaymentAmountParamPosition = values.length + 1;
+              updateClauses.push(`last_payment_amount = $${lastPaymentAmountParamPosition}::numeric`);
+              values.push(normalizedPaidAmount || 0);
+            }
+
+            if (columns.has('payment_status')) {
+              const paramPosition = values.length + 1;
+              updateClauses.push(`payment_status = $${paramPosition}::text`);
+              values.push(isLunas ? 'LUNAS' : 'BELUM LUNAS');
+            }
+
+            const updateSql = `
+              UPDATE sales_records
+              SET ${updateClauses.join(', ')}
+              WHERE id = $2::bigint
+                ${columns.has('tenant_id') ? `AND tenant_id = $${values.length + 1}::text` : ''}
+              RETURNING *
+            `;
+
+            const updateResult = await txClient.query(
+              updateSql,
+              columns.has('tenant_id') ? [...values, safeTenantId || ''] : values,
+            );
+            updatedTransaction = updateResult.rows[0] || null;
+          } else {
+            const values = [safeRemainingBalance || 0, safeSalesRecordId, safeNextAmountPaid || 0];
+
+            if (columns.has('payment_status')) {
+              const paramPosition = values.length + 1;
+              updateClauses.push(`payment_status = $${paramPosition}::text`);
+              values.push(isLunas ? 'LUNAS' : 'BELUM LUNAS');
+            }
+
+            const updateSql = `
+              UPDATE sales_records
+              SET ${updateClauses.join(', ')}
+              WHERE id = $2::bigint
+                ${columns.has('tenant_id') ? `AND tenant_id = $${values.length + 1}::text` : ''}
+              RETURNING *
+            `;
+
+            const updateResult = await txClient.query(
+              updateSql,
+              columns.has('tenant_id') ? [...values, safeTenantId || ''] : values,
+            );
+            updatedTransaction = updateResult.rows[0] || null;
+          }
+
+          responseBody = {
+            transaction: updatedTransaction,
+            paid_amount: normalizedPaidAmount,
+            remaining_balance: safeRemainingBalance,
+            amount_paid: safeNextAmountPaid,
+            payment_method: settlementMethod || 'Cash',
+            note: settlementNote,
+            tax_pb1_amount: normalizedPb1Amount,
+            status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
+          };
+
+          committedResponse = {
+            body: responseBody,
+            message: 'Pelunasan kas bon berhasil',
+            status: 200,
+            emit: () => {
+              emitKasBonUpdated(req, updatedTransaction, {
+                transactionId: id,
+                paidAmount: normalizedPaidAmount,
+                remainingBalance: safeRemainingBalance,
+                status: isLunas ? 'Lunas' : 'Belum Lunas',
+                paymentMethod: settlementMethod || 'Cash',
+              });
+
+              emitTransactionUpdated(req, updatedTransaction, {
+                transactionId: id,
+                action: 'UPDATE',
+                mutationType: 'KASBON_SETTLED',
+                paymentHistory: {
+                  sales_record_id: id,
+                  paid_amount: normalizedPaidAmount,
+                  previous_balance: safeCurrentBalance,
+                  remaining_balance: safeRemainingBalance,
+                  payment_method: settlementMethod || 'Cash',
+                  paid_at: paidAt,
+                  note: settlementNote,
+                },
+                paidAmount: normalizedPaidAmount,
+                remainingBalance: safeRemainingBalance,
+                amountPaid: safeNextAmountPaid,
+                tax_pb1_amount: normalizedPb1Amount,
+                status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
+              });
+            },
+          };
         },
-        paidAmount: normalizedPaidAmount,
-        remainingBalance: safeRemainingBalance,
-        amountPaid: safeNextAmountPaid,
-        tax_pb1_amount: normalizedPb1Amount,
-        status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
-      });
+        {
+          label: `settle_kas_bon:${tenantId || 'unknown'}:${id || 'noid'}`,
+          maxAttempts: 4,
+          baseDelayMs: 150,
+          maxDelayMs: 2500,
+        },
+      );
+
+      if (!committedResponse) {
+        throw new Error('Internal inconsistency: kas bon settlement completed without committedResponse');
+      }
+
+      if (typeof committedResponse.emit === 'function') {
+        try { committedResponse.emit(); } catch (_) {}
+      }
 
       return jsonOk(
         res,
-        {
-          transaction: updatedTransaction,
-          paid_amount: normalizedPaidAmount,
-          remaining_balance: safeRemainingBalance,
-          amount_paid: safeNextAmountPaid,
-          payment_method: settlementMethod || 'Cash',
-          note: settlementNote,
-          tax_pb1_amount: normalizedPb1Amount,
-          status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
-        },
-        'Pelunasan kas bon berhasil',
+        committedResponse.body,
+        committedResponse.message,
+        committedResponse.status,
       );
+    } finally {
+      client.release();
     }
+  };
 
-    const values = [safeRemainingBalance || 0, safeSalesRecordId, safeNextAmountPaid || 0];
-
-    if (columns.has('payment_status')) {
-      const paramPosition = values.length + 1;
-      updateClauses.push(`payment_status = $${paramPosition}::text`);
-      values.push(isLunas ? 'LUNAS' : 'BELUM LUNAS');
-    }
-
-    const updateSql = `
-      UPDATE sales_records
-      SET ${updateClauses.join(', ')}
-      WHERE id = $2::bigint
-        ${columns.has('tenant_id') ? `AND tenant_id = $${values.length + 1}::text` : ''}
-      RETURNING *
-    `;
-
-    settlePhase = 'update_sales_records_fallback_branch';
-    const updateResult = await client.query(
-      updateSql,
-      columns.has('tenant_id') ? [...values, safeTenantId || ''] : values,
-    );
-    settlePhase = 'commit_fallback_branch';
-    await client.query('COMMIT');
-
-    const updatedTransaction = updateResult.rows[0] || null;
-
-    emitKasBonUpdated(req, updatedTransaction, {
-      transactionId: id,
-      paidAmount: normalizedPaidAmount,
-      remainingBalance: safeRemainingBalance,
-      status: isLunas ? 'Lunas' : 'Belum Lunas',
-      paymentMethod: settlementMethod || 'Cash',
-    });
-
-    emitTransactionUpdated(req, updatedTransaction, {
-      transactionId: id,
-      action: 'UPDATE',
-      mutationType: 'KASBON_SETTLED',
-      paymentHistory: {
-        sales_record_id: id,
-        paid_amount: normalizedPaidAmount,
-        previous_balance: safeCurrentBalance,
-        remaining_balance: safeRemainingBalance,
-        payment_method: settlementMethod || 'Cash',
-        paid_at: paidAt,
-        note: settlementNote,
-      },
-      paidAmount: normalizedPaidAmount,
-      remainingBalance: safeRemainingBalance,
-      amountPaid: safeNextAmountPaid,
-      tax_pb1_amount: normalizedPb1Amount,
-      status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
-    });
-
-    return jsonOk(
-      res,
+  try {
+    return await withRetries(
+      runSettleCore,
       {
-        transaction: updatedTransaction,
-        paid_amount: normalizedPaidAmount,
-        remaining_balance: safeRemainingBalance,
-        amount_paid: safeNextAmountPaid,
-        payment_method: settlementMethod || 'Cash',
-        note: settlementNote,
-        tax_pb1_amount: normalizedPb1Amount,
-        status: isLunas ? 'LUNAS' : 'BELUM LUNAS',
+        label: `settle_kas_bon:${requestId}`,
+        maxAttempts: 3,
+        baseDelayMs: 200,
+        maxDelayMs: 1500,
+        shouldRetry: (error, attempt) => {
+          if (error?.statusCode && error.statusCode >= 400 && error.statusCode < 500) {
+            return false;
+          }
+          if (attempt >= 3) return false;
+          return isTransientDbError(error);
+        },
       },
-      'Pelunasan kas bon berhasil',
     );
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
-    const phaseMessage = `[settleKasBon:${settlePhase}] ${error.message || 'Internal server error'}`;
-    return jsonError(res, 500, phaseMessage, phaseMessage);
-  } finally {
-    client.release();
+    try {
+      await storeFailedPayload(
+        'pos_kas_bon_settle',
+        {
+          requestId,
+          tenantId: tenantIdForLog,
+          transactionId: id,
+          body: incomingBody,
+          params: req.params || null,
+          query: req.query || null,
+        },
+        error,
+        {
+          url: req.url,
+          method: req.method,
+          headers: req.headers
+            ? Object.fromEntries(
+                Object.entries(req.headers).filter(([k]) => !/authorization|cookie|secret|signature/i.test(k)),
+              )
+            : null,
+        },
+      );
+    } catch (_) {}
+
+    console.error(
+      `❌ Kas Bon Settlement Error [requestId=${requestId}, Tenant=${tenantIdForLog}, ID=${id}]: ${error.message}`,
+      {
+        code: error?.code,
+        statusCode: error?.statusCode || null,
+        stack: error?.stack,
+      },
+    );
+
+    const phaseMessage = `[settleKasBon] ${error.message || 'Internal server error'}`;
+    return jsonError(
+      res,
+      error?.statusCode || 500,
+      phaseMessage,
+      error.message || phaseMessage,
+    );
   }
 };
 

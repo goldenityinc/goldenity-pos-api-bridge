@@ -235,6 +235,224 @@ const ensureSettingsUploadAllowed = (req) => {
   return providedKey.length > 0 && providedKey === configuredKey;
 };
 
+const updateStoreSettingsWideRow = async ({
+  pool,
+  columnSet,
+  tenantId,
+  branchId,
+  fieldValues,
+}) => {
+  const normalizedEntries = Object.entries(fieldValues).filter(
+    ([key, value]) => columnSet.has(key) && value !== undefined,
+  );
+
+  if (normalizedEntries.length === 0) {
+    return false;
+  }
+
+  const supportsBranchColumn = columnSet.has('branch_id');
+  const whereParts = ['tenant_id = $1'];
+  const whereValues = [tenantId];
+
+  if (supportsBranchColumn) {
+    if (branchId !== null) {
+      whereParts.push(`branch_id = $${whereValues.length + 1}`);
+      whereValues.push(branchId);
+    } else {
+      whereParts.push('branch_id IS NULL');
+    }
+  }
+
+  const assignmentClauses = normalizedEntries.map(
+    ([key], index) => `${quoteIdentifier(key)} = $${whereValues.length + index + 1}`,
+  );
+  const assignmentValues = normalizedEntries.map(([, value]) => value);
+
+  if (columnSet.has('updated_at')) {
+    assignmentClauses.push('updated_at = NOW()');
+  }
+
+  const updateResult = await pool.query(
+    `UPDATE store_settings
+     SET ${assignmentClauses.join(', ')}
+     WHERE ${whereParts.join(' AND ')}`,
+    [...whereValues, ...assignmentValues],
+  );
+
+  if ((updateResult.rowCount || 0) > 0) {
+    return true;
+  }
+
+  const insertColumns = ['tenant_id'];
+  const insertValues = [tenantId];
+
+  if (supportsBranchColumn) {
+    insertColumns.push('branch_id');
+    insertValues.push(branchId);
+  }
+
+  normalizedEntries.forEach(([key, value]) => {
+    insertColumns.push(key);
+    insertValues.push(value);
+  });
+
+  if (columnSet.has('created_at')) {
+    insertColumns.push('created_at');
+  }
+  if (columnSet.has('updated_at')) {
+    insertColumns.push('updated_at');
+  }
+
+  const valuePlaceholders = [];
+  let parameterIndex = 1;
+  for (const columnName of insertColumns) {
+    if (columnName === 'created_at' || columnName === 'updated_at') {
+      valuePlaceholders.push('NOW()');
+    } else {
+      valuePlaceholders.push(`$${parameterIndex}`);
+      parameterIndex += 1;
+    }
+  }
+
+  await pool.query(
+    `INSERT INTO store_settings (${insertColumns.map(quoteIdentifier).join(', ')})
+     VALUES (${valuePlaceholders.join(', ')})`,
+    insertValues,
+  );
+
+  return true;
+};
+
+const upsertStoreSettingsKeyValue = async ({
+  pool,
+  columnSet,
+  tenantId,
+  branchId,
+  valuesByKey,
+}) => {
+  if (!columnSet.has('key') || !columnSet.has('value')) {
+    return false;
+  }
+
+  const supportsBranchColumn = columnSet.has('branch_id');
+  const hasUpdatedAt = columnSet.has('updated_at');
+  const hasCreatedAt = columnSet.has('created_at');
+
+  for (const [key, value] of Object.entries(valuesByKey)) {
+    if (value === undefined) {
+      continue;
+    }
+
+    const whereParts = ['tenant_id = $1', 'key = $2'];
+    const whereValues = [tenantId, key];
+
+    if (supportsBranchColumn) {
+      if (branchId !== null) {
+        whereParts.push(`branch_id = $${whereValues.length + 1}`);
+        whereValues.push(branchId);
+      } else {
+        whereParts.push('branch_id IS NULL');
+      }
+    }
+
+    const updateClauses = [`value = $${whereValues.length + 1}`];
+    const updateValues = [...whereValues, value];
+    if (hasUpdatedAt) {
+      updateClauses.push('updated_at = NOW()');
+    }
+
+    const updateResult = await pool.query(
+      `UPDATE store_settings
+       SET ${updateClauses.join(', ')}
+       WHERE ${whereParts.join(' AND ')}`,
+      updateValues,
+    );
+
+    if ((updateResult.rowCount || 0) > 0) {
+      continue;
+    }
+
+    const insertColumns = ['tenant_id'];
+    const insertValues = [tenantId];
+    if (supportsBranchColumn) {
+      insertColumns.push('branch_id');
+      insertValues.push(branchId);
+    }
+    insertColumns.push('key', 'value');
+    insertValues.push(key, value);
+    if (hasCreatedAt) {
+      insertColumns.push('created_at');
+    }
+    if (hasUpdatedAt) {
+      insertColumns.push('updated_at');
+    }
+
+    const valuePlaceholders = [];
+    let parameterIndex = 1;
+    for (const columnName of insertColumns) {
+      if (columnName === 'created_at' || columnName === 'updated_at') {
+        valuePlaceholders.push('NOW()');
+      } else {
+        valuePlaceholders.push(`$${parameterIndex}`);
+        parameterIndex += 1;
+      }
+    }
+
+    await pool.query(
+      `INSERT INTO store_settings (${insertColumns.map(quoteIdentifier).join(', ')})
+       VALUES (${valuePlaceholders.join(', ')})`,
+      insertValues,
+    );
+  }
+
+  return true;
+};
+
+const persistStoreProfileSettings = async ({
+  tenantId,
+  branchId,
+  qrisImageUrl,
+  receiptFooter,
+}) => {
+  const pool = getSharedPool();
+  const columnSet = await getTableColumnSet(pool, 'store_settings');
+  if (!(columnSet instanceof Set) || columnSet.size === 0) {
+    return false;
+  }
+
+  const supportsWideColumns =
+    columnSet.has('qris_image_url') ||
+    columnSet.has('receipt_footer');
+
+  if (supportsWideColumns) {
+    return updateStoreSettingsWideRow({
+      pool,
+      columnSet,
+      tenantId,
+      branchId,
+      fieldValues: {
+        qris_image_url: qrisImageUrl,
+        receipt_footer: receiptFooter,
+      },
+    });
+  }
+
+  if (columnSet.has('key') && columnSet.has('value')) {
+    return upsertStoreSettingsKeyValue({
+      pool,
+      columnSet,
+      tenantId,
+      branchId,
+      valuesByKey: {
+        qris_image_url: qrisImageUrl,
+        receipt_footer: receiptFooter,
+      },
+    });
+  }
+
+  return false;
+};
+
 const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
   const normalizedTenantId = (tenantId || '').toString().trim();
   if (!normalizedTenantId) {
@@ -461,7 +679,7 @@ const resolveTenantProfile = async ({ tenantId, branchId }) => {
     const tenantPrinterConfigs = normalizePrinterConfigs(tenantRow?.printer_configs);
 
     return {
-      qrisImageUrl: tenantUrl || storeProfile.qrisImageUrl,
+      qrisImageUrl: storeProfile.qrisImageUrl || tenantUrl,
       logoUrl: storeProfile.logoUrl || tenantLogo,
       storeName: storeProfile.storeName || tenantName,
       storeAddress: storeProfile.storeAddress,
@@ -588,6 +806,8 @@ const updateTenantQrisImage = async (req, res) => {
       return jsonError(res, 400, 'tenantId wajib diisi');
     }
 
+    const branchId = parseOptionalBranchId(req.body?.branchId || req.body?.branch_id);
+
     let qrisImageUrl = (
       req.body?.qrisImageUrl ||
       req.body?.qris_image_url ||
@@ -627,19 +847,31 @@ const updateTenantQrisImage = async (req, res) => {
     }
 
     const pool = getSharedPool();
-    await pool.query(
-      `UPDATE tenants
-       SET qris_image_url = $1,
-           updated_at = NOW()
-       WHERE id = $2`,
-      [qrisImageUrl, tenantId],
-    );
+    const storedInBranchSettings = await persistStoreProfileSettings({
+      tenantId,
+      branchId,
+      qrisImageUrl,
+    });
+
+    if (!storedInBranchSettings || branchId === null) {
+      await pool.query(
+        `UPDATE tenants
+         SET qris_image_url = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [qrisImageUrl, tenantId],
+      );
+    }
 
     return jsonOk(res, {
       tenantId,
+      branchId,
       qrisImageUrl,
     }, 'QRIS static berhasil disimpan');
   } catch (error) {
+    if (error?.statusCode) {
+      return jsonError(res, error.statusCode, error.message);
+    }
     console.error('[settingsController.updateTenantQrisImage] Error:', error.message);
     return jsonError(res, 500, 'Gagal menyimpan QRIS static', error.message);
   }
@@ -669,6 +901,8 @@ const updateTenantReceiptFooter = async (req, res) => {
       return jsonError(res, 400, 'tenantId wajib diisi');
     }
 
+    const branchId = parseOptionalBranchId(req.body?.branchId || req.body?.branch_id);
+
     const rawFooter = req.body?.receiptFooter ?? req.body?.receipt_footer;
     const normalizedFooter = normalizeOptionalText(rawFooter) || DEFAULT_RECEIPT_FOOTER;
     if (normalizedFooter.length > 500) {
@@ -676,23 +910,35 @@ const updateTenantReceiptFooter = async (req, res) => {
     }
 
     const pool = getSharedPool();
-    await pool.query(
-      `UPDATE tenants
-       SET receipt_footer = $1,
-           updated_at = NOW()
-       WHERE id = $2`,
-      [normalizedFooter, tenantId],
-    );
+    const storedInBranchSettings = await persistStoreProfileSettings({
+      tenantId,
+      branchId,
+      receiptFooter: normalizedFooter,
+    });
+
+    if (!storedInBranchSettings || branchId === null) {
+      await pool.query(
+        `UPDATE tenants
+         SET receipt_footer = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [normalizedFooter, tenantId],
+      );
+    }
 
     return jsonOk(
       res,
       {
         tenantId,
+        branchId,
         receiptFooter: normalizedFooter,
       },
       'Footer struk berhasil disimpan',
     );
   } catch (error) {
+    if (error?.statusCode) {
+      return jsonError(res, error.statusCode, error.message);
+    }
     console.error('[settingsController.updateTenantReceiptFooter] Error:', error.message);
     return jsonError(res, 500, 'Gagal menyimpan footer struk', error.message);
   }
