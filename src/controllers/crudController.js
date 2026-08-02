@@ -187,11 +187,24 @@ const cancelLinkedOrdersForClearedTable = async ({
 };
 
 const getQueryableClient = async (tenantDb) => {
-  if (tenantDb && typeof tenantDb.connect === 'function') {
+  const tenantDbIsPool = !!tenantDb
+    && typeof tenantDb === 'object'
+    && typeof tenantDb.query === 'function'
+    && typeof tenantDb.connect === 'function'
+    && typeof tenantDb.release !== 'function';
+  if (tenantDbIsPool) {
     const client = await tenantDb.connect();
     return {
       db: client,
       release: () => client.release(),
+      supportsTransactions: true,
+    };
+  }
+
+  if (tenantDb && typeof tenantDb === 'object' && typeof tenantDb.release === 'function') {
+    return {
+      db: tenantDb,
+      release: () => {},
       supportsTransactions: true,
     };
   }

@@ -27,6 +27,14 @@ const TRANSIENT_SQLSTATE = new Set([
   '28000',
 ]);
 
+const isPgPool = (poolOrClient) =>
+  !!poolOrClient
+  && typeof poolOrClient === 'object'
+  && typeof poolOrClient.query === 'function'
+  && typeof poolOrClient.connect === 'function'
+  && typeof poolOrClient.release !== 'function';
+
+
 const isTransientDbError = (error) => {
   if (!error) return false;
   const code = (error.code || error.sqlState || error.sqlstate || '').toString().trim().toUpperCase();
@@ -81,32 +89,37 @@ const withRetries = async (task, options = {}) => {
   throw lastError;
 };
 
-const getClientFromPool = async (pool) => withRetries(
-  async () => {
-    const client = await pool.connect();
-    if (!client) {
-      throw new Error('Pool returned empty client');
-    }
-    return client;
-  },
-  {
-    label: 'pool_connect',
-    maxAttempts: 5,
-    baseDelayMs: 200,
-    maxDelayMs: 3000,
-    shouldRetry: (error) => {
-      if (isTransientDbError(error)) return true;
-      const code = error?.code?.toString();
-      return !!(code && /^pool|timeout|timedout/i.test(code));
+const getClientFromPool = async (pool) => {
+  if (pool && typeof pool === 'object' && typeof pool.release === 'function' && !isPgPool(pool)) {
+    return pool;
+  }
+  return withRetries(
+    async () => {
+      const client = await pool.connect();
+      if (!client) {
+        throw new Error('Pool returned empty client');
+      }
+      return client;
     },
-  },
-);
+    {
+      label: 'pool_connect',
+      maxAttempts: 5,
+      baseDelayMs: 200,
+      maxDelayMs: 3000,
+      shouldRetry: (error) => {
+        if (isTransientDbError(error)) return true;
+        const code = error?.code?.toString();
+        return !!(code && /^pool|timeout|timedout/i.test(code));
+      },
+    },
+  );
+};
 
 const runTransaction = async (poolOrClient, handler, options = {}) => {
-  const outerClient = poolOrClient && typeof poolOrClient.connect === 'function'
+  const outerClient = isPgPool(poolOrClient)
     ? await getClientFromPool(poolOrClient)
     : poolOrClient;
-  const release = poolOrClient && typeof poolOrClient.connect === 'function'
+  const release = isPgPool(poolOrClient)
     ? () => outerClient.release()
     : () => {};
   const supportsTransactions = Boolean(options.supportsTransactions !== false);
