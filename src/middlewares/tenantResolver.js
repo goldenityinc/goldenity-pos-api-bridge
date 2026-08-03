@@ -30,12 +30,42 @@ const createSharedPool = () => {
     statement_timeout: statementTimeoutMs > 0 ? statementTimeoutMs : undefined,
   });
 
-  pool.on('connect', (client) => {
+  const ensureCoreTablesSql = `
+    CREATE TABLE IF NOT EXISTS app_versions (
+      id SERIAL PRIMARY KEY,
+      version VARCHAR(50),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version VARCHAR(255) PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `.trim();
+
+  const bootstrapClient = async (client) => {
     try {
       if (statementTimeoutMs > 0) {
         client.query(`SET statement_timeout = ${statementTimeoutMs}`).catch(() => {});
       }
+      try {
+        await client.query(ensureCoreTablesSql);
+      } catch (err) {
+        const code = err?.code;
+        if (code !== '42P01' && code !== '42P07' && code !== '23505' && code !== '25P02') {
+          console.warn('[tenantResolver] core table bootstrap skipped:', {
+            message: err?.message || err,
+            code,
+          });
+        }
+      }
+      try {
+        await client.query(`INSERT INTO app_versions (version) VALUES ($1) ON CONFLICT DO NOTHING`, ['bridge-1.2.0']);
+      } catch (_) {}
     } catch (_) {}
+  };
+
+  pool.on('connect', (client) => {
+    bootstrapClient(client).catch(() => {});
   });
 
   pool.on('acquire', (client) => {
@@ -45,20 +75,57 @@ const createSharedPool = () => {
   });
 
   pool.on('error', (error, client) => {
+    const code = error?.code;
+    const isRelationMissing = code === '42P01' || code === '42703';
+    if (isRelationMissing) {
+      console.info('[tenantResolver] Ignorable pool error (relation/column missing - auto bootstrap):', {
+        message: error?.message || error,
+        code,
+        clientProcessId: client?.processID || null,
+      });
+      return;
+    }
     console.error('[tenantResolver] Shared pool client error:', {
       message: error?.message || error,
-      code: error?.code || null,
+      code: code || null,
       clientProcessId: client?.processID || null,
     });
   });
 
+  const poisonErrorCodes = new Set([
+    '08000','08001','08003','08004','08006','08007','08P01',
+    '57P01','57P02','57P03','57P04','58000','58001','58002','58003','58004',
+    'XX000','XX001',
+    '26000','28000','28P01','3D000','3C000','2D000',
+  ]);
+
   pool.on('release', (error, client) => {
     if (!error) return;
+    const code = error?.code;
     const acquiredAt = client?.__goldenityAcquiredAt || 0;
     const heldMs = acquiredAt > 0 ? Date.now() - acquiredAt : null;
+    const isBenign = code === '42P01' || code === '42703' || code === '42P07' || code === '23505';
+    const isPoison = !!code && poisonErrorCodes.has(code);
+    if (isPoison) {
+      try { client.release(true); } catch (_) {}
+      console.error('[tenantResolver] POOL POISON client released, destroyed:', {
+        message: error?.message || error,
+        code,
+        heldMs,
+      });
+      return;
+    }
+    if (isBenign) {
+      console.info('[tenantResolver] Benign release (bootstrap schema gap - safe):', {
+        message: error?.message || error,
+        code,
+        heldMs,
+      });
+      return;
+    }
     console.warn('[tenantResolver] Pool client released with error:', {
       message: error?.message || error,
-      code: error?.code || null,
+      code: code || null,
       heldMs,
     });
   });
