@@ -864,6 +864,25 @@ const createTransaction = async (req, res) => {
           hasSalesTenantColumn = hasSalesTenantColumnLocal;
           const productsColumnSet = await getTableColumnSet(txClient, 'products');
           const hasProductsTenantColumn = productsColumnSet.has('tenant_id');
+          const productTracksStockCol = productsColumnSet.has('is_stock_tracked')
+            ? 'is_stock_tracked'
+            : productsColumnSet.has('stock_tracked')
+              ? 'stock_tracked'
+              : productsColumnSet.has('is_stock')
+                ? 'is_stock'
+                : null;
+          const productIsServiceCol = productsColumnSet.has('is_service')
+            ? 'is_service'
+            : productsColumnSet.has('is_custom_item')
+              ? 'is_custom_item'
+              : null;
+
+          const stockTrackedPredicate = productTracksStockCol
+            ? `(COALESCE(${productTracksStockCol}, true) = false OR COALESCE(stock, 0) >= $1)`
+            : `COALESCE(stock, 0) >= $1`;
+          const isServicePredicate = productIsServiceCol
+            ? `OR COALESCE(${productIsServiceCol}, false) = true`
+            : '';
 
           if (existingTransactionIdToUpdate || existingReceiptNumberToUpdate) {
             const existingRecordResult = await txClient.query(
@@ -1038,11 +1057,21 @@ const createTransaction = async (req, res) => {
               continue;
             }
 
+            const lookupValues = hasProductsTenantColumn
+              ? [item.productId, tenantIdLocal]
+              : [item.productId];
+
             const currentResult = await txClient.query(
               hasProductsTenantColumn
-                ? 'SELECT id, name, stock, is_service FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE'
-                : 'SELECT id, name, stock, is_service FROM "products" WHERE id = $1 LIMIT 1 FOR UPDATE',
-              hasProductsTenantColumn ? [item.productId, tenantIdLocal] : [item.productId],
+                ? `SELECT id, name, stock,
+                          ${productIsServiceCol ? `${productIsServiceCol} AS is_service,` : 'false AS is_service,'}
+                          ${productTracksStockCol ? `${productTracksStockCol} AS is_stock_tracked` : 'true AS is_stock_tracked'}
+                   FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE`
+                : `SELECT id, name, stock,
+                          ${productIsServiceCol ? `${productIsServiceCol} AS is_service,` : 'false AS is_service,'}
+                          ${productTracksStockCol ? `${productTracksStockCol} AS is_stock_tracked` : 'true AS is_stock_tracked'}
+                   FROM "products" WHERE id = $1 LIMIT 1 FOR UPDATE`,
+              lookupValues,
             );
 
             if ((currentResult.rowCount || 0) === 0) {
@@ -1056,27 +1085,65 @@ const createTransaction = async (req, res) => {
               continue;
             }
 
+            const safeQty = Number.isFinite(Number(item.qty)) ? Number(item.qty) : 0;
+            if (safeQty <= 0) {
+              continue;
+            }
+
+            const tracked = currentProduct.is_stock_tracked !== false && productTracksStockCol
+              ? true
+              : (!productTracksStockCol ? true : currentProduct.is_stock_tracked !== false);
+
             const currentStock = Number(currentProduct.stock ?? 0);
+            if (!tracked) {
+              const unchangedValues = hasProductsTenantColumn
+                ? [item.productId, tenantIdLocal]
+                : [item.productId];
+              const unchangedUpdate = await txClient.query(
+                hasProductsTenantColumn
+                  ? `UPDATE "products" SET updated_at = NOW() WHERE id = $1 AND tenant_id = $2 RETURNING *`
+                  : `UPDATE "products" SET updated_at = NOW() WHERE id = $1 RETURNING *`,
+                unchangedValues,
+              );
+              if ((unchangedUpdate.rowCount || 0) > 0) {
+                inventoryUpdates.push(unchangedUpdate.rows[0]);
+              }
+              continue;
+            }
+
             if (!Number.isFinite(currentStock)) {
               throw new Error(`Stok produk ${item.productId} tidak valid`);
             }
 
-            const nextStock = currentStock - item.qty;
-            if (nextStock < 0) {
+            const safeUpdateSql = hasProductsTenantColumn
+              ? `UPDATE "products"
+                 SET stock = COALESCE(stock, 0) - $1,
+                     updated_at = NOW()
+                 WHERE id = $2
+                   AND tenant_id = $3
+                   AND (${stockTrackedPredicate} ${isServicePredicate})
+                 RETURNING *`
+              : `UPDATE "products"
+                 SET stock = COALESCE(stock, 0) - $1,
+                     updated_at = NOW()
+                 WHERE id = $2
+                   AND (${stockTrackedPredicate} ${isServicePredicate})
+                 RETURNING *`;
+            const safeUpdateValues = hasProductsTenantColumn
+              ? [safeQty, item.productId, tenantIdLocal]
+              : [safeQty, item.productId];
+
+            const updateResult = await txClient.query(safeUpdateSql, safeUpdateValues);
+
+            if ((updateResult.rowCount || 0) === 0) {
               console.warn(
-                `⚠️ STOCK INSUFFICIENT: Product=${currentProduct.name}, ID=${item.productId}, Current=${currentStock}, Requested=${item.qty}, Tenant=${tenantIdLocal}`,
+                `⚠️ STOCK INSUFFICIENT [ATOMIC]: Product=${currentProduct.name}, ID=${item.productId}, Current=${currentStock}, Requested=${safeQty}, Tenant=${tenantIdLocal}`,
               );
-              const error = new Error(`Stok produk ${currentProduct.name || item.productId} tidak mencukupi`);
+              const error = new Error(`Stok produk ${currentProduct.name || item.productId} tidak mencukupi / tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty})`);
               error.statusCode = 400;
               throw error;
             }
 
-            const updateResult = await txClient.query(
-              hasProductsTenantColumn
-                ? 'UPDATE "products" SET stock = $1 WHERE id = $2 AND tenant_id = $3 RETURNING *'
-                : 'UPDATE "products" SET stock = $1 WHERE id = $2 RETURNING *',
-              hasProductsTenantColumn ? [nextStock, item.productId, tenantIdLocal] : [nextStock, item.productId],
-            );
             if ((updateResult.rowCount || 0) > 0) {
               inventoryUpdates.push(updateResult.rows[0]);
             }

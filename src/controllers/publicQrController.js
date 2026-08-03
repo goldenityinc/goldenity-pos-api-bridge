@@ -1328,18 +1328,34 @@ const createQrOrder = async (req, res) => {
             );
 
             if (!item.isService && item.isStockTracked) {
-              const stockUpdate = await txClient.query(
-                `UPDATE products
-                 SET stock = COALESCE(stock, 0) - $1,
-                     updated_at = NOW()
-                 WHERE tenant_id = $2 AND id = $3
-                 RETURNING id`,
-                [item.qty, tenantId, item.productId],
-              );
-              if ((stockUpdate.rowCount || 0) === 0) {
-                throw new Error(
-                  `Stok update produk gagal (row kosong): ${item.productId}`,
+              const safeQty = Number.isFinite(Number(item.qty)) ? Number(item.qty) : 0;
+              if (safeQty > 0) {
+                const productForError = productMap.get(item.productId);
+                const stockUpdate = await txClient.query(
+                  `UPDATE products
+                   SET stock = COALESCE(stock, 0) - $1,
+                       updated_at = NOW()
+                   WHERE tenant_id = $2
+                     AND id = $3
+                     AND (
+                       COALESCE(is_stock_tracked, true) = false
+                       OR COALESCE(stock_tracked, true) = false
+                       OR COALESCE(is_service, false) = true
+                       OR COALESCE(stock, 0) >= $1
+                     )
+                   RETURNING id`,
+                  [safeQty, tenantId, item.productId],
                 );
+                if ((stockUpdate.rowCount || 0) === 0) {
+                  const currentStock = productForError
+                    ? Number(productForError.stock || 0)
+                    : 'unknown';
+                  const error = new Error(
+                    `Stok produk ${productForError?.name || item.productId} tidak mencukupi / tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, ID=${item.productId})`,
+                  );
+                  error.statusCode = 400;
+                  throw error;
+                }
               }
             }
           }
