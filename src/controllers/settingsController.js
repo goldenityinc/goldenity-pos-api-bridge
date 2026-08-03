@@ -500,13 +500,13 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
 
       if (supportsBranchColumn && branchId !== null) {
         branchParamIndex = values.length + 1;
-        whereParts.push(`(branch_id = $${branchParamIndex} OR branch_id IS NULL)`);
+        whereParts.push(`(branch_id::text = $${branchParamIndex}::text OR branch_id IS NULL)`);
         values.push(branchId);
       }
 
       const orderParts = [];
       if (supportsBranchColumn && branchId !== null && branchParamIndex > 0) {
-        orderParts.push(`CASE WHEN branch_id = $${branchParamIndex} THEN 0 WHEN branch_id IS NULL THEN 1 ELSE 2 END`);
+        orderParts.push(`CASE WHEN branch_id::text = $${branchParamIndex}::text THEN 0 WHEN branch_id IS NULL THEN 1 ELSE 2 END`);
       }
       if (columnSet.has('updated_at')) {
         orderParts.push('updated_at DESC NULLS LAST');
@@ -566,7 +566,7 @@ const resolveStoreProfileFromStoreSettings = async ({ tenantId, branchId }) => {
       const whereParts = ['tenant_id = $1'];
       const values = [normalizedTenantId];
       if (supportsBranchColumn && branchId !== null) {
-        whereParts.push(`(branch_id = $2 OR branch_id IS NULL)`);
+        whereParts.push(`(branch_id::text = $2::text OR branch_id IS NULL)`);
         values.push(branchId);
       }
 
