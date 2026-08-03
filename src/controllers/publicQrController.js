@@ -404,13 +404,13 @@ const resolveQrOrderSettings = async ({ client, tenantId, branchId }) => {
 
       if (supportsBranch && branchId !== null) {
         branchParamIndex = params.length + 1;
-        whereParts.push(`(branch_id = $${branchParamIndex} OR branch_id IS NULL)`);
+        whereParts.push(`(branch_id::text = $${branchParamIndex}::text OR branch_id IS NULL)`);
         params.push(branchId);
       }
 
       const orderParts = [];
       if (supportsBranch && branchId !== null && branchParamIndex > 0) {
-        orderParts.push(`CASE WHEN branch_id = $${branchParamIndex} THEN 0 WHEN branch_id IS NULL THEN 1 ELSE 2 END`);
+        orderParts.push(`CASE WHEN branch_id::text = $${branchParamIndex}::text THEN 0 WHEN branch_id IS NULL THEN 1 ELSE 2 END`);
       }
       if (columnSet.has('updated_at')) {
         orderParts.push('updated_at DESC NULLS LAST');
@@ -645,14 +645,14 @@ const getQrMenu = async (req, res) => {
     )`;
 
     const branchProductsClause = supportsBranchProducts
-      ? `AND ($3 IS NULL OR branch_id = $3)`
-      : `AND ($3 IS NULL OR true)`;
+      ? `AND ($3::text IS NULL OR branch_id::text = $3::text)`
+      : `AND ($3::text IS NULL OR true)`;
     const branchFallbackClause = supportsBranchProducts
-      ? `AND ($2 IS NULL OR branch_id = $2)`
-      : `AND ($2 IS NULL OR true)`;
+      ? `AND ($2::text IS NULL OR branch_id::text = $2::text)`
+      : `AND ($2::text IS NULL OR true)`;
     const branchCategoriesClause = supportsBranchCategories
-      ? `AND ($2 IS NULL OR branch_id = $2)`
-      : `AND ($2 IS NULL OR true)`;
+      ? `AND ($2::text IS NULL OR branch_id::text = $2::text)`
+      : `AND ($2::text IS NULL OR true)`;
 
     const productParams = [tenantId, Array.from(FNB_PRODUCT_TYPES)];
     if (supportsBranchProducts) productParams.push(branchId);
@@ -1151,8 +1151,8 @@ const createQrOrder = async (req, res) => {
               : 'true';
           const supportsProductBranch = productColumns.has('branch_id');
           const productBranchClause = supportsProductBranch
-            ? 'AND ($3 IS NULL OR branch_id = $3)'
-            : 'AND ($3 IS NULL OR true)';
+            ? 'AND ($3::text IS NULL OR branch_id::text = $3::text)'
+            : 'AND ($3::text IS NULL OR true)';
           const productParams = [tenantId, productIds];
           if (supportsProductBranch) productParams.push(branchId);
           else productParams.push(null);
@@ -1832,8 +1832,8 @@ const checkoutQrOrder = async (req, res) => {
               }
 
               const branchClause = supportsSalesBranch
-                ? `AND ($${branchParamIndex} IS NULL OR branch_id = $${branchParamIndex})`
-                : `AND ($${branchParamIndex} IS NULL OR true)`;
+                ? `AND ($${branchParamIndex}::text IS NULL OR branch_id::text = $${branchParamIndex}::text)`
+                : `AND ($${branchParamIndex}::text IS NULL OR true)`;
 
               const columnsToSelectBranch = supportsSalesBranch ? 'branch_id,' : 'NULL::text AS branch_id,';
 
