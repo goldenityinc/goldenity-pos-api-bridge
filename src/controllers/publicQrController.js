@@ -1330,49 +1330,61 @@ const createQrOrder = async (req, res) => {
             if (!item.isService && item.isStockTracked) {
               const safeQty = Number.isFinite(Number(item.qty)) ? Number(item.qty) : 0;
               if (safeQty > 0) {
-                const productForError = productMap.get(item.productId);
+                const rawProductId = item.productId;
+                const safeProductId = (rawProductId === undefined || rawProductId === null)
+                  ? ''
+                  : `${rawProductId}`.trim();
+                const productForError = productMap.get(rawProductId) || productMap.get(safeProductId);
                 const currentStock = Number.isFinite(Number(productForError?.stock ?? 0))
                   ? Number(productForError?.stock ?? 0)
                   : 0;
 
                 if (currentStock < safeQty) {
                   const error = new Error(
-                    `Stok produk ${productForError?.name || item.productId} tidak mencukupi / tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, ID=${item.productId})`,
+                    `Stok produk ${productForError?.name || safeProductId} tidak mencukupi / tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, ID=${safeProductId})`,
                   );
                   error.statusCode = 400;
                   throw error;
                 }
 
                 const nextStock = currentStock - safeQty;
-                const safeProductId = (item.productId === undefined || item.productId === null)
-                  ? ''
-                  : (typeof item.productId === 'bigint' || Number.isSafeInteger(Number(item.productId)) || /^\d+$/.test(`${item.productId}`))
-                    ? `${item.productId}`
-                    : item.productId;
 
-                const queryParams = [nextStock, tenantId, safeProductId];
                 const updateSql = `UPDATE products
                    SET stock = $1,
                        updated_at = NOW()
                    WHERE tenant_id = $2
                      AND id = $3
                    RETURNING id`;
+                const queryParams = [nextStock, tenantId, safeProductId];
 
                 console.log('DEBUG STOCK UPDATE CREATEQRORDER:', {
-                  id: safeProductId,
+                  sql: updateSql,
+                  params: queryParams,
+                  item: item,
+                  rawProductId,
+                  rawTypeof: typeof rawProductId,
+                  safeProductId,
+                  safeTypeof: typeof safeProductId,
                   qty: safeQty,
                   currentStock,
                   nextStock,
-                  params: queryParams,
                   tenantId,
                   productName: productForError?.name,
-                  updateSql,
+                  productTenant: productForError?.tenant_id,
                 });
 
-                const stockUpdate = await txClient.query(updateSql, queryParams);
+                let stockUpdate = await txClient.query(updateSql, queryParams);
+                if ((stockUpdate.rowCount || 0) === 0) {
+                  console.warn('DEBUG CREATEQRORDER FALLBACK: stock update 0 rows WITH tenant_id. Trying fallback without tenant_id.');
+                  const fallbackSql = `UPDATE products SET stock = $1, updated_at = NOW() WHERE id = $2 RETURNING id`;
+                  const fallbackParams = [nextStock, safeProductId];
+                  stockUpdate = await txClient.query(fallbackSql, fallbackParams);
+                  console.warn(`  → Fallback rows: ${stockUpdate.rowCount || 0}`);
+                }
+
                 if ((stockUpdate.rowCount || 0) === 0) {
                   const error = new Error(
-                    `Stok produk ${productForError?.name || item.productId} tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, ID=${safeProductId}, tenantId=${tenantId})`,
+                    `Stok produk ${productForError?.name || safeProductId} tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, ID=${safeProductId}, tenantId=${tenantId}, productTenant=${productForError?.tenant_id ?? 'unknown'})`,
                   );
                   error.statusCode = 400;
                   throw error;
