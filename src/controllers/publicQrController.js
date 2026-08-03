@@ -1163,8 +1163,8 @@ const createQrOrder = async (req, res) => {
               ${stockTrackedExpression} AS is_stock_tracked,
               COALESCE(stock, 0) AS stock
        FROM products
-       WHERE tenant_id = $1
-         AND id = ANY($2::text[])
+       WHERE tenant_id = $1::text
+         AND id = ANY($2::bigint[])
          AND ${softDeletePredicate}
          ${productBranchClause}
          AND COALESCE(is_active, true) = true
