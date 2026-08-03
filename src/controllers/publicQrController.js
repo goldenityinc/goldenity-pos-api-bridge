@@ -664,8 +664,8 @@ const getQrMenu = async (req, res) => {
               ${stockTrackedExpression} AS is_stock_tracked,
               COALESCE(is_service, false) AS is_service,
               COALESCE(is_available, true) AS is_available
-       FROM products
-       WHERE tenant_id = $1
+      FROM products
+      WHERE tenant_id = $1::text
          AND ${softDeletePredicate}
          ${branchProductsClause}
          AND COALESCE(is_active, true) = true
@@ -689,7 +689,7 @@ const getQrMenu = async (req, res) => {
           COALESCE(is_service, false) AS is_service,
           COALESCE(is_available, true) AS is_available
          FROM products
-         WHERE tenant_id = $1
+         WHERE tenant_id = $1::text
            AND ${softDeletePredicate}
            ${branchFallbackClause}
            AND COALESCE(is_active, true) = true
@@ -709,7 +709,7 @@ const getQrMenu = async (req, res) => {
       const categoriesResult = await pool.query(
         `SELECT id, name
          FROM categories
-         WHERE tenant_id = $1
+         WHERE tenant_id = $1::text
            AND ${categorySoftDeletePredicate}
            ${branchCategoriesClause}
          ORDER BY name ASC`,
@@ -741,7 +741,7 @@ const getQrMenu = async (req, res) => {
       const storeSettingsResult = await pool.query(
         `SELECT COALESCE(value, '') AS store_name
          FROM store_settings
-         WHERE tenant_id = $1
+         WHERE tenant_id = $1::text
            AND key = ANY($2::text[])
          ORDER BY CASE
            WHEN key = 'store_name' THEN 0
