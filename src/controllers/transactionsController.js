@@ -274,21 +274,26 @@ const normalizeTransactionItems = (items) => {
         ? item.product
         : {};
       const productId = (
-        item.product_id ?? item.productId ?? product.id ?? ''
+        product.id ?? product.product_id ?? product.productId ??
+        item.product_id ?? item.productId ?? ''
       ).toString().trim();
       const productName = (
-        item.product_name ?? item.productName ?? product.name ?? ''
+        product.name ?? product.product_name ?? product.productName ??
+        item.product_name ?? item.productName ?? ''
       ).toString().trim();
       const isService =
-        item.is_service === true ||
-        item.isService === true ||
-        item.is_custom_item === true ||
-        item.isCustomItem === true ||
         product.is_service === true ||
         product.isService === true ||
         product.is_custom_item === true ||
-        product.isCustomItem === true;
-      const qty = toPositiveInteger(item.qty ?? item.quantity);
+        product.isCustomItem === true ||
+        item.is_service === true ||
+        item.isService === true ||
+        item.is_custom_item === true ||
+        item.isCustomItem === true;
+      const qty = toPositiveInteger(
+        item.qty ?? item.quantity ??
+        product.qty ?? product.quantity
+      );
       if (qty === null) {
         return null;
       }
@@ -322,12 +327,15 @@ const normalizeTransactionItemsWithNotes = (items) => {
         ? item.product
         : {};
       const productId = (
-        item.product_id ?? item.productId ?? product.id ?? ''
+        product.id ?? product.product_id ?? product.productId ??
+        item.product_id ?? item.productId ?? ''
       ).toString().trim();
       const productName = (
-        item.product_name ?? item.productName ?? product.name ?? ''
+        product.name ?? product.product_name ?? product.productName ??
+        item.product_name ?? item.productName ?? ''
       ).toString().trim();
       const note = (
+        product.note ??
         item.note ??
         item.item_note ??
         item.product_note ??
@@ -338,13 +346,21 @@ const normalizeTransactionItemsWithNotes = (items) => {
       )
         .toString()
         .trim();
-      const qty = toPositiveInteger(item.qty ?? item.quantity);
+      const qty = toPositiveInteger(
+        item.qty ?? item.quantity ??
+        product.qty ?? product.quantity
+      );
       if (qty === null) {
         return null;
       }
       let customPrice = toNumber(
         item.custom_price ??
         item.customPrice ??
+        product.price ??
+        product.unit_price ??
+        product.unitPrice ??
+        product.sale_price ??
+        product.harga_jual ??
         item.price ??
         item.unit_price ??
         item.unitPrice ??
@@ -363,16 +379,18 @@ const normalizeTransactionItemsWithNotes = (items) => {
       }
 
       const isService =
-        item.is_service === true ||
-        item.isService === true ||
-        item.is_custom_item === true ||
-        item.isCustomItem === true ||
         product.is_service === true ||
         product.isService === true ||
         product.is_custom_item === true ||
-        product.isCustomItem === true;
+        product.isCustomItem === true ||
+        item.is_service === true ||
+        item.isService === true ||
+        item.is_custom_item === true ||
+        item.isCustomItem === true;
 
       const mechanicId = (
+        product.mechanic_id ??
+        product.mechanicId ??
         item.mechanic_id ??
         item.mechanicId ??
         item.employee_id ??
@@ -1050,7 +1068,15 @@ const createTransaction = async (req, res) => {
               continue;
             }
 
-            const rawProductId = item.product_id ?? item.productId ?? item.id;
+            const nestedProduct =
+              item.product && typeof item.product === 'object' ? item.product : {};
+            const rawProductId =
+              nestedProduct.id ??
+              nestedProduct.product_id ??
+              nestedProduct.productId ??
+              item.product_id ??
+              item.productId ??
+              item.id;
             const safeProductId = (rawProductId === undefined || rawProductId === null)
               ? ''
               : `${rawProductId}`.trim();
@@ -1121,7 +1147,9 @@ const createTransaction = async (req, res) => {
               continue;
             }
 
-            const safeQty = Number.isFinite(Number(item.qty ?? item.quantity)) ? Number(item.qty ?? item.quantity) : 0;
+            const safeQty = Number.isFinite(Number(
+              item.qty ?? item.quantity ?? nestedProduct.qty ?? nestedProduct.quantity
+            )) ? Number(item.qty ?? item.quantity ?? nestedProduct.qty ?? nestedProduct.quantity) : 0;
             if (safeQty <= 0) {
               continue;
             }

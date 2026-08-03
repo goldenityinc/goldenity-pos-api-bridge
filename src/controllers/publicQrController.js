@@ -127,21 +127,27 @@ const parseOrderItems = (items) => {
       throw error;
     }
 
-    const productId = (raw.productId || raw.product_id || '').toString().trim();
+    const nested = raw.product && typeof raw.product === 'object' ? raw.product : {};
+    const productId = (
+      nested.id ?? nested.product_id ?? nested.productId ??
+      raw.productId ?? raw.product_id ?? ''
+    ).toString().trim();
     if (!productId) {
       const error = new Error(`items[${index}].productId wajib diisi`);
       error.statusCode = 400;
       throw error;
     }
 
-    const qty = Number(raw.qty || raw.quantity);
+    const qty = Number(
+      raw.qty ?? raw.quantity ?? nested.qty ?? nested.quantity ?? 0
+    );
     if (!Number.isInteger(qty) || qty <= 0) {
       const error = new Error(`items[${index}].qty harus angka bulat > 0`);
       error.statusCode = 400;
       throw error;
     }
 
-    const customPriceRaw = raw.customPrice ?? raw.custom_price;
+    const customPriceRaw = raw.customPrice ?? raw.custom_price ?? nested.customPrice ?? nested.custom_price;
     const customPrice =
       customPriceRaw === undefined || customPriceRaw === null || customPriceRaw === ''
         ? undefined
@@ -561,13 +567,32 @@ const toQrOrderPayloadItems = (items) => {
         return null;
       }
 
-      const productId = (item.productId ?? item.product_id ?? '').toString().trim();
-      const productName = (item.productName ?? item.product_name ?? '').toString().trim();
-      const qty = Number(item.qty || 0);
-      const customPrice = Number(item.customPrice ?? item.custom_price ?? 0);
-      const note = (item.note ?? item.item_note ?? item.notes ?? '').toString().trim();
-      const isService = item.isService === true || item.is_service === true;
-      const batchSequence = parseBatchSequence(item.batchSequence ?? item.batch_sequence ?? item.batch ?? item.sequence) || 1;
+      const nested = item.product && typeof item.product === 'object' ? item.product : {};
+      const productId = (
+        nested.id ?? nested.product_id ?? nested.productId ??
+        item.productId ?? item.product_id ?? ''
+      ).toString().trim();
+      const productName = (
+        nested.name ?? nested.product_name ?? nested.productName ??
+        item.productName ?? item.product_name ?? ''
+      ).toString().trim();
+      const qty = Number(
+        item.qty ?? item.quantity ?? nested.qty ?? nested.quantity ?? 0
+      );
+      const customPrice = Number(
+        item.customPrice ?? item.custom_price ??
+        nested.customPrice ?? nested.custom_price ??
+        nested.price ?? nested.unit_price ?? nested.unitPrice ??
+        0
+      );
+      const note = (
+        nested.note ??
+        item.note ?? item.item_note ?? item.notes ?? ''
+      ).toString().trim();
+      const isService =
+        nested.isService === true || nested.is_service === true ||
+        item.isService === true || item.is_service === true;
+      const batchSequence = parseBatchSequence(item.batchSequence ?? item.batch_sequence ?? item.batch ?? item.sequence ?? nested.batchSequence ?? nested.batch_sequence ?? nested.batch ?? nested.sequence) || 1;
 
       if ((!productId && !isService) || !Number.isFinite(qty) || qty <= 0) {
         return null;
@@ -1086,7 +1111,37 @@ const createQrOrder = async (req, res) => {
             }
           }
 
-          const productIds = items.map((item) => item.productId);
+          const extractItemRefs = (item) => {
+            if (!item || typeof item !== 'object') return { productId: '', qty: 0 };
+            const nested = item.product && typeof item.product === 'object' ? item.product : {};
+            const productId = (
+              nested.id ?? nested.product_id ?? nested.productId ??
+              item.product_id ?? item.productId ?? item.id ?? ''
+            ).toString().trim();
+            const qtyRaw = item.qty ?? item.quantity ?? nested.qty ?? nested.quantity ?? 0;
+            const qty = Number.isFinite(Number(qtyRaw)) ? Number(qtyRaw) : 0;
+            const customPriceRaw =
+              item.customPrice ?? item.custom_price ??
+              nested.customPrice ?? nested.custom_price ??
+              nested.price ?? nested.unit_price ?? nested.unitPrice ??
+              item.price ?? item.unit_price ?? item.unitPrice ?? null;
+            const customPrice = (customPriceRaw === null || customPriceRaw === undefined || customPriceRaw === '')
+              ? undefined
+              : Number(customPriceRaw);
+            const noteRaw =
+              nested.note ??
+              item.note ?? item.item_note ?? item.notes ?? '';
+            return {
+              productId,
+              qty,
+              customPrice: Number.isFinite(customPrice) ? customPrice : undefined,
+              note: (noteRaw ?? '').toString().trim(),
+            };
+          };
+
+          const productIds = items
+            .map((item) => extractItemRefs(item).productId)
+            .filter((id) => !!`${id}`.trim());
           const productColumns = await getTableColumnSet(txClient, 'products');
           const softDeletePredicate = resolveSoftDeletePredicate(productColumns);
           const stockTrackedExpression = productColumns.has('is_stock_tracked')
@@ -1117,13 +1172,16 @@ const createQrOrder = async (req, res) => {
             productParams,
           );
 
-          const productMap = new Map((productsResult.rows || []).map((row) => [row.id, row]));
+          const productMap = new Map((productsResult.rows || []).map((row) => [String(row.id), row]));
 
           let totalAmount = 0;
           const normalizedItems = items.map((item) => {
-            const product = productMap.get(item.productId);
+            const refs = extractItemRefs(item);
+            const productId = refs.productId;
+            const qty = refs.qty;
+            const product = productMap.get(productId);
             if (!product) {
-              const error = new Error(`Produk tidak ditemukan: ${item.productId}`);
+              const error = new Error(`Produk tidak ditemukan: ${productId || '(empty)'}`);
               error.statusCode = 404;
               throw error;
             }
@@ -1137,24 +1195,24 @@ const createQrOrder = async (req, res) => {
               throw error;
             }
             const availableStock = Number(product.stock || 0);
-            if (!isService && isStockTracked && availableStock < item.qty) {
+            if (!isService && isStockTracked && availableStock < qty) {
               const error = new Error(`Stok tidak cukup untuk produk ${product.name}`);
               error.statusCode = 400;
               throw error;
             }
 
-            const unitPrice = item.customPrice !== undefined
-              ? item.customPrice
+            const unitPrice = refs.customPrice !== undefined
+              ? refs.customPrice
               : Number(product.price || 0);
 
-            totalAmount += unitPrice * item.qty;
+            totalAmount += unitPrice * qty;
 
             return {
-              productId: item.productId,
+              productId,
               productName: product.name,
-              qty: item.qty,
+              qty,
               customPrice: unitPrice,
-              note: item.note,
+              note: refs.note || item.note || '',
               isService,
               isStockTracked,
             };
@@ -1359,16 +1417,29 @@ const createQrOrder = async (req, res) => {
             );
 
             if (!item.isService && item.isStockTracked) {
-              const safeQty = Number.isFinite(Number(item.qty ?? item.quantity)) ? Number(item.qty ?? item.quantity) : 0;
+              const nestedProduct =
+                item.product && typeof item.product === 'object' ? item.product : {};
+              const safeQty = Number.isFinite(Number(
+                item.qty ?? item.quantity ?? nestedProduct.qty ?? nestedProduct.quantity
+              )) ? Number(item.qty ?? item.quantity ?? nestedProduct.qty ?? nestedProduct.quantity) : 0;
               if (safeQty > 0) {
-                const rawProductId = item.product_id ?? item.productId ?? item.id;
+                const rawProductId =
+                  nestedProduct.id ??
+                  nestedProduct.product_id ??
+                  nestedProduct.productId ??
+                  item.product_id ??
+                  item.productId ??
+                  item.id;
                 const safeProductId = (rawProductId === undefined || rawProductId === null)
                   ? ''
                   : `${rawProductId}`.trim();
                 const safeTenantId = (tenantId === undefined || tenantId === null)
                   ? ''
                   : `${tenantId}`.trim();
-                const productForError = productMap.get(rawProductId) || productMap.get(safeProductId);
+                const productForError =
+                  productMap.get(safeProductId) ||
+                  productMap.get(String(rawProductId ?? '')) ||
+                  productMap.get(rawProductId);
                 const currentStock = Number.isFinite(Number(productForError?.stock ?? 0))
                   ? Number(productForError?.stock ?? 0)
                   : 0;
