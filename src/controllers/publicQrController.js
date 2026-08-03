@@ -1328,12 +1328,15 @@ const createQrOrder = async (req, res) => {
             );
 
             if (!item.isService && item.isStockTracked) {
-              const safeQty = Number.isFinite(Number(item.qty)) ? Number(item.qty) : 0;
+              const safeQty = Number.isFinite(Number(item.qty ?? item.quantity)) ? Number(item.qty ?? item.quantity) : 0;
               if (safeQty > 0) {
-                const rawProductId = item.productId;
+                const rawProductId = item.product_id ?? item.productId ?? item.id;
                 const safeProductId = (rawProductId === undefined || rawProductId === null)
                   ? ''
                   : `${rawProductId}`.trim();
+                const safeTenantId = (tenantId === undefined || tenantId === null)
+                  ? ''
+                  : `${tenantId}`.trim();
                 const productForError = productMap.get(rawProductId) || productMap.get(safeProductId);
                 const currentStock = Number.isFinite(Number(productForError?.stock ?? 0))
                   ? Number(productForError?.stock ?? 0)
@@ -1341,7 +1344,7 @@ const createQrOrder = async (req, res) => {
 
                 if (currentStock < safeQty) {
                   const error = new Error(
-                    `Stok produk ${productForError?.name || safeProductId} tidak mencukupi / tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, ID=${safeProductId})`,
+                    `Stok produk ${productForError?.name || item.product_name || item.productName || safeProductId} tidak mencukupi / tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, ID=${safeProductId})`,
                   );
                   error.statusCode = 400;
                   throw error;
@@ -1350,17 +1353,16 @@ const createQrOrder = async (req, res) => {
                 const nextStock = currentStock - safeQty;
 
                 const updateSql = `UPDATE products
-                   SET stock = $1,
+                   SET stock = $1::numeric,
                        updated_at = NOW()
-                   WHERE tenant_id = $2
-                     AND id = $3
+                   WHERE tenant_id = $2::bigint
+                     AND id = $3::bigint
                    RETURNING id`;
-                const queryParams = [nextStock, tenantId, safeProductId];
+                const queryParams = [nextStock, safeTenantId, safeProductId];
 
                 console.log('DEBUG STOCK UPDATE CREATEQRORDER:', {
                   sql: updateSql,
                   params: queryParams,
-                  item: item,
                   rawProductId,
                   rawTypeof: typeof rawProductId,
                   safeProductId,
@@ -1368,23 +1370,25 @@ const createQrOrder = async (req, res) => {
                   qty: safeQty,
                   currentStock,
                   nextStock,
-                  tenantId,
+                  tenantId: safeTenantId,
                   productName: productForError?.name,
                   productTenant: productForError?.tenant_id,
                 });
+                console.log('DEBUG SQL:', updateSql, 'PARAMS:', queryParams, 'ITEM:', item);
 
                 let stockUpdate = await txClient.query(updateSql, queryParams);
                 if ((stockUpdate.rowCount || 0) === 0) {
                   console.warn('DEBUG CREATEQRORDER FALLBACK: stock update 0 rows WITH tenant_id. Trying fallback without tenant_id.');
-                  const fallbackSql = `UPDATE products SET stock = $1, updated_at = NOW() WHERE id = $2 RETURNING id`;
+                  const fallbackSql = `UPDATE products SET stock = $1::numeric, updated_at = NOW() WHERE id = $2::bigint RETURNING id`;
                   const fallbackParams = [nextStock, safeProductId];
+                  console.log('DEBUG SQL FALLBACK:', fallbackSql, 'PARAMS:', fallbackParams, 'ITEM:', item);
                   stockUpdate = await txClient.query(fallbackSql, fallbackParams);
                   console.warn(`  → Fallback rows: ${stockUpdate.rowCount || 0}`);
                 }
 
                 if ((stockUpdate.rowCount || 0) === 0) {
                   const error = new Error(
-                    `Stok produk ${productForError?.name || safeProductId} tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, ID=${safeProductId}, tenantId=${tenantId}, productTenant=${productForError?.tenant_id ?? 'unknown'})`,
+                    `Stok produk ${productForError?.name || item.product_name || item.productName || safeProductId} tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, ID=${safeProductId}, tenantId=${safeTenantId}, productTenant=${productForError?.tenant_id ?? 'unknown'})`,
                   );
                   error.statusCode = 400;
                   throw error;

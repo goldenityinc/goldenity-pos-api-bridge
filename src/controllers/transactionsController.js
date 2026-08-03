@@ -1050,13 +1050,16 @@ const createTransaction = async (req, res) => {
               continue;
             }
 
-            const rawProductId = item.productId;
+            const rawProductId = item.product_id ?? item.productId ?? item.id;
             const safeProductId = (rawProductId === undefined || rawProductId === null)
               ? ''
               : `${rawProductId}`.trim();
+            const safeTenantId = (tenantIdLocal === undefined || tenantIdLocal === null)
+              ? ''
+              : `${tenantIdLocal}`.trim();
 
             const lookupValues = hasProductsTenantColumn
-              ? [safeProductId, tenantIdLocal]
+              ? [safeProductId, safeTenantId]
               : [safeProductId];
 
             console.log('DEBUG (1/5): STOCK SELECT LOOKUP:', {
@@ -1067,7 +1070,7 @@ const createTransaction = async (req, res) => {
               itemKeys: Object.keys(item || {}),
               rawItem: item,
               hasProductsTenantColumn,
-              tenantIdLocal,
+              safeTenantId,
             });
 
             const currentResult = await txClient.query(
@@ -1075,29 +1078,29 @@ const createTransaction = async (req, res) => {
                 ? `SELECT id, tenant_id, name, stock,
                           ${productIsServiceCol ? `${productIsServiceCol} AS is_service,` : 'false AS is_service,'}
                           ${productTracksStockCol ? `${productTracksStockCol} AS is_stock_tracked` : 'true AS is_stock_tracked'}
-                   FROM "products" WHERE id = $1 AND tenant_id = $2 LIMIT 1 FOR UPDATE`
+                   FROM "products" WHERE id = $1::bigint AND tenant_id = $2::bigint LIMIT 1 FOR UPDATE`
                 : `SELECT id, name, stock,
                           ${productIsServiceCol ? `${productIsServiceCol} AS is_service,` : 'false AS is_service,'}
                           ${productTracksStockCol ? `${productTracksStockCol} AS is_stock_tracked` : 'true AS is_stock_tracked'}
-                   FROM "products" WHERE id = $1 LIMIT 1 FOR UPDATE`,
+                   FROM "products" WHERE id = $1::bigint LIMIT 1 FOR UPDATE`,
               lookupValues,
             );
 
             if ((currentResult.rowCount || 0) === 0) {
               console.warn('DEBUG (2/5): STOCK SELECT MISS! rowCount=0. Running debug SELECT WITHOUT tenant_id:', {
                 productId: safeProductId,
-                tenantId: tenantIdLocal,
+                tenantId: safeTenantId,
               });
               try {
-                const diag = await txClient.query(
-                  'SELECT id, tenant_id, name, stock FROM "products" WHERE id = $1 LIMIT 5',
-                  [safeProductId],
-                );
+                const diagSql = 'SELECT id, tenant_id, name, stock FROM "products" WHERE id = $1::bigint LIMIT 5';
+                const diagParams = [safeProductId];
+                console.log('DEBUG SQL:', diagSql, 'PARAMS:', diagParams, 'ITEM:', item);
+                const diag = await txClient.query(diagSql, diagParams);
                 console.warn('  → SELECT WITHOUT tenant_id rows:', diag.rows);
               } catch (diagErr) {
                 console.warn('  → diagnostic select failed:', diagErr && diagErr.message);
               }
-              const error = new Error(`Produk ${item.productName || safeProductId} tidak ditemukan`);
+              const error = new Error(`Produk ${item.productName || item.product_name || safeProductId} tidak ditemukan`);
               error.statusCode = 404;
               throw error;
             }
@@ -1108,8 +1111,8 @@ const createTransaction = async (req, res) => {
               typeofId: currentProduct && typeof currentProduct.id,
               idStr: currentProduct && String(currentProduct.id),
               tenantId: currentProduct && currentProduct.tenant_id,
-              expectedTenantId: tenantIdLocal,
-              tenantMatch: currentProduct && String(currentProduct.tenant_id || '') === String(tenantIdLocal || ''),
+              expectedTenantId: safeTenantId,
+              tenantMatch: currentProduct && String(currentProduct.tenant_id || '') === String(safeTenantId || ''),
               name: currentProduct && currentProduct.name,
               stock: currentProduct && currentProduct.stock,
             });
@@ -1118,7 +1121,7 @@ const createTransaction = async (req, res) => {
               continue;
             }
 
-            const safeQty = Number.isFinite(Number(item.qty)) ? Number(item.qty) : 0;
+            const safeQty = Number.isFinite(Number(item.qty ?? item.quantity)) ? Number(item.qty ?? item.quantity) : 0;
             if (safeQty <= 0) {
               continue;
             }
@@ -1130,14 +1133,13 @@ const createTransaction = async (req, res) => {
 
             if (!shouldCheckStock) {
               const unchangedValues = hasProductsTenantColumn
-                ? [safeProductId, tenantIdLocal]
+                ? [safeProductId, safeTenantId]
                 : [safeProductId];
-              const unchangedUpdate = await txClient.query(
-                hasProductsTenantColumn
-                  ? `UPDATE "products" SET updated_at = NOW() WHERE id = $1 AND tenant_id = $2 RETURNING *`
-                  : `UPDATE "products" SET updated_at = NOW() WHERE id = $1 RETURNING *`,
-                unchangedValues,
-              );
+              const unchangedSql = hasProductsTenantColumn
+                ? `UPDATE "products" SET updated_at = NOW() WHERE id = $1::bigint AND tenant_id = $2::bigint RETURNING *`
+                : `UPDATE "products" SET updated_at = NOW() WHERE id = $1::bigint RETURNING *`;
+              console.log('DEBUG SQL:', unchangedSql, 'PARAMS:', unchangedValues, 'ITEM:', item);
+              const unchangedUpdate = await txClient.query(unchangedSql, unchangedValues);
               if ((unchangedUpdate.rowCount || 0) > 0) {
                 inventoryUpdates.push(unchangedUpdate.rows[0]);
               }
@@ -1154,9 +1156,9 @@ const createTransaction = async (req, res) => {
 
             if (currentStock < safeQty) {
               console.warn(
-                `⚠️ STOCK INSUFFICIENT: Product=${currentProduct.name}, ID=${safeProductId}, Current=${currentStock}, Requested=${safeQty}, Tenant=${tenantIdLocal}`,
+                `⚠️ STOCK INSUFFICIENT: Product=${currentProduct.name}, ID=${safeProductId}, Current=${currentStock}, Requested=${safeQty}, Tenant=${safeTenantId}`,
               );
-              const error = new Error(`Stok produk ${currentProduct.name || safeProductId} tidak mencukupi / tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, id=${safeProductId})`);
+              const error = new Error(`Stok produk ${currentProduct.name || item.product_name || item.productName || safeProductId} tidak mencukupi / tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, id=${safeProductId})`);
               error.statusCode = 400;
               throw error;
             }
@@ -1165,58 +1167,59 @@ const createTransaction = async (req, res) => {
 
             const updateSql = hasProductsTenantColumn
               ? `UPDATE "products"
-                 SET stock = $1,
+                 SET stock = $1::numeric,
                      updated_at = NOW()
-                 WHERE id = $2
-                   AND tenant_id = $3
+                 WHERE id = $2::bigint
+                   AND tenant_id = $3::bigint
                  RETURNING *`
               : `UPDATE "products"
-                 SET stock = $1,
+                 SET stock = $1::numeric,
                      updated_at = NOW()
-                 WHERE id = $2
+                 WHERE id = $2::bigint
                  RETURNING *`;
 
             const queryParams = hasProductsTenantColumn
-              ? [nextStock, safeProductId, tenantIdLocal]
+              ? [nextStock, safeProductId, safeTenantId]
               : [nextStock, safeProductId];
 
             console.log('DEBUG STOCK UPDATE (4/5):', {
               sql: updateSql,
               params: queryParams,
-              item: item,
               safeProductId,
               qty: safeQty,
               currentStock,
               nextStock,
               hasTenant: hasProductsTenantColumn,
-              tenantId: tenantIdLocal,
+              tenantId: safeTenantId,
             });
+            console.log('DEBUG SQL:', updateSql, 'PARAMS:', queryParams, 'ITEM:', item);
 
             let updateResult = await txClient.query(updateSql, queryParams);
 
             if ((updateResult.rowCount || 0) === 0 && hasProductsTenantColumn) {
               console.warn('DEBUG (5/5): STOCK UPDATE 0 rows WITH tenant_id. Retrying WITHOUT tenant_id fallback:', {
                 safeProductId,
-                expectedTenant: tenantIdLocal,
+                expectedTenant: safeTenantId,
                 actualTenantOnRow: currentProduct && currentProduct.tenant_id,
                 sql: updateSql,
                 params: queryParams,
               });
               const fallbackSql = `UPDATE "products"
-                                   SET stock = $1,
+                                   SET stock = $1::numeric,
                                        updated_at = NOW()
-                                   WHERE id = $2
+                                   WHERE id = $2::bigint
                                    RETURNING *`;
               const fallbackParams = [nextStock, safeProductId];
+              console.log('DEBUG SQL FALLBACK:', fallbackSql, 'PARAMS:', fallbackParams, 'ITEM:', item);
               updateResult = await txClient.query(fallbackSql, fallbackParams);
               console.warn(`  → Fallback result: rowCount=${updateResult.rowCount || 0}`);
             }
 
             if ((updateResult.rowCount || 0) === 0) {
               console.warn(
-                `⚠️ STOCK UPDATE NO ROWS (FINAL FAIL): Product=${currentProduct.name}, ID=${safeProductId}, Current=${currentStock}, Requested=${safeQty}, Tenant=${tenantIdLocal}, hasTenant=${hasProductsTenantColumn}`,
+                `⚠️ STOCK UPDATE NO ROWS (FINAL FAIL): Product=${currentProduct.name}, ID=${safeProductId}, Current=${currentStock}, Requested=${safeQty}, Tenant=${safeTenantId}, hasTenant=${hasProductsTenantColumn}`,
               );
-              const error = new Error(`Stok produk ${currentProduct.name || safeProductId} tidak ditemukan saat potong stok (id=${safeProductId}, tenant=${tenantIdLocal}, hasTenant=${hasProductsTenantColumn}, actualTenantOnRow=${String(currentProduct && currentProduct.tenant_id)})`);
+              const error = new Error(`Stok produk ${currentProduct.name || item.product_name || item.productName || safeProductId} tidak ditemukan saat potong stok (id=${safeProductId}, tenant=${safeTenantId}, hasTenant=${hasProductsTenantColumn}, actualTenantOnRow=${String(currentProduct && currentProduct.tenant_id)})`);
               error.statusCode = 400;
               throw error;
             }
