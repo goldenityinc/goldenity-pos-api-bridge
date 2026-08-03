@@ -27,6 +27,38 @@ const TRANSIENT_SQLSTATE = new Set([
   '28000',
 ]);
 
+const installQuerySerializer = (client) => {
+  if (!client || client.__goldenityQuerySerializerInstalled) return client;
+  client.__goldenityQuerySerializerInstalled = true;
+  const originalQuery = client.query.bind(client);
+  let head = Promise.resolve();
+  let inflight = 0;
+  client.query = function serializedQuery(...args) {
+    const runNow = () => {
+      inflight += 1;
+      let result;
+      try {
+        result = originalQuery(...args);
+      } catch (err) {
+        inflight = Math.max(0, inflight - 1);
+        throw err;
+      }
+      const promise = Promise.resolve(result);
+      return promise.finally(() => {
+        inflight = Math.max(0, inflight - 1);
+      });
+    };
+    if (inflight <= 0) {
+      head = runNow();
+      return head;
+    }
+    const next = head.then(runNow, runNow);
+    head = next.catch(() => {});
+    return next;
+  };
+  return client;
+};
+
 const isPgPool = (poolOrClient) =>
   !!poolOrClient
   && typeof poolOrClient === 'object'
@@ -91,7 +123,7 @@ const withRetries = async (task, options = {}) => {
 
 const getClientFromPool = async (pool) => {
   if (pool && typeof pool === 'object' && typeof pool.release === 'function' && !isPgPool(pool)) {
-    return pool;
+    return installQuerySerializer(pool);
   }
   return withRetries(
     async () => {
@@ -99,7 +131,7 @@ const getClientFromPool = async (pool) => {
       if (!client) {
         throw new Error('Pool returned empty client');
       }
-      return client;
+      return installQuerySerializer(client);
     },
     {
       label: 'pool_connect',
@@ -228,4 +260,5 @@ module.exports = {
   getClientFromPool,
   runTransaction,
   storeFailedPayload,
+  installQuerySerializer,
 };

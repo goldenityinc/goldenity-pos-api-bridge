@@ -1,6 +1,37 @@
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 
+const installQuerySerializer = (client) => {
+  if (client.__goldenityQuerySerializerInstalled) return;
+  client.__goldenityQuerySerializerInstalled = true;
+  const originalQuery = client.query.bind(client);
+  let head = Promise.resolve();
+  let inflight = 0;
+  client.query = function serializedQuery(...args) {
+    const runNow = () => {
+      inflight += 1;
+      let result;
+      try {
+        result = originalQuery(...args);
+      } catch (err) {
+        inflight = Math.max(0, inflight - 1);
+        throw err;
+      }
+      const promise = Promise.resolve(result);
+      return promise.finally(() => {
+        inflight = Math.max(0, inflight - 1);
+      });
+    };
+    if (inflight <= 0) {
+      head = runNow();
+      return head;
+    }
+    const next = head.then(runNow, runNow);
+    head = next.catch(() => {});
+    return next;
+  };
+};
+
 const createSharedPool = () => {
   const connectionString = (process.env.DATABASE_URL || '').trim();
   if (!connectionString) {
@@ -44,8 +75,11 @@ const createSharedPool = () => {
 
   const bootstrapClient = async (client) => {
     try {
+      installQuerySerializer(client);
       if (statementTimeoutMs > 0) {
-        client.query(`SET statement_timeout = ${statementTimeoutMs}`).catch(() => {});
+        try {
+          await client.query(`SET statement_timeout = ${statementTimeoutMs}`);
+        } catch (_) {}
       }
       try {
         await client.query(ensureCoreTablesSql);
@@ -70,6 +104,7 @@ const createSharedPool = () => {
 
   pool.on('acquire', (client) => {
     try {
+      installQuerySerializer(client);
       client.__goldenityAcquiredAt = Date.now();
     } catch (_) {}
   });
