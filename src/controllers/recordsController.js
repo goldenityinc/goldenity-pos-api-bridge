@@ -21,6 +21,7 @@ const { ensureTenantScopedTable } = require('../utils/tenantScope');
 const { emitTableMutation } = require('../services/realtimeEmitter');
 const { uploadBase64Object } = require('../services/objectStorageService');
 const { scheduleExpenseJournalPosting } = require('../services/accountingAutomationService');
+const { normalizePayloadCartItems, normalizeCartItemInPlace } = require('../utils/dbSafe');
 
 const createHttpError = (statusCode, message) => {
   const error = new Error(message);
@@ -1144,22 +1145,25 @@ const normalizeProductId = (value) => {
 const collectProductIdsFromItems = (items = []) => {
   const ids = new Set();
 
-  for (const item of items) {
-    if (!item || typeof item !== 'object') {
+  for (const raw of items) {
+    if (!raw || typeof raw !== 'object') {
       continue;
     }
+    normalizeCartItemInPlace(raw);
 
     const isService =
-      normalizeBoolean(item.is_service) ||
-      normalizeBoolean(item.isService) ||
-      normalizeBoolean(item?.product?.is_service) ||
-      normalizeBoolean(item?.product?.isService);
+      normalizeBoolean(raw?.product?.is_service) ||
+      normalizeBoolean(raw?.product?.isService) ||
+      normalizeBoolean(raw.is_service) ||
+      normalizeBoolean(raw.isService);
     if (isService) {
       continue;
     }
 
+    const nested = raw.product && typeof raw.product === 'object' ? raw.product : {};
     const productId = normalizeProductId(
-      item.product_id ?? item.productId ?? item?.product?.id,
+      nested.id ?? nested.product_id ?? nested.productId ??
+      raw.product_id ?? raw.productId ?? raw.id,
     );
     if (productId) {
       ids.add(productId);
@@ -1257,7 +1261,13 @@ const loadTableNumberMap = async (tenantDb, rows, tenantId) => {
 };
 
 const extractItemQty = (item = {}) => {
-  const qty = toFiniteNumber(item.qty ?? item.quantity ?? 0);
+  normalizeCartItemInPlace(item);
+  const nested = item?.product && typeof item.product === 'object' ? item.product : {};
+  const qty = toFiniteNumber(
+    item.qty ?? item.quantity ??
+    nested.qty ?? nested.quantity ??
+    0
+  );
   if (qty === null || qty <= 0) {
     return 0;
   }
@@ -1265,7 +1275,19 @@ const extractItemQty = (item = {}) => {
 };
 
 const extractItemSellingPrice = (item = {}) => {
+  normalizeCartItemInPlace(item);
+  const nested = item?.product && typeof item.product === 'object' ? item.product : {};
   const candidates = [
+    nested.custom_price,
+    nested.customPrice,
+    nested.service_item_price,
+    nested.product_price,
+    nested.productPrice,
+    nested.harga_jual,
+    nested.price,
+    nested.unit_price,
+    nested.unitPrice,
+    nested.sale_price,
     item.custom_price,
     item.customPrice,
     item.service_item_price,
@@ -1290,11 +1312,18 @@ const extractItemSellingPrice = (item = {}) => {
 };
 
 const extractItemPurchasePrice = (item = {}, purchasePriceMap = new Map()) => {
+  normalizeCartItemInPlace(item);
+  const nested = item?.product && typeof item.product === 'object' ? item.product : {};
   const productId = normalizeProductId(
-    item.product_id ?? item.productId ?? item?.product?.id,
+    nested.id ?? nested.product_id ?? nested.productId ??
+    item.product_id ?? item.productId ?? item.id,
   );
 
   const candidates = [
+    nested.purchase_price,
+    nested.purchasePrice,
+    nested.product_purchase_price,
+    nested.productPurchasePrice,
     item.purchase_price,
     item.purchasePrice,
     item.product_purchase_price,
@@ -1688,6 +1717,43 @@ const listRecords = async (req, res) => {
 };
 
 const createRecords = async (req, res) => {
+  try { normalizePayloadCartItems(req); } catch (_) {}
+  try {
+    const table = (req?.params?.table || '').toString().trim();
+    const method = (req.method || 'POST').toUpperCase();
+    const url = req.originalUrl || req.url || `/records/${table}`;
+    const tenantId = resolveTenantId(req);
+    const incomingLogPayload = (req.body && typeof req.body === 'object') ? { ...req.body } : null;
+    const getItemsFromPayload = (p) => {
+      if (!p || typeof p !== 'object') return [];
+      const candidates = [p.items, p.products, p.cart_items, p.cartItems, p.sales_items, p.order_items, p.detail];
+      for (const c of candidates) if (Array.isArray(c)) return c;
+      if (Array.isArray(p.records) && p.records[0] && typeof p.records[0] === 'object' && Array.isArray(p.records[0].items)) return p.records[0].items;
+      return [];
+    };
+    const items = getItemsFromPayload(incomingLogPayload);
+    for (let i = 0; i < items.length; i += 1) normalizeCartItemInPlace(items[i]);
+    const summary = {
+      method,
+      url,
+      table,
+      tenant: tenantId || null,
+      isArray: Array.isArray(incomingLogPayload),
+      itemsCount: items.length,
+      firstItems: items.slice(0, 3).map((it) => ({
+        id: it?.id ?? null,
+        productId: it?.productId ?? it?.product_id ?? null,
+        nestedProductId: it?.product?.id ?? null,
+        qty: it?.qty ?? it?.quantity ?? null,
+        price: it?.price ?? it?.unit_price ?? it?.custom_price ?? it?.product?.price ?? null,
+        name: it?.name ?? it?.product_name ?? it?.productName ?? it?.product?.name ?? null,
+      })),
+    };
+    console.log(`[RECORDS POST /:table] ${method} ${url} payload=`, JSON.stringify(summary));
+    if (items.length > 0) {
+      console.log(`[RECORDS POST /:table] RAW ITEMS JSON=`, JSON.stringify(items).slice(0, 3500));
+    }
+  } catch (_) {}
   try {
     const table = req.params.table;
     const tenantId = resolveTenantId(req);

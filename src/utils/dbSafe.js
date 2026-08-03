@@ -59,6 +59,204 @@ const installQuerySerializer = (client) => {
   return client;
 };
 
+const normalizeCartItemInPlace = (item) => {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    return item;
+  }
+  const nested =
+    item.product && typeof item.product === 'object' && !Array.isArray(item.product)
+      ? item.product
+      : null;
+  const obj = item;
+  if (nested) {
+    const pickFirst = (keys) => {
+      for (const k of keys) {
+        if (nested[k] !== undefined && nested[k] !== null && `${nested[k]}`.trim() !== '') {
+          return nested[k];
+        }
+      }
+      return undefined;
+    };
+    const nestedId = pickFirst(['id', 'product_id', 'productId', 'entity_id', 'manual_item_id']);
+    const nestedName = pickFirst(['name', 'product_name', 'productName', 'title', 'label']);
+    const nestedQty = pickFirst(['qty', 'quantity', 'jumlah']);
+    const nestedPrice = pickFirst([
+      'custom_price',
+      'customPrice',
+      'price',
+      'unit_price',
+      'unitPrice',
+      'harga_jual',
+      'sale_price',
+      'harga',
+    ]);
+    const nestedIsService = pickFirst([
+      'is_service',
+      'isService',
+      'is_custom_item',
+      'isCustomItem',
+      'isNonStock',
+      'is_non_stock',
+    ]);
+    const nestedNote = pickFirst([
+      'note',
+      'item_note',
+      'product_note',
+      'notes',
+      'remark',
+      'remarks',
+      'catatan',
+    ]);
+    if (nestedId !== undefined && (obj.id === undefined || `${obj.id}`.length > 14)) {
+      try {
+        obj.id = nestedId;
+      } catch (_) {}
+    }
+    if (nestedId !== undefined) {
+      try {
+        if (obj.product_id === undefined || obj.product_id === null || `${obj.product_id}`.trim() === '') {
+          obj.product_id = nestedId;
+        }
+        if (obj.productId === undefined || obj.productId === null || `${obj.productId}`.trim() === '') {
+          obj.productId = nestedId;
+        }
+      } catch (_) {}
+    }
+    if (nestedName !== undefined) {
+      try {
+        if (obj.product_name === undefined || obj.product_name === null || `${obj.product_name}`.trim() === '') {
+          obj.product_name = nestedName;
+        }
+        if (obj.productName === undefined || obj.productName === null || `${obj.productName}`.trim() === '') {
+          obj.productName = nestedName;
+        }
+        if (obj.name === undefined || obj.name === null || `${obj.name}`.trim() === '') {
+          obj.name = nestedName;
+        }
+      } catch (_) {}
+    }
+    if (nestedQty !== undefined && Number.isFinite(Number(nestedQty))) {
+      try {
+        const qtyNum = Number(nestedQty);
+        if ((obj.qty === undefined || !Number.isFinite(Number(obj.qty)) || Number(obj.qty) <= 0) && qtyNum > 0) {
+          obj.qty = qtyNum;
+        }
+        if ((obj.quantity === undefined || !Number.isFinite(Number(obj.quantity)) || Number(obj.quantity) <= 0) && qtyNum > 0) {
+          obj.quantity = qtyNum;
+        }
+      } catch (_) {}
+    }
+    if (nestedPrice !== undefined && Number.isFinite(Number(nestedPrice))) {
+      try {
+        const pr = Number(nestedPrice);
+        if ((obj.price === undefined || !Number.isFinite(Number(obj.price)) || Number(obj.price) <= 0) && pr > 0) {
+          obj.price = pr;
+        }
+        if ((obj.unit_price === undefined || !Number.isFinite(Number(obj.unit_price)) || Number(obj.unit_price) <= 0) && pr > 0) {
+          obj.unit_price = pr;
+        }
+        if ((obj.unitPrice === undefined || !Number.isFinite(Number(obj.unitPrice)) || Number(obj.unitPrice) <= 0) && pr > 0) {
+          obj.unitPrice = pr;
+        }
+        if ((obj.harga_jual === undefined || !Number.isFinite(Number(obj.harga_jual)) || Number(obj.harga_jual) <= 0) && pr > 0) {
+          obj.harga_jual = pr;
+        }
+        if ((obj.custom_price === undefined || !Number.isFinite(Number(obj.custom_price)) || Number(obj.custom_price) <= 0) && pr > 0) {
+          obj.custom_price = pr;
+        }
+        if ((obj.customPrice === undefined || !Number.isFinite(Number(obj.customPrice)) || Number(obj.customPrice) <= 0) && pr > 0) {
+          obj.customPrice = pr;
+        }
+      } catch (_) {}
+    }
+    if (nestedIsService !== undefined && nestedIsService !== null) {
+      try {
+        if (obj.is_service === undefined || obj.is_service === null) {
+          obj.is_service = nestedIsService;
+        }
+        if (obj.isService === undefined || obj.isService === null) {
+          obj.isService = nestedIsService;
+        }
+      } catch (_) {}
+    }
+    if (nestedNote !== undefined && `${nestedNote}`.trim() !== '') {
+      try {
+        if (obj.note === undefined || obj.note === null || `${obj.note}`.trim() === '') {
+          obj.note = nestedNote;
+        }
+        if (obj.item_note === undefined || obj.item_note === null || `${obj.item_note}`.trim() === '') {
+          obj.item_note = nestedNote;
+        }
+        if (obj.notes === undefined || obj.notes === null || `${obj.notes}`.trim() === '') {
+          obj.notes = nestedNote;
+        }
+      } catch (_) {}
+    }
+  }
+  if (
+    obj.id !== undefined &&
+    obj.id !== null &&
+    `${obj.id}`.length >= 13 &&
+    /^\d+$/.test(`${obj.id}`) &&
+    (obj.product_id === undefined || `${obj.product_id}`.trim() === '' || `${obj.product_id}` === `${obj.id}`) &&
+    (obj.productId === undefined || `${obj.productId}`.trim() === '' || `${obj.productId}` === `${obj.id}`)
+  ) {
+    const numericId = Number(obj.id);
+    if (numericId > 1e12) {
+      if (nested && nested.id !== undefined && nested.id !== null && `${nested.id}` !== `${obj.id}`) {
+        try {
+          obj.id = nested.id;
+          obj.product_id = nested.id;
+          obj.productId = nested.id;
+        } catch (_) {}
+      }
+    }
+  }
+  return obj;
+};
+
+const normalizePayloadCartItems = (req) => {
+  if (!req || !req.body || typeof req.body !== 'object') return req;
+  const payload = req.body;
+  const candidates = ['items', 'products', 'cart_items', 'cartItems', 'sales_items', 'salesItems', 'order_items', 'orderItems', 'detail'];
+  for (const key of candidates) {
+    const arr = payload[key];
+    if (Array.isArray(arr)) {
+      for (let i = 0; i < arr.length; i += 1) {
+        normalizeCartItemInPlace(arr[i]);
+      }
+    }
+  }
+  if (payload.record && Array.isArray(payload.record?.items)) {
+    for (let i = 0; i < payload.record.items.length; i += 1) {
+      normalizeCartItemInPlace(payload.record.items[i]);
+    }
+  }
+  if (Array.isArray(payload.records)) {
+    for (let r = 0; r < payload.records.length; r += 1) {
+      const rec = payload.records[r];
+      for (const key of candidates) {
+        const arr = rec && rec[key];
+        if (Array.isArray(arr)) {
+          for (let i = 0; i < arr.length; i += 1) normalizeCartItemInPlace(arr[i]);
+        }
+      }
+    }
+  }
+  if (Array.isArray(payload)) {
+    for (let r = 0; r < payload.length; r += 1) {
+      const rec = payload[r];
+      for (const key of candidates) {
+        const arr = rec && rec[key];
+        if (Array.isArray(arr)) {
+          for (let i = 0; i < arr.length; i += 1) normalizeCartItemInPlace(arr[i]);
+        }
+      }
+    }
+  }
+  return req;
+};
+
 const isPgPool = (poolOrClient) =>
   !!poolOrClient
   && typeof poolOrClient === 'object'
@@ -261,4 +459,6 @@ module.exports = {
   runTransaction,
   storeFailedPayload,
   installQuerySerializer,
+  normalizeCartItemInPlace,
+  normalizePayloadCartItems,
 };

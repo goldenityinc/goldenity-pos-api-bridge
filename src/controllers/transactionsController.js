@@ -23,6 +23,8 @@ const {
   getClientFromPool,
   runTransaction,
   storeFailedPayload,
+  normalizePayloadCartItems,
+  normalizeCartItemInPlace,
 } = require('../utils/dbSafe');
 
 const normalizePaymentType = (value) => (value || '').toString().trim().toUpperCase();
@@ -787,7 +789,38 @@ const listActiveKasBon = async (req, res) => {
 };
 
 const createTransaction = async (req, res) => {
+  try { normalizePayloadCartItems(req); } catch (_) {}
   const requestId = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    const incomingLogPayload = (req.body && typeof req.body === 'object') ? { ...req.body } : null;
+    if (incomingLogPayload && Array.isArray(incomingLogPayload.items)) {
+      for (let i = 0; i < incomingLogPayload.items.length; i += 1) normalizeCartItemInPlace(incomingLogPayload.items[i]);
+    }
+    const method = (req.method || 'POST').toUpperCase();
+    const url = req.originalUrl || req.url || '/transactions';
+    const tenantId = resolveTenantIdFromRequest(req);
+    const summary = {
+      requestId,
+      method,
+      url,
+      tenant: tenantId || null,
+      table: incomingLogPayload?.table_id ?? incomingLogPayload?.tableId ?? null,
+      itemsCount: Array.isArray(incomingLogPayload?.items) ? incomingLogPayload.items.length : 0,
+      totalAmount: incomingLogPayload?.total_amount ?? incomingLogPayload?.totalAmount ?? incomingLogPayload?.total ?? incomingLogPayload?.subtotal ?? null,
+      firstItems: Array.isArray(incomingLogPayload?.items) ? (incomingLogPayload.items.slice(0, 3).map((it) => ({
+        id: it?.id ?? null,
+        productId: it?.productId ?? it?.product_id ?? null,
+        nestedProductId: it?.product?.id ?? null,
+        qty: it?.qty ?? it?.quantity ?? null,
+        price: it?.price ?? it?.unit_price ?? it?.custom_price ?? it?.product?.price ?? null,
+        name: it?.name ?? it?.product_name ?? it?.productName ?? it?.product?.name ?? null,
+      }))) : [],
+    };
+    console.log(`[TRANSACTION ENTRY ${requestId}] ${method} ${url} payload=`, JSON.stringify(summary));
+    if (incomingLogPayload && Array.isArray(incomingLogPayload.items)) {
+      console.log(`[TRANSACTION ENTRY ${requestId}] RAW ITEMS JSON=`, JSON.stringify(incomingLogPayload.items).slice(0, 3500));
+    }
+  } catch (_) {}
   const incomingBody = (req.body && typeof req.body === 'object')
     ? { ...req.body }
     : {};
@@ -1067,6 +1100,7 @@ const createTransaction = async (req, res) => {
             if (item.isService) {
               continue;
             }
+            normalizeCartItemInPlace(item);
 
             const nestedProduct =
               item.product && typeof item.product === 'object' ? item.product : {};

@@ -18,6 +18,12 @@ const {
   getCachedResponse,
   storeResponse,
 } = require('../utils/idempotencyCache');
+const {
+  normalizePayloadCartItems,
+  normalizeCartItemInPlace,
+  runTransaction,
+} = require('../utils/dbSafe');
+const { getTableColumnSet } = require('../utils/sqlHelpers');
 
 const BCRYPT_REGEX = /^\$2[aby]\$\d{2}\$.{53}$/;
 
