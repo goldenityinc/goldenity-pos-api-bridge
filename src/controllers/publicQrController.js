@@ -1164,7 +1164,7 @@ const createQrOrder = async (req, res) => {
               COALESCE(stock, 0) AS stock
        FROM products
        WHERE tenant_id = $1::text
-         AND id = ANY($2::bigint[])
+         AND id = ANY($2)
          AND ${softDeletePredicate}
          ${productBranchClause}
          AND COALESCE(is_active, true) = true
@@ -1458,7 +1458,7 @@ const createQrOrder = async (req, res) => {
                    SET stock = $1::numeric,
                        updated_at = NOW()
                    WHERE tenant_id = $2::text
-                     AND id = $3::bigint
+                     AND id = $3
                    RETURNING id`;
                 const queryParams = [nextStock, safeTenantId, safeProductId];
 
@@ -1481,7 +1481,7 @@ const createQrOrder = async (req, res) => {
                 let stockUpdate = await txClient.query(updateSql, queryParams);
                 if ((stockUpdate.rowCount || 0) === 0) {
                   console.warn('DEBUG CREATEQRORDER FALLBACK: stock update 0 rows WITH tenant_id. Trying fallback without tenant_id.');
-                  const fallbackSql = `UPDATE products SET stock = $1::numeric, updated_at = NOW() WHERE id = $2::bigint RETURNING id`;
+                  const fallbackSql = `UPDATE products SET stock = $1::numeric, updated_at = NOW() WHERE id = $2 RETURNING id`;
                   const fallbackParams = [nextStock, safeProductId];
                   console.log('DEBUG SQL FALLBACK:', fallbackSql, 'PARAMS:', fallbackParams, 'ITEM:', item);
                   stockUpdate = await txClient.query(fallbackSql, fallbackParams);
