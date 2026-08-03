@@ -645,14 +645,14 @@ const getQrMenu = async (req, res) => {
     )`;
 
     const branchProductsClause = supportsBranchProducts
-      ? `AND ($3::bigint IS NULL OR branch_id = $3)`
-      : `AND ($3::bigint IS NULL OR true)`;
+      ? `AND ($3 IS NULL OR branch_id = $3)`
+      : `AND ($3 IS NULL OR true)`;
     const branchFallbackClause = supportsBranchProducts
-      ? `AND ($2::bigint IS NULL OR branch_id = $2)`
-      : `AND ($2::bigint IS NULL OR true)`;
+      ? `AND ($2 IS NULL OR branch_id = $2)`
+      : `AND ($2 IS NULL OR true)`;
     const branchCategoriesClause = supportsBranchCategories
-      ? `AND ($2::bigint IS NULL OR branch_id = $2)`
-      : `AND ($2::bigint IS NULL OR true)`;
+      ? `AND ($2 IS NULL OR branch_id = $2)`
+      : `AND ($2 IS NULL OR true)`;
 
     const productParams = [tenantId, Array.from(FNB_PRODUCT_TYPES)];
     if (supportsBranchProducts) productParams.push(branchId);
@@ -1151,8 +1151,8 @@ const createQrOrder = async (req, res) => {
               : 'true';
           const supportsProductBranch = productColumns.has('branch_id');
           const productBranchClause = supportsProductBranch
-            ? 'AND ($3::bigint IS NULL OR branch_id = $3)'
-            : 'AND ($3::bigint IS NULL OR true)';
+            ? 'AND ($3 IS NULL OR branch_id = $3)'
+            : 'AND ($3 IS NULL OR true)';
           const productParams = [tenantId, productIds];
           if (supportsProductBranch) productParams.push(branchId);
           else productParams.push(null);
@@ -1457,7 +1457,7 @@ const createQrOrder = async (req, res) => {
                 const updateSql = `UPDATE products
                    SET stock = $1::numeric,
                        updated_at = NOW()
-                   WHERE tenant_id = $2::bigint
+                   WHERE tenant_id = $2::text
                      AND id = $3::bigint
                    RETURNING id`;
                 const queryParams = [nextStock, safeTenantId, safeProductId];
@@ -1832,10 +1832,10 @@ const checkoutQrOrder = async (req, res) => {
               }
 
               const branchClause = supportsSalesBranch
-                ? `AND ($${branchParamIndex}::bigint IS NULL OR branch_id = $${branchParamIndex})`
-                : `AND ($${branchParamIndex}::bigint IS NULL OR true)`;
+                ? `AND ($${branchParamIndex} IS NULL OR branch_id = $${branchParamIndex})`
+                : `AND ($${branchParamIndex} IS NULL OR true)`;
 
-              const columnsToSelectBranch = supportsSalesBranch ? 'branch_id,' : 'NULL::bigint AS branch_id,';
+              const columnsToSelectBranch = supportsSalesBranch ? 'branch_id,' : 'NULL::text AS branch_id,';
 
               const lookupSql = `SELECT id, reference_id, receipt_number,
                         payment_status, order_status, payment_method,

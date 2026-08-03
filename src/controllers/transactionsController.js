@@ -1138,7 +1138,7 @@ const createTransaction = async (req, res) => {
                 ? `SELECT id, tenant_id, name, stock,
                           ${productIsServiceCol ? `${productIsServiceCol} AS is_service,` : 'false AS is_service,'}
                           ${productTracksStockCol ? `${productTracksStockCol} AS is_stock_tracked` : 'true AS is_stock_tracked'}
-                   FROM "products" WHERE id = $1::bigint AND tenant_id = $2::bigint LIMIT 1 FOR UPDATE`
+                   FROM "products" WHERE id = $1::bigint AND tenant_id = $2::text LIMIT 1 FOR UPDATE`
                 : `SELECT id, name, stock,
                           ${productIsServiceCol ? `${productIsServiceCol} AS is_service,` : 'false AS is_service,'}
                           ${productTracksStockCol ? `${productTracksStockCol} AS is_stock_tracked` : 'true AS is_stock_tracked'}
@@ -1198,7 +1198,7 @@ const createTransaction = async (req, res) => {
                 ? [safeProductId, safeTenantId]
                 : [safeProductId];
               const unchangedSql = hasProductsTenantColumn
-                ? `UPDATE "products" SET updated_at = NOW() WHERE id = $1::bigint AND tenant_id = $2::bigint RETURNING *`
+                ? `UPDATE "products" SET updated_at = NOW() WHERE id = $1::bigint AND tenant_id = $2::text RETURNING *`
                 : `UPDATE "products" SET updated_at = NOW() WHERE id = $1::bigint RETURNING *`;
               console.log('DEBUG SQL:', unchangedSql, 'PARAMS:', unchangedValues, 'ITEM:', item);
               const unchangedUpdate = await txClient.query(unchangedSql, unchangedValues);
@@ -1232,7 +1232,7 @@ const createTransaction = async (req, res) => {
                  SET stock = $1::numeric,
                      updated_at = NOW()
                  WHERE id = $2::bigint
-                   AND tenant_id = $3::bigint
+                   AND tenant_id = $3::text
                  RETURNING *`
               : `UPDATE "products"
                  SET stock = $1::numeric,
