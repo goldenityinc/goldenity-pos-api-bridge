@@ -447,7 +447,7 @@ const resolveQrOrderSettings = async ({ client, tenantId, branchId }) => {
       const whereParts = ['tenant_id = $1'];
       const params = [tenantId];
       if (supportsBranch && branchId !== null) {
-        whereParts.push('(branch_id = $2 OR branch_id IS NULL)');
+        whereParts.push('(branch_id::text = $2::text OR branch_id IS NULL)');
         params.push(branchId);
       }
 
