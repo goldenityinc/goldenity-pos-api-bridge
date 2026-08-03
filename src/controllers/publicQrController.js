@@ -1331,27 +1331,48 @@ const createQrOrder = async (req, res) => {
               const safeQty = Number.isFinite(Number(item.qty)) ? Number(item.qty) : 0;
               if (safeQty > 0) {
                 const productForError = productMap.get(item.productId);
-                const stockUpdate = await txClient.query(
-                  `UPDATE products
-                   SET stock = COALESCE(stock, 0) - $1,
+                const currentStock = Number.isFinite(Number(productForError?.stock ?? 0))
+                  ? Number(productForError?.stock ?? 0)
+                  : 0;
+
+                if (currentStock < safeQty) {
+                  const error = new Error(
+                    `Stok produk ${productForError?.name || item.productId} tidak mencukupi / tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, ID=${item.productId})`,
+                  );
+                  error.statusCode = 400;
+                  throw error;
+                }
+
+                const nextStock = currentStock - safeQty;
+                const safeProductId = (item.productId === undefined || item.productId === null)
+                  ? ''
+                  : (typeof item.productId === 'bigint' || Number.isSafeInteger(Number(item.productId)) || /^\d+$/.test(`${item.productId}`))
+                    ? `${item.productId}`
+                    : item.productId;
+
+                const queryParams = [nextStock, tenantId, safeProductId];
+                const updateSql = `UPDATE products
+                   SET stock = $1,
                        updated_at = NOW()
                    WHERE tenant_id = $2
                      AND id = $3
-                     AND (
-                       COALESCE(is_stock_tracked, true) = false
-                       OR COALESCE(stock_tracked, true) = false
-                       OR COALESCE(is_service, false) = true
-                       OR COALESCE(stock, 0) >= $1
-                     )
-                   RETURNING id`,
-                  [safeQty, tenantId, item.productId],
-                );
+                   RETURNING id`;
+
+                console.log('DEBUG STOCK UPDATE CREATEQRORDER:', {
+                  id: safeProductId,
+                  qty: safeQty,
+                  currentStock,
+                  nextStock,
+                  params: queryParams,
+                  tenantId,
+                  productName: productForError?.name,
+                  updateSql,
+                });
+
+                const stockUpdate = await txClient.query(updateSql, queryParams);
                 if ((stockUpdate.rowCount || 0) === 0) {
-                  const currentStock = productForError
-                    ? Number(productForError.stock || 0)
-                    : 'unknown';
                   const error = new Error(
-                    `Stok produk ${productForError?.name || item.productId} tidak mencukupi / tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, ID=${item.productId})`,
+                    `Stok produk ${productForError?.name || item.productId} tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, ID=${safeProductId}, tenantId=${tenantId})`,
                   );
                   error.statusCode = 400;
                   throw error;

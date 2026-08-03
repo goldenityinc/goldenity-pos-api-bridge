@@ -877,13 +877,6 @@ const createTransaction = async (req, res) => {
               ? 'is_custom_item'
               : null;
 
-          const stockTrackedPredicate = productTracksStockCol
-            ? `(COALESCE(${productTracksStockCol}, true) = false OR COALESCE(stock, 0) >= $1)`
-            : `COALESCE(stock, 0) >= $1`;
-          const isServicePredicate = productIsServiceCol
-            ? `OR COALESCE(${productIsServiceCol}, false) = true`
-            : '';
-
           if (existingTransactionIdToUpdate || existingReceiptNumberToUpdate) {
             const existingRecordResult = await txClient.query(
               existingTransactionIdToUpdate
@@ -1090,12 +1083,12 @@ const createTransaction = async (req, res) => {
               continue;
             }
 
-            const tracked = currentProduct.is_stock_tracked !== false && productTracksStockCol
-              ? true
-              : (!productTracksStockCol ? true : currentProduct.is_stock_tracked !== false);
+            const stockTrackedOnProduct = currentProduct.is_stock_tracked !== false
+              && currentProduct.is_stock_tracked !== 'false'
+              && currentProduct.is_stock_tracked !== 0;
+            const shouldCheckStock = !productTracksStockCol || stockTrackedOnProduct;
 
-            const currentStock = Number(currentProduct.stock ?? 0);
-            if (!tracked) {
+            if (!shouldCheckStock) {
               const unchangedValues = hasProductsTenantColumn
                 ? [item.productId, tenantIdLocal]
                 : [item.productId];
@@ -1111,35 +1104,66 @@ const createTransaction = async (req, res) => {
               continue;
             }
 
+            const currentStock = Number.isFinite(Number(currentProduct.stock ?? 0))
+              ? Number(currentProduct.stock ?? 0)
+              : 0;
+
             if (!Number.isFinite(currentStock)) {
               throw new Error(`Stok produk ${item.productId} tidak valid`);
             }
 
-            const safeUpdateSql = hasProductsTenantColumn
+            if (currentStock < safeQty) {
+              console.warn(
+                `⚠️ STOCK INSUFFICIENT: Product=${currentProduct.name}, ID=${item.productId}, Current=${currentStock}, Requested=${safeQty}, Tenant=${tenantIdLocal}`,
+              );
+              const error = new Error(`Stok produk ${currentProduct.name || item.productId} tidak mencukupi / tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty}, id=${item.productId})`);
+              error.statusCode = 400;
+              throw error;
+            }
+
+            const nextStock = currentStock - safeQty;
+
+            const updateSql = hasProductsTenantColumn
               ? `UPDATE "products"
-                 SET stock = COALESCE(stock, 0) - $1,
+                 SET stock = $1,
                      updated_at = NOW()
                  WHERE id = $2
                    AND tenant_id = $3
-                   AND (${stockTrackedPredicate} ${isServicePredicate})
                  RETURNING *`
               : `UPDATE "products"
-                 SET stock = COALESCE(stock, 0) - $1,
+                 SET stock = $1,
                      updated_at = NOW()
                  WHERE id = $2
-                   AND (${stockTrackedPredicate} ${isServicePredicate})
                  RETURNING *`;
-            const safeUpdateValues = hasProductsTenantColumn
-              ? [safeQty, item.productId, tenantIdLocal]
-              : [safeQty, item.productId];
 
-            const updateResult = await txClient.query(safeUpdateSql, safeUpdateValues);
+            const safeProductId = (item.productId === undefined || item.productId === null)
+              ? ''
+              : (typeof item.productId === 'bigint' || Number.isSafeInteger(Number(item.productId)) || /^\d+$/.test(`${item.productId}`))
+                ? `${item.productId}`
+                : item.productId;
+
+            const queryParams = hasProductsTenantColumn
+              ? [nextStock, safeProductId, tenantIdLocal]
+              : [nextStock, safeProductId];
+
+            console.log('DEBUG STOCK UPDATE TRANSACTIONS:', {
+              id: safeProductId,
+              qty: safeQty,
+              currentStock,
+              nextStock,
+              params: queryParams,
+              hasTenant: hasProductsTenantColumn,
+              tenantId: tenantIdLocal,
+              updateSql,
+            });
+
+            const updateResult = await txClient.query(updateSql, queryParams);
 
             if ((updateResult.rowCount || 0) === 0) {
               console.warn(
-                `⚠️ STOCK INSUFFICIENT [ATOMIC]: Product=${currentProduct.name}, ID=${item.productId}, Current=${currentStock}, Requested=${safeQty}, Tenant=${tenantIdLocal}`,
+                `⚠️ STOCK UPDATE NO ROWS: Product=${currentProduct.name}, ID=${item.productId}, Current=${currentStock}, Requested=${safeQty}, Tenant=${tenantIdLocal}, hasTenant=${hasProductsTenantColumn}`,
               );
-              const error = new Error(`Stok produk ${currentProduct.name || item.productId} tidak mencukupi / tidak ditemukan saat potong stok (Current=${currentStock}, Requested=${safeQty})`);
+              const error = new Error(`Stok produk ${currentProduct.name || item.productId} tidak ditemukan saat potong stok (id=${safeProductId}, tenant=${tenantIdLocal}, hasTenant=${hasProductsTenantColumn})`);
               error.statusCode = 400;
               throw error;
             }
