@@ -605,6 +605,8 @@ const getQrMenu = async (req, res) => {
     const softDeletePredicate = resolveSoftDeletePredicate(productColumns);
     const categoryColumns = await getTableColumnSet(pool, 'categories');
     const categorySoftDeletePredicate = resolveSoftDeletePredicate(categoryColumns);
+    const supportsBranchProducts = productColumns.has('branch_id');
+    const supportsBranchCategories = categoryColumns.has('branch_id');
     const supportsPrintDestination = productColumns.has('print_destination');
     const stockTrackedExpression = productColumns.has('is_stock_tracked')
       ? 'COALESCE(is_stock_tracked, true)'
@@ -617,6 +619,20 @@ const getQrMenu = async (req, res) => {
       OR ${stockTrackedExpression} = false
     )`;
 
+    const branchProductsClause = supportsBranchProducts
+      ? `AND ($3::bigint IS NULL OR branch_id = $3)`
+      : `AND ($3::bigint IS NULL OR true)`;
+    const branchFallbackClause = supportsBranchProducts
+      ? `AND ($2::bigint IS NULL OR branch_id = $2)`
+      : `AND ($2::bigint IS NULL OR true)`;
+    const branchCategoriesClause = supportsBranchCategories
+      ? `AND ($2::bigint IS NULL OR branch_id = $2)`
+      : `AND ($2::bigint IS NULL OR true)`;
+
+    const productParams = [tenantId, Array.from(FNB_PRODUCT_TYPES)];
+    if (supportsBranchProducts) productParams.push(branchId);
+    else productParams.push(null);
+
     const result = await pool.query(
             `SELECT id, name, category, product_type, price, stock, image_url, unit,
               ${supportsPrintDestination ? 'print_destination,' : 'NULL::text AS print_destination,'}
@@ -626,18 +642,22 @@ const getQrMenu = async (req, res) => {
        FROM products
        WHERE tenant_id = $1
          AND ${softDeletePredicate}
-         AND ($3::bigint IS NULL OR branch_id = $3)
+         ${branchProductsClause}
          AND COALESCE(is_active, true) = true
          AND (
            UPPER(COALESCE(product_type, '')) = ANY($2::text[])
          )
          AND ${stockVisibilityPredicate}
        ORDER BY name ASC`,
-      [tenantId, Array.from(FNB_PRODUCT_TYPES), branchId],
+      productParams,
     );
 
     let rows = result.rows || [];
     if (rows.length === 0) {
+      const fallbackParams = [tenantId];
+      if (supportsBranchProducts) fallbackParams.push(branchId);
+      else fallbackParams.push(null);
+
       const fallbackResult = await pool.query(
         `SELECT id, name, category, product_type, price, stock, image_url, unit,
           ${stockTrackedExpression} AS is_stock_tracked,
@@ -646,25 +666,29 @@ const getQrMenu = async (req, res) => {
          FROM products
          WHERE tenant_id = $1
            AND ${softDeletePredicate}
-           AND ($2::bigint IS NULL OR branch_id = $2)
+           ${branchFallbackClause}
            AND COALESCE(is_active, true) = true
            AND ${stockVisibilityPredicate}
          ORDER BY name ASC`,
-        [tenantId, branchId],
+        fallbackParams,
       );
       rows = fallbackResult.rows || [];
     }
 
     let categoryRows = [];
     try {
+      const categoryParams = [tenantId];
+      if (supportsBranchCategories) categoryParams.push(branchId);
+      else categoryParams.push(null);
+
       const categoriesResult = await pool.query(
         `SELECT id, name
          FROM categories
          WHERE tenant_id = $1
            AND ${categorySoftDeletePredicate}
-           AND ($2::bigint IS NULL OR branch_id = $2)
+           ${branchCategoriesClause}
          ORDER BY name ASC`,
-        [tenantId, branchId],
+        categoryParams,
       );
       categoryRows = categoriesResult.rows || [];
     } catch (categoriesError) {
@@ -1070,6 +1094,13 @@ const createQrOrder = async (req, res) => {
             : productColumns.has('stock_tracked')
               ? 'COALESCE(stock_tracked, true)'
               : 'true';
+          const supportsProductBranch = productColumns.has('branch_id');
+          const productBranchClause = supportsProductBranch
+            ? 'AND ($3::bigint IS NULL OR branch_id = $3)'
+            : 'AND ($3::bigint IS NULL OR true)';
+          const productParams = [tenantId, productIds];
+          if (supportsProductBranch) productParams.push(branchId);
+          else productParams.push(null);
           const productsResult = await txClient.query(
             `SELECT id, name, price,
               COALESCE(is_service, false) AS is_service,
@@ -1080,10 +1111,10 @@ const createQrOrder = async (req, res) => {
        WHERE tenant_id = $1
          AND id = ANY($2::text[])
          AND ${softDeletePredicate}
-         AND ($3::bigint IS NULL OR branch_id = $3)
+         ${productBranchClause}
          AND COALESCE(is_active, true) = true
        FOR UPDATE OF products`,
-            [tenantId, productIds, branchId],
+            productParams,
           );
 
           const productMap = new Map((productsResult.rows || []).map((row) => [row.id, row]));
@@ -1688,11 +1719,57 @@ const checkoutQrOrder = async (req, res) => {
           const result = await runTransaction(
             client,
             async (txClient) => {
-              const lookup = await txClient.query(
-                `SELECT id, reference_id, receipt_number,
+              const salesColumns = await getTableColumnSet(txClient, 'sales_records');
+              const supportsSalesBranch = salesColumns.has('branch_id');
+              const hasOrderIdParam = !!(orderId && orderId !== '');
+              const hasRefIdParam = !!(referenceId && referenceId !== '');
+              const hasReceiptParam = !!(receiptNumber && receiptNumber !== '');
+
+              const orderMatchParts = [];
+              const params = [tenantId];
+              let branchParamIndex = 0;
+              let orderIdParamIndex = 0;
+              let refIdParamIndex = 0;
+              let receiptParamIndex = 0;
+
+              if (supportsSalesBranch) {
+                branchParamIndex = params.length + 1;
+                params.push(branchId);
+              } else {
+                params.push(null);
+                branchParamIndex = params.length;
+              }
+
+              if (hasOrderIdParam) {
+                orderIdParamIndex = params.length + 1;
+                orderMatchParts.push(`($${orderIdParamIndex}::text <> '' AND id::text = $${orderIdParamIndex})`);
+                params.push(orderId);
+              }
+              if (hasRefIdParam) {
+                refIdParamIndex = params.length + 1;
+                orderMatchParts.push(`($${refIdParamIndex}::text <> '' AND reference_id = $${refIdParamIndex})`);
+                params.push(referenceId);
+              }
+              if (hasReceiptParam) {
+                receiptParamIndex = params.length + 1;
+                orderMatchParts.push(`($${receiptParamIndex}::text <> '' AND receipt_number = $${receiptParamIndex})`);
+                params.push(receiptNumber);
+              }
+
+              if (orderMatchParts.length === 0) {
+                orderMatchParts.push('false');
+              }
+
+              const branchClause = supportsSalesBranch
+                ? `AND ($${branchParamIndex}::bigint IS NULL OR branch_id = $${branchParamIndex})`
+                : `AND ($${branchParamIndex}::bigint IS NULL OR true)`;
+
+              const columnsToSelectBranch = supportsSalesBranch ? 'branch_id,' : 'NULL::bigint AS branch_id,';
+
+              const lookupSql = `SELECT id, reference_id, receipt_number,
                         payment_status, order_status, payment_method,
                         total_amount, total_price,
-                        branch_id,
+                        ${columnsToSelectBranch}
                         table_id,
                         table_number,
                         order_type,
@@ -1700,17 +1777,13 @@ const checkoutQrOrder = async (req, res) => {
                         special_note
                  FROM sales_records
                  WHERE tenant_id = $1
-                   AND ($2::bigint IS NULL OR branch_id = $2)
-                   AND (
-                     ($3::text <> '' AND id::text = $3)
-                     OR ($4::text <> '' AND reference_id = $4)
-                     OR ($5::text <> '' AND receipt_number = $5)
-                   )
+                   ${branchClause}
+                   AND (${orderMatchParts.join(' OR ')})
                  ORDER BY created_at DESC
                  LIMIT 1
-                 FOR UPDATE`,
-                [tenantId, branchId, orderId, referenceId, receiptNumber],
-              );
+                 FOR UPDATE`;
+
+              const lookup = await txClient.query(lookupSql, params);
 
               const sale = lookup.rows?.[0];
               if (!sale) {
