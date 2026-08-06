@@ -4,6 +4,63 @@ const jwt = require('jsonwebtoken');
 let ioInstance = null;
 
 const buildTenantRoom = (tenantId) => `tenant:${tenantId}`;
+const buildDeviceRoom = (deviceUuid) => `device:${deviceUuid}`;
+const buildBranchRoom = (branchId) => `branch:${branchId}`;
+
+const connectedDevices = new Map();
+
+const getConnectedDevices = () => connectedDevices;
+
+const isDeviceOnline = (deviceUuid) => {
+  const entry = connectedDevices.get(deviceUuid);
+  if (!entry) return false;
+  const now = Date.now();
+  const staleThreshold = 120000;
+  return (now - (entry.lastPing || entry.connectedAt || 0)) <= staleThreshold;
+};
+
+const getConnectedDevicesCount = () => {
+  let online = 0;
+  for (const [, entry] of connectedDevices.entries()) {
+    if (isDeviceOnlineByEntry(entry)) online += 1;
+  }
+  return online;
+};
+
+const isDeviceOnlineByEntry = (entry) => {
+  if (!entry) return false;
+  const now = Date.now();
+  const staleThreshold = 120000;
+  return (now - (entry.lastPing || entry.connectedAt || 0)) <= staleThreshold;
+};
+
+const getPerDeviceStatus = () => {
+  const result = {};
+  for (const [deviceUuid, entry] of connectedDevices.entries()) {
+    result[deviceUuid] = isDeviceOnlineByEntry(entry) ? 'online' : 'offline';
+  }
+  return result;
+};
+
+const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
+  if (!ioInstance) return { emitted: false, reason: 'IO_NOT_INITIALIZED' };
+  const posNamespace = ioInstance.of('/pos-relay');
+  const deviceRoom = buildDeviceRoom(targetDeviceUuid);
+  const socketsInRoom = posNamespace.adapter?.rooms?.get(deviceRoom);
+  if (socketsInRoom && socketsInRoom.size > 0) {
+    posNamespace.to(deviceRoom).emit('incoming-web-order', orderPayload);
+    return { emitted: true, target: 'device', room: deviceRoom };
+  }
+  if (branchId) {
+    const branchRoom = buildBranchRoom(branchId);
+    const branchSockets = posNamespace.adapter?.rooms?.get(branchRoom);
+    if (branchSockets && branchSockets.size > 0) {
+      posNamespace.to(branchRoom).emit('incoming-web-order', orderPayload);
+      return { emitted: true, target: 'branch-fallback', room: branchRoom };
+    }
+  }
+  return { emitted: false, reason: 'DEVICE_AND_BRANCH_OFFLINE' };
+};
 
 const extractHandshakeToken = (socket) => {
   const authToken = socket.handshake.auth?.token;
@@ -87,6 +144,69 @@ const initializeSocketServer = (server) => {
     });
   });
 
+  const posRelayNamespace = ioInstance.of('/pos-relay');
+
+  posRelayNamespace.use((socket, next) => {
+    try {
+      const auth = socket.handshake.auth || {};
+      const deviceUuid = (auth.deviceUuid ?? '').toString().trim();
+      const tenantId = (auth.tenantId ?? '').toString().trim();
+      const branchId = (auth.branchId ?? '').toString().trim();
+
+      if (!deviceUuid || !tenantId || !branchId) {
+        return next(new Error('Handshake auth harus menyertakan deviceUuid, tenantId, branchId'));
+      }
+
+      socket.data.posDevice = { deviceUuid, tenantId, branchId };
+      return next();
+    } catch (error) {
+      return next(new Error(error.message || 'Autentikasi POS relay gagal'));
+    }
+  });
+
+  posRelayNamespace.on('connection', (socket) => {
+    const { deviceUuid, tenantId, branchId } = socket.data.posDevice || {};
+    const now = Date.now();
+
+    socket.join(buildDeviceRoom(deviceUuid));
+    socket.join(buildBranchRoom(branchId));
+    socket.join(buildTenantRoom(tenantId));
+
+    connectedDevices.set(deviceUuid, {
+      socketId: socket.id,
+      connectedAt: now,
+      lastPing: now,
+      tenantId,
+      branchId,
+    });
+
+    socket.on('pos-ping', () => {
+      const entry = connectedDevices.get(deviceUuid);
+      if (entry) {
+        entry.lastPing = Date.now();
+        socket.emit('pos-pong', { serverTs: Date.now() });
+      }
+    });
+
+    socket.on('order-acknowledged', (ackPayload = {}) => {
+      const { resolveOrderAcknowledgement } = require('./posOrderQueue');
+      resolveOrderAcknowledgement({
+        submissionId: ackPayload.submissionId,
+        ackStatus: ackPayload.ackStatus || 'POS_PRINTED',
+        ackPayload: ackPayload.ackPayload || ackPayload,
+        deviceUuid,
+        printedAt: ackPayload.printedAt || new Date().toISOString(),
+      }).catch(() => {});
+    });
+
+    socket.on('disconnect', () => {
+      const entry = connectedDevices.get(deviceUuid);
+      if (entry && entry.socketId === socket.id) {
+        entry.lastPing = 0;
+      }
+    });
+  });
+
   return ioInstance;
 };
 
@@ -107,4 +227,12 @@ module.exports = {
   initializeSocketServer,
   emitToTenant,
   buildTenantRoom,
+  buildDeviceRoom,
+  buildBranchRoom,
+  connectedDevices,
+  getConnectedDevices,
+  isDeviceOnline,
+  getConnectedDevicesCount,
+  getPerDeviceStatus,
+  emitIncomingWebOrder,
 };

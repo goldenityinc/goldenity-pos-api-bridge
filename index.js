@@ -5,6 +5,7 @@ const path = require('path');
 require('dotenv').config();
 
 const publicRoutes = require('./src/routes/publicRoutes');
+const posRelayRoutes = require('./src/routes/posRelayRoutes');
 const protectedRoutes = require('./src/routes/protectedRoutes');
 const { tenantResolver } = require('./src/middlewares/tenantResolver');
 const { initializeSocketServer } = require('./src/services/socketServer');
@@ -23,6 +24,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use('/uploads', express.static(path.join(process.cwd(), 'public', 'uploads')));
 
 app.use(publicRoutes);
+app.use('/api/v1/relay', posRelayRoutes);
 app.use(tenantResolver);
 app.use(protectedRoutes);
 
