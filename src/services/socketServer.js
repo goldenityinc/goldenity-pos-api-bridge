@@ -45,54 +45,115 @@ const getPerDeviceStatus = () => {
 const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
   if (!ioInstance) return { emitted: false, reason: 'IO_NOT_INITIALIZED', fallback: null };
   const posNamespace = ioInstance.of('/pos-relay');
-  const deviceRoom = buildDeviceRoom(targetDeviceUuid);
-  const socketsInDeviceRoom = posNamespace.adapter?.rooms?.get(deviceRoom);
-  if (socketsInDeviceRoom && socketsInDeviceRoom.size > 0) {
-    posNamespace.to(deviceRoom).emit('incoming-web-order', orderPayload);
-    return { emitted: true, target: 'device', room: deviceRoom, sockets: socketsInDeviceRoom.size, fallback: 'none' };
-  }
-  let fallbackReason = 'DEVICE_ROOM_EMPTY';
-  let socketsInBranchRoom = null;
-  if (branchId) {
-    const branchRoom = buildBranchRoom(branchId);
-    socketsInBranchRoom = posNamespace.adapter?.rooms?.get(branchRoom);
-    if (socketsInBranchRoom && socketsInBranchRoom.size > 0) {
-      posNamespace.to(branchRoom).emit('incoming-web-order', orderPayload);
-      return { emitted: true, target: 'branch-fallback', room: branchRoom, sockets: socketsInBranchRoom.size, fallback: 'branch', deviceUuid: targetDeviceUuid || null };
-    }
-    fallbackReason = 'DEVICE_AND_BRANCH_ROOMS_EMPTY';
-  }
   const tenantIdFromPayload =
     (orderPayload && typeof orderPayload === 'object' && (orderPayload.tenantId || orderPayload.tenant_id)) ||
     (targetDeviceUuid && connectedDevices.get(targetDeviceUuid)?.tenantId) ||
     '';
-  if (tenantIdFromPayload) {
+
+  // 🔴 CRITICAL FIX 1 — SOCKET BROADCAST:
+  //    SEBELUMNYA: Hanya emit ke 1 targetDeviceUuid room, LALU RETURN!
+  //    Akibatnya device lain (Tablet Printer, PC Kasir Kedua) di BRANCH YANG SAMA
+  //    TIDAK PERNAH menerima event incoming-web-order kalo 1 device default printer online.
+  //    SEKARANG: SELALU BROADCAST KE BRANCH ROOM DULU (ALL devices connected to that branch),
+  //    BARU emit tambahan ke targetDeviceUuid (guaranteed delivery ke printer default).
+  //    JANGAN ada early-return! Semua level room harus di-emit.
+  const stats = {
+    branchEmitted: false,
+    branchSockets: 0,
+    deviceEmitted: false,
+    deviceSockets: 0,
+    tenantEmitted: false,
+    tenantSockets: 0,
+    manualEmitted: false,
+    manualSockets: 0,
+  };
+  let fallbackReason = '';
+
+  // STEP 1 (PRIMARY) — BROADCAST TO ALL DEVICES IN BRANCH ROOM
+  if (branchId) {
+    const branchRoom = buildBranchRoom(branchId);
+    const socketsInBranchRoom = posNamespace.adapter?.rooms?.get(branchRoom);
+    if (socketsInBranchRoom && socketsInBranchRoom.size > 0) {
+      posNamespace.to(branchRoom).emit('incoming-web-order', orderPayload);
+      stats.branchEmitted = true;
+      stats.branchSockets = socketsInBranchRoom.size;
+    } else {
+      fallbackReason = fallbackReason || 'BRANCH_ROOM_EMPTY';
+    }
+  } else {
+    fallbackReason = fallbackReason || 'NO_BRANCH_ID';
+  }
+
+  // STEP 2 (TARGETED DELIVERY) — EMIT DIRECTLY TO TARGET DEVICE ROOM (printer default)
+  //    Jangan RETURN! Hanya tambahan emit guarantee, tidak menggantikan branch broadcast.
+  if (targetDeviceUuid) {
+    const deviceRoom = buildDeviceRoom(targetDeviceUuid);
+    const socketsInDeviceRoom = posNamespace.adapter?.rooms?.get(deviceRoom);
+    if (socketsInDeviceRoom && socketsInDeviceRoom.size > 0) {
+      posNamespace.to(deviceRoom).emit('incoming-web-order', orderPayload);
+      stats.deviceEmitted = true;
+      stats.deviceSockets = socketsInDeviceRoom.size;
+    } else {
+      fallbackReason = fallbackReason || 'DEVICE_ROOM_EMPTY';
+    }
+  }
+
+  // STEP 3 (FALLBACK TENANT) — Jika branch room kosong, coba broadcast ke tenant room
+  if (!stats.branchEmitted && tenantIdFromPayload) {
     const tenantRoom = buildTenantRoom(String(tenantIdFromPayload).trim());
     const socketsInTenantRoom = posNamespace.adapter?.rooms?.get(tenantRoom);
     if (socketsInTenantRoom && socketsInTenantRoom.size > 0) {
       posNamespace.to(tenantRoom).emit('incoming-web-order', orderPayload);
-      return { emitted: true, target: 'tenant-fallback', room: tenantRoom, sockets: socketsInTenantRoom.size, fallback: 'tenant', deviceUuid: targetDeviceUuid || null, branchId: branchId || null };
+      stats.tenantEmitted = true;
+      stats.tenantSockets = socketsInTenantRoom.size;
+    } else {
+      fallbackReason = fallbackReason || 'DEVICE_BRANCH_TENANT_ROOMS_EMPTY';
     }
-    fallbackReason = 'DEVICE_BRANCH_TENANT_ROOMS_EMPTY';
   }
-  const allConnected = Array.from(posNamespace.sockets?.values?.() || []).filter(s => {
-    const d = s.data?.posDevice || {};
-    if (!d.branchId || !d.tenantId) return false;
-    if (branchId && String(d.branchId) === String(branchId)) return true;
-    if (tenantIdFromPayload && String(d.tenantId) === String(tenantIdFromPayload)) return true;
-    return false;
-  });
-  if (allConnected.length > 0) {
-    for (const s of allConnected) {
-      try { s.emit('incoming-web-order', orderPayload); } catch (_) {}
+
+  // STEP 4 (FALLBACK MANUAL ITERATE) — Jika SEMUA room strategy kosong, iterate manual
+  const emittedAny = stats.branchEmitted || stats.deviceEmitted || stats.tenantEmitted;
+  if (!emittedAny) {
+    const allConnected = Array.from(posNamespace.sockets?.values?.() || []).filter(s => {
+      const d = s.data?.posDevice || {};
+      if (!d.branchId || !d.tenantId) return false;
+      if (branchId && String(d.branchId) === String(branchId)) return true;
+      if (tenantIdFromPayload && String(d.tenantId) === String(tenantIdFromPayload)) return true;
+      return false;
+    });
+    if (allConnected.length > 0) {
+      for (const s of allConnected) {
+        try { s.emit('incoming-web-order', orderPayload); } catch (_) {}
+      }
+      stats.manualEmitted = true;
+      stats.manualSockets = allConnected.length;
+    } else {
+      fallbackReason = fallbackReason || 'DEVICE_AND_BRANCH_OFFLINE';
     }
-    return { emitted: true, target: 'manual-iterate-pos-sockets', sockets: allConnected.length, fallback: 'manual-iterate', deviceUuid: targetDeviceUuid || null, branchId: branchId || null, tenantId: tenantIdFromPayload || null };
   }
+
+  const finalEmitted = stats.branchEmitted || stats.deviceEmitted || stats.tenantEmitted || stats.manualEmitted;
+
+  if (finalEmitted) {
+    return {
+      emitted: true,
+      broadcastTo: {
+        branch: stats.branchEmitted ? { count: stats.branchSockets } : null,
+        device: stats.deviceEmitted ? { uuid: targetDeviceUuid || null, count: stats.deviceSockets } : null,
+        tenant: stats.tenantEmitted ? { count: stats.tenantSockets } : null,
+        manual: stats.manualEmitted ? { count: stats.manualSockets } : null,
+      },
+      fallbackReason: fallbackReason || null,
+      targetDeviceUuid: targetDeviceUuid || null,
+      branchId: branchId || null,
+      tenantId: tenantIdFromPayload || null,
+    };
+  }
+
   return {
     emitted: false,
     reason: fallbackReason || 'DEVICE_AND_BRANCH_OFFLINE',
-    deviceRoomSize: socketsInDeviceRoom?.size || 0,
-    branchRoomSize: socketsInBranchRoom?.size || 0,
+    debug: stats,
     debugConnectedDevices: connectedDevices.size,
     debugTargetDeviceUuid: targetDeviceUuid || null,
     debugBranchId: branchId || null,

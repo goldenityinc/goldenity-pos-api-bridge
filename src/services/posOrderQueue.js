@@ -368,14 +368,15 @@ const enqueueWebOrderForPrinting = async ({
   submissionStates.set(cleanSubmissionId, stateEntry);
 
   try {
-    let resolvedTargetDeviceUuid = (targetDeviceUuid || '').toString().trim();
-    if (!resolvedTargetDeviceUuid) {
-      try {
-        resolvedTargetDeviceUuid = (await resolveDefaultPrinterDevice(branchId, tenantId)) || '';
-      } catch (_) {
-        resolvedTargetDeviceUuid = '';
-      }
-    }
+    // 🔴 CRITICAL FIX - BROADCAST TO ENTIRE BRANCH ROOM, NOT ONE DEVICE:
+    //    User melaporkan TABLET Android pake fallback UUID TIDAK PERNAH dapat notif,
+    //    karena sebelumnya logic resolveDefaultPrinterDevice SELALU pilih 1 device
+    //    (Printer Default = Windows PC saja). SEKARANG: PAKSA resolvedTargetDeviceUuid = ''
+    //    supaya emitIncomingWebOrder LANGSUNG broadcast BRANCH ROOM DULU ke SEMUA
+    //    device (Tablet + PC + Printer lain) yang connected di branch itu.
+    //    Frontend aplikasi masing-masing yang decide mau print / tampilkan notif atau tidak.
+    let resolvedTargetDeviceUuid = '';
+    // (Line 373-378 resolveDefaultPrinterDevice DIBYPASS SEMUA)
     stateEntry.resolvedTargetDeviceUuid = resolvedTargetDeviceUuid;
 
     try {
@@ -459,12 +460,17 @@ const onWatchdogTimeout = async (stateEntry, submissionId, tenantId, branchId, d
 
   if (stateEntry.retries <= 0) {
     stateEntry.retries += 1;
-    const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, deviceUuid, orderPayload, transactionId, salesRecordId);
-    const emitResult = emitIncomingWebOrder(deviceUuid, branchId, envelope);
-    if (deviceUuid) {
-      appendLongPollOrder(deviceUuid, branchId, envelope);
-    }
-    startWatchdog(stateEntry, submissionId, tenantId, branchId, deviceUuid, orderPayload, transactionId, salesRecordId);
+    // 🔴 CRITICAL FIX - BROADCAST RETRY KE BRANCH ROOM, BUKAN 1 device:
+    //    Pass deviceUuid = '' supaya emitIncomingWebOrder SELALU broadcast BRANCH.
+    const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
+    const emitResult = emitIncomingWebOrder('', branchId, envelope);
+    // Selalu append ke long-poll branch-level juga (jika ada longpoll clients)
+    const branchKey = `__branch:${branchId}`;
+    const branchBucket = getLongPollBucket(branchKey);
+    branchBucket.push({ ...envelope, queuedAt: Date.now() });
+    if (branchBucket.length > 200) branchBucket.splice(0, branchBucket.length - 200);
+    notifyLongPollWaiters(branchKey);
+    startWatchdog(stateEntry, submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
     return;
   }
 
@@ -554,24 +560,18 @@ const processQueueJob = async (jobData) => {
   const stateEntry = submissionStates.get(submissionId);
   if (stateEntry && stateEntry.resolved) return;
 
-  const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, targetDeviceUuid, orderPayload, transactionId, salesRecordId);
+  const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
 
-  if (targetDeviceUuid) {
-    appendLongPollOrder(targetDeviceUuid, branchId, envelope);
-  }
+  // Selalu append branch-level long-poll (fallback kalau socket mati)
+  const branchKey = `__branch:${branchId}`;
+  const branchBucket = getLongPollBucket(branchKey);
+  branchBucket.push({ ...envelope, queuedAt: Date.now() });
+  if (branchBucket.length > 200) branchBucket.splice(0, branchBucket.length - 200);
+  notifyLongPollWaiters(branchKey);
 
-  const emitResult = emitIncomingWebOrder(targetDeviceUuid, branchId, envelope);
-  if (!emitResult.emitted && targetDeviceUuid && !isDeviceOnline(targetDeviceUuid)) {
-    if (stateEntry && !stateEntry.resolved) {
-      finalizeReject(stateEntry, submissionId, {
-        statusCode: 503,
-        code: 'POS_DEVICE_OFFLINE',
-        message: 'Perangkat printer target tidak online',
-        retryAvailable: true,
-        submissionId,
-      });
-    }
-  }
+  // 🔴 CRITICAL FIX - SELALU emit dengan targetDeviceUuid='' agar BROADCAST BRANCH ROOM DULU.
+  //    Jangan pernah finalize reject "device offline" karena kita sudah BLAST ke seluruh room.
+  const emitResult = emitIncomingWebOrder('', branchId, envelope);
 };
 
 const finalizeResolve = (stateEntry, submissionId, result) => {
