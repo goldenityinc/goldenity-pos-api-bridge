@@ -1,0 +1,13 @@
+version = 1
+
+[phases]
+  [phases.install]
+  cmds = ["npm install --omit=dev --no-audit --no-fund"]
+  dependsOn = ["setup"]
+
+  [phases.build]
+  cmds = ["echo 'Build step OK — no compile step for Node.js Express app'"]
+  dependsOn = ["install"]
+
+[start]
+cmd = "node index.js"
