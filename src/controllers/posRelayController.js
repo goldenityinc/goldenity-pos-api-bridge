@@ -174,6 +174,20 @@ const _submitWebOrderBackgroundWorker = async (args) => {
     });
     try {
       if (submissionStates instanceof Map) {
+        const normalizedTopFields = (() => {
+          try {
+            const payload = (orderPayload && typeof orderPayload === 'object') ? orderPayload : (rawBody || {});
+            const table = payload.table && typeof payload.table === 'object' ? payload.table : {};
+            return Object.freeze({
+              tableId: String(payload.tableId || payload.table_id || table.id || table.tableId || table.table_id || rawBody.tableId || rawBody.table_id || '').trim(),
+              table_id: String(payload.table_id || payload.tableId || table.id || table.table_id || table.tableId || rawBody.table_id || rawBody.tableId || '').trim(),
+              tableNumber: String(payload.tableNumber || payload.table_number || payload.tableName || payload.table_name || payload.tableLabel || table.tableNumber || table.table_number || table.name || table.label || rawBody.tableNumber || rawBody.table || '').trim(),
+              table_number: String(payload.table_number || payload.tableNumber || table.table_number || table.tableNumber || table.name || table.label || rawBody.table || '').trim(),
+            });
+          } catch (_e) {
+            return Object.freeze({ tableId: '', table_id: '', tableNumber: '', table_number: '' });
+          }
+        })();
         submissionStates.set(submissionId, Object.assign(Object.create(null), {
           status: 'PENDING_ACK',
           ackStatus: 'PENDING_ACK',
@@ -184,6 +198,10 @@ const _submitWebOrderBackgroundWorker = async (args) => {
           targetDeviceUuid: targetDeviceUuid || null,
           orderPayload: orderPayload || null,
           envelope: orderPayload,
+          tableId: normalizedTopFields.tableId,
+          table_id: normalizedTopFields.table_id,
+          tableNumber: normalizedTopFields.tableNumber,
+          table_number: normalizedTopFields.table_number,
           createdAt: Date.now(),
           queuedAt: Date.now(),
           _stubBeforeEnqueue: true,

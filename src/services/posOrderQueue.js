@@ -486,16 +486,59 @@ const onWatchdogTimeout = async (stateEntry, submissionId, tenantId, branchId, d
   });
 };
 
-const buildOrderEnvelope = (submissionId, tenantId, branchId, deviceUuid, orderPayload, transactionId, salesRecordId) => ({
-  submissionId,
-  tenantId,
-  branchId,
-  targetDeviceUuid: deviceUuid,
-  orderPayload,
-  transactionId: transactionId || null,
-  salesRecordId: salesRecordId || null,
-  serverTs: Date.now(),
-});
+const normalizeTopLevelOrderEnvelopeFields = (orderPayloadRaw, ctx = {}) => {
+  const payload = (orderPayloadRaw && typeof orderPayloadRaw === 'object') ? orderPayloadRaw : {};
+  const fallback = Object.create(null);
+  Object.assign(fallback, {
+    tableId: payload.tableId || payload.table_id || ctx.tableId || ctx.table_id || '',
+    table_id: payload.table_id || payload.tableId || ctx.table_id || ctx.tableId || '',
+    tableNumber: payload.tableNumber || payload.table_number || payload.tableName || payload.table_name || payload.tableLabel || payload.table_label || payload.tableLabel || ((payload.table && (payload.table.tableNumber || payload.table.table_number || payload.table.name || payload.table.label || '')) || '') || ctx.tableNumber || ctx.table_number || '',
+    table_number: payload.table_number || payload.tableNumber || ((payload.table && (payload.table.table_number || payload.table.tableNumber || payload.table.name || payload.table.label || '')) || '') || ctx.table_number || ctx.tableNumber || '',
+    items: Array.isArray(payload.items) ? payload.items : (Array.isArray(payload.items_json) ? payload.items_json : (Array.isArray(payload.line_items) ? payload.line_items : (Array.isArray(payload.transaction_items) ? payload.transaction_items : []))),
+    transactionId: payload.transactionId || payload.transaction_id || payload.receiptNumber || payload.receipt_number || ctx.transactionId || '',
+    orderId: payload.orderId || payload.order_id || payload.id || payload.salesRecordId || payload.sales_record_id || ctx.salesRecordId || '',
+    receiptNumber: payload.receiptNumber || payload.receipt_number || '',
+    totalAmount: Number.isFinite(payload.totalAmount) ? payload.totalAmount : (Number.isFinite(payload.total_amount) ? payload.total_amount : (Number.isFinite(payload.grandTotal) ? payload.grandTotal : (Number.isFinite(payload.grand_total) ? payload.grand_total : (Number.isFinite(payload.totalPrice) ? payload.totalPrice : (Number.isFinite(payload.total_price) ? payload.total_price : 0))))),
+    grandTotal: Number.isFinite(payload.grandTotal) ? payload.grandTotal : (Number.isFinite(payload.grand_total) ? payload.grand_total : (Number.isFinite(payload.totalAmount) ? payload.totalAmount : (Number.isFinite(payload.total_amount) ? payload.total_amount : 0))),
+    pax: Number.isFinite(payload.pax) ? payload.pax : (Number.isFinite(payload.guestCount) ? payload.guestCount : (Number.isFinite(payload.guests) ? payload.guests : (Number.isFinite(payload.customer_count) ? payload.customer_count : 1))),
+    customerName: String(payload.customerName || payload.customer_name || payload.customer || '').trim(),
+    orderNote: String(payload.orderNote || payload.order_note || payload.notes || payload.specialInstruction || payload.special_instruction || payload.specialNote || payload.special_note || '').trim(),
+    paymentMethod: String(payload.paymentMethod || payload.payment_method || '').trim(),
+    orderType: String(payload.orderType || payload.order_type || payload.ordertype || 'QR_ORDER').toUpperCase(),
+    branchId: String(payload.branchId || payload.branch_id || ctx.branchId || '').trim(),
+    tenantId: String(payload.tenantId || payload.tenant_id || ctx.tenantId || '').trim(),
+  });
+  return fallback;
+};
+
+const buildOrderEnvelope = (submissionId, tenantId, branchId, deviceUuid, orderPayload, transactionId, salesRecordId) => {
+  const normalizedTop = normalizeTopLevelOrderEnvelopeFields(orderPayload, { transactionId, salesRecordId, tenantId, branchId });
+  return {
+    submissionId,
+    tenantId: normalizedTop.tenantId || tenantId,
+    branchId: normalizedTop.branchId || branchId,
+    targetDeviceUuid: deviceUuid,
+    orderPayload: { ...(orderPayload || {}), ...normalizedTop },
+    envelope: normalizedTop,
+    transactionId: normalizedTop.transactionId || transactionId || null,
+    salesRecordId: salesRecordId || normalizedTop.orderId || null,
+    tableId: normalizedTop.tableId,
+    tableNumber: normalizedTop.tableNumber,
+    table_number: normalizedTop.table_number,
+    items: normalizedTop.items,
+    pax: normalizedTop.pax,
+    customerName: normalizedTop.customerName,
+    orderNote: normalizedTop.orderNote,
+    totalAmount: normalizedTop.totalAmount,
+    grandTotal: normalizedTop.grandTotal,
+    subtotal: normalizedTop.grandTotal,
+    paymentMethod: normalizedTop.paymentMethod,
+    orderType: normalizedTop.orderType,
+    receiptNumber: normalizedTop.receiptNumber,
+    referenceId: normalizedTop.orderId,
+    serverTs: Date.now(),
+  };
+};
 
 const processQueueJob = async (jobData) => {
   const {
