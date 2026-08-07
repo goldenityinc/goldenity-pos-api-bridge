@@ -27,6 +27,66 @@ const ADMIN_CORE_TIMEOUT_MS = Number.parseInt(process.env.ADMIN_CORE_API_TIMEOUT
 
 const submissionStates = new Map();
 
+const getUnprocessedPendingOrdersByBranch = (branchId, sinceTsMs) => {
+  const results = [];
+  const branch = (branchId || '').toString().trim();
+  if (!branch) return results;
+  const since = Number(sinceTsMs) || 0;
+  const seen = new Set();
+  for (const [submissionId, s] of submissionStates.entries()) {
+    try {
+      if (!s || seen.has(submissionId)) continue;
+      const sBranch = String((s.branchId) ?? (s.result && s.result.branchId) ?? '').trim();
+      if (!sBranch || sBranch !== branch) continue;
+      const statusRaw =
+        (s.result && (s.result.ackStatus || s.result.status)) ||
+        s.status ||
+        (s.resolved === true && s.result && s.result.ok ? 'POS_ACKNOWLEDGED' : 'PENDING_ACK');
+      const isUnresolvedTerminalAckFail =
+        statusRaw === 'FAILED_DELIVERY' ||
+        statusRaw === 'POS_ACK_TIMEOUT' ||
+        statusRaw === 'TIMEOUT' ||
+        statusRaw === 'POS_DEVICE_OFFLINE' ||
+        statusRaw === 'QUEUE_JOB_FAILED' ||
+        statusRaw === 'QUEUE_RESOLVE_UNKNOWN';
+      const stillPending =
+        s.resolved !== true && (
+          statusRaw === 'PENDING_ACK' ||
+          statusRaw === 'QUEUED_FOR_POS' ||
+          statusRaw === 'PROCESSING' ||
+          statusRaw === null ||
+          statusRaw === undefined ||
+          statusRaw === ''
+        );
+      if (!(stillPending || isUnresolvedTerminalAckFail)) continue;
+      const createdAtMs = Number(s.createdAt || s.enqueuedAt || (s.result && s.result.enqueuedAt) || 0);
+      if (since > 0 && createdAtMs > 0 && createdAtMs <= since) continue;
+      const orderPayload = s.orderPayload || (s.result && s.result.orderPayload) || null;
+      const targetDeviceUuid = s.targetDeviceUuid || s.resolvedTargetDeviceUuid || (s.result && (s.result.targetDeviceUuid || s.result.resolvedTargetDeviceUuid)) || '';
+      const tenantId = String((s.tenantId) ?? (s.result && s.result.tenantId) ?? '').trim();
+      const transactionId = (s.transactionId ?? (s.result && s.result.transactionId) ?? null);
+      const salesRecordId = (s.salesRecordId ?? (s.result && s.result.salesRecordId) ?? null);
+      seen.add(submissionId);
+      results.push({
+        submissionId,
+        tenantId,
+        branchId: sBranch,
+        targetDeviceUuid,
+        orderPayload,
+        transactionId,
+        salesRecordId,
+        serverTs: createdAtMs || Date.now(),
+        queuedAt: createdAtMs || Date.now(),
+        status: statusRaw || 'PENDING_ACK',
+        _replayFromSubmissionStates: true,
+      });
+    } catch (_e) {
+      continue;
+    }
+  }
+  return results;
+};
+
 const longPollBuckets = new Map();
 
 const getLongPollBucket = (deviceUuid) => {
@@ -37,25 +97,46 @@ const getLongPollBucket = (deviceUuid) => {
 };
 
 const appendLongPollOrder = (deviceUuid, branchId, orderEnvelope) => {
-  const bucket = getLongPollBucket(deviceUuid);
-  bucket.push({
-    ...orderEnvelope,
-    queuedAt: Date.now(),
-  });
-  if (bucket.length > 100) {
-    bucket.splice(0, bucket.length - 100);
+  const safeUuid = (deviceUuid || '').toString().trim();
+  if (safeUuid) {
+    const bucket = getLongPollBucket(safeUuid);
+    bucket.push({
+      ...orderEnvelope,
+      queuedAt: Date.now(),
+    });
+    if (bucket.length > 100) {
+      bucket.splice(0, bucket.length - 100);
+    }
+    notifyLongPollWaiters(safeUuid);
   }
   const branchKey = `__branch:${branchId}`;
-  const branchBucket = getLongPollBucket(branchKey);
-  branchBucket.push({
-    ...orderEnvelope,
-    queuedAt: Date.now(),
-  });
-  if (branchBucket.length > 200) {
-    branchBucket.splice(0, branchBucket.length - 200);
+  const tenantId =
+    (orderEnvelope && typeof orderEnvelope === 'object' && (orderEnvelope.tenantId || orderEnvelope.tenant_id)) ||
+    (safeUuid && connectedDevices.get(safeUuid)?.tenantId) ||
+    '';
+  const tenantKey = `__tenant:${tenantId}`;
+  if (branchId) {
+    const branchBucket = getLongPollBucket(branchKey);
+    branchBucket.push({
+      ...orderEnvelope,
+      queuedAt: Date.now(),
+    });
+    if (branchBucket.length > 200) {
+      branchBucket.splice(0, branchBucket.length - 200);
+    }
+    notifyLongPollWaiters(branchKey);
   }
-  notifyLongPollWaiters(deviceUuid);
-  notifyLongPollWaiters(branchKey);
+  if (tenantId) {
+    const tenantBucket = getLongPollBucket(tenantKey);
+    tenantBucket.push({
+      ...orderEnvelope,
+      queuedAt: Date.now(),
+    });
+    if (tenantBucket.length > 300) {
+      tenantBucket.splice(0, tenantBucket.length - 300);
+    }
+    notifyLongPollWaiters(tenantKey);
+  }
 };
 
 const longPollWaiters = new Map();
@@ -580,18 +661,42 @@ const resolveOrderAcknowledgement = async ({
 };
 
 const pollIncomingOrders = async ({ deviceUuid, tenantId, branchId, sinceTs }) => {
+  const normalizeSinceTsMs = (raw) => {
+    if (raw === undefined || raw === null || raw === '') return 0;
+    if (typeof raw === 'number' && Number.isFinite(raw)) return Math.max(0, Math.floor(raw));
+    const asStr = String(raw).trim();
+    if (!asStr) return 0;
+    const asNum = Number(asStr);
+    if (Number.isFinite(asNum) && asStr.length >= 10 && !asStr.includes('-') && !asStr.includes('T')) {
+      return Math.max(0, Math.floor(asNum));
+    }
+    try {
+      const asDate = new Date(asStr);
+      if (asDate instanceof Date && !Number.isNaN(asDate.valueOf())) {
+        return Math.max(0, Math.floor(asDate.valueOf()));
+      }
+    } catch (_isoErr) {}
+    try {
+      const n = Number(asStr);
+      if (Number.isFinite(n)) return Math.max(0, Math.floor(n));
+    } catch (_) {}
+    return 0;
+  };
   const orders = [];
-  const since = Number(sinceTs) || 0;
-  if (deviceUuid) {
-    const bucket = getLongPollBucket(deviceUuid);
+  const since = normalizeSinceTsMs(sinceTs);
+  const tenant = (tenantId || '').toString().trim();
+  const branch = (branchId || '').toString().trim();
+  const device = (deviceUuid || '').toString().trim();
+  if (device) {
+    const bucket = getLongPollBucket(device);
     for (const item of bucket) {
       if (!since || (item.queuedAt || 0) > since) {
         orders.push(item);
       }
     }
   }
-  if (branchId) {
-    const branchKey = `__branch:${branchId}`;
+  if (branch) {
+    const branchKey = `__branch:${branch}`;
     const bucket = getLongPollBucket(branchKey);
     for (const item of bucket) {
       if (!since || (item.queuedAt || 0) > since) {
@@ -601,17 +706,36 @@ const pollIncomingOrders = async ({ deviceUuid, tenantId, branchId, sinceTs }) =
       }
     }
   }
-
+  if (tenant) {
+    const tenantKey = `__tenant:${tenant}`;
+    const bucket = getLongPollBucket(tenantKey);
+    for (const item of bucket) {
+      if (!since || (item.queuedAt || 0) > since) {
+        if (!orders.find((x) => x.submissionId === item.submissionId)) {
+          orders.push(item);
+        }
+      }
+    }
+  }
+  if (branch) {
+    const replayFromStates = getUnprocessedPendingOrdersByBranch(branch, since || 0);
+    for (const r of replayFromStates) {
+      if (!orders.find((x) => x.submissionId === r.submissionId)) {
+        orders.push(r);
+      }
+    }
+  }
   if (orders.length > 0) {
     return { orders, returnedAt: Date.now() };
   }
 
   const waiters = [];
   const keysToWait = [];
-  if (deviceUuid) keysToWait.push(deviceUuid);
-  if (branchId) keysToWait.push(`__branch:${branchId}`);
+  if (device) keysToWait.push(device);
+  if (branch) keysToWait.push(`__branch:${branch}`);
+  if (tenant) keysToWait.push(`__tenant:${tenant}`);
 
-  const MAX_WAIT_MS = 25000;
+  const MAX_WAIT_MS = 15000;
   return new Promise((resolve) => {
     let resolved = false;
     const doResolve = () => {
@@ -623,22 +747,41 @@ const pollIncomingOrders = async ({ deviceUuid, tenantId, branchId, sinceTs }) =
         if (idx >= 0) list.splice(idx, 1);
       }
       const finalOrders = [];
-      if (deviceUuid) {
-        const bucket = getLongPollBucket(deviceUuid);
+      if (device) {
+        const bucket = getLongPollBucket(device);
         for (const item of bucket) {
           if (!since || (item.queuedAt || 0) > since) {
             finalOrders.push(item);
           }
         }
       }
-      if (branchId) {
-        const branchKey = `__branch:${branchId}`;
+      if (branch) {
+        const branchKey = `__branch:${branch}`;
         const bucket = getLongPollBucket(branchKey);
         for (const item of bucket) {
           if (!since || (item.queuedAt || 0) > since) {
             if (!finalOrders.find((x) => x.submissionId === item.submissionId)) {
               finalOrders.push(item);
             }
+          }
+        }
+      }
+      if (tenant) {
+        const tenantKey = `__tenant:${tenant}`;
+        const bucket = getLongPollBucket(tenantKey);
+        for (const item of bucket) {
+          if (!since || (item.queuedAt || 0) > since) {
+            if (!finalOrders.find((x) => x.submissionId === item.submissionId)) {
+              finalOrders.push(item);
+            }
+          }
+        }
+      }
+      if (branch) {
+        const replayFromStates = getUnprocessedPendingOrdersByBranch(branch, since || 0);
+        for (const r of replayFromStates) {
+          if (!finalOrders.find((x) => x.submissionId === r.submissionId)) {
+            finalOrders.push(r);
           }
         }
       }
@@ -748,4 +891,5 @@ module.exports = {
   submissionStates,
   getOrderSubmissionState,
   adminCoreFetch,
+  getUnprocessedPendingOrdersByBranch,
 };

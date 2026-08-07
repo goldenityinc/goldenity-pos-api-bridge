@@ -174,7 +174,7 @@ const _submitWebOrderBackgroundWorker = async (args) => {
     });
     try {
       if (submissionStates instanceof Map) {
-        submissionStates.set(submissionId, Object.freeze({
+        submissionStates.set(submissionId, Object.assign(Object.create(null), {
           status: 'PENDING_ACK',
           ackStatus: 'PENDING_ACK',
           submissionId,
@@ -182,7 +182,9 @@ const _submitWebOrderBackgroundWorker = async (args) => {
           tenantId,
           branchId,
           targetDeviceUuid: targetDeviceUuid || null,
+          orderPayload: orderPayload || null,
           envelope: orderPayload,
+          createdAt: Date.now(),
           queuedAt: Date.now(),
           _stubBeforeEnqueue: true,
         }));
@@ -198,7 +200,7 @@ const _submitWebOrderBackgroundWorker = async (args) => {
       // Tulis status FAILED_DELIVERY ke cache untuk ack-status polling.
       try {
         if (submissionStates instanceof Map) {
-          submissionStates.set(submissionId, Object.freeze({
+          submissionStates.set(submissionId, Object.assign(Object.create(null), {
             status: 'FAILED_DELIVERY',
             ackStatus: 'FAILED_DELIVERY',
             submissionId,
@@ -206,7 +208,9 @@ const _submitWebOrderBackgroundWorker = async (args) => {
             tenantId,
             branchId,
             targetDeviceUuid: targetDeviceUuid || null,
-            failedAt: new Date().toISOString(),
+            orderPayload: orderPayload || null,
+            createdAt: Date.now(),
+            failedAt: Date.now(),
             failedReason:
               (_enqueueErr && (_enqueueErr.code || _enqueueErr.message))
                 ? String((_enqueueErr.code ? _enqueueErr.code + ': ' : '') + (_enqueueErr.message || '')).slice(0, 400)
