@@ -62,18 +62,90 @@ const submitWebOrderToPos = async (req, res) => {
       });
     }
 
-    // 🔴 [FIX STUCK 15% WEB ORDERING - SUPER AGGRESSIVE NON-BLOCKING PATTERN]
-    //    Previous blocking `await enqueueWebOrderForPrinting` caused HTTP PENDING FOREVER 30s+.
-    //    Strategy pattern yang TIDAK BISA GAGAL:
-    //    (A) SINKRON - IDEMPOTENCY CHECK + RESPONSE 202 DIKIRIM TERLEBIH DAHULU.
-    //    (B) ASINKRON - Setelah response END, jalankan enqueue di background event loop.
-    //    Gunakan `setTimeout(fn, 0)` (LEBIH KUAT detach dari setImmediate) +
-    //    process.nextTick() double guard agar tidak blokir HTTP response stream flush.
-    const etaPromise = estimateEtaSeconds();
+    // =====================================================
+    // 🔥🔥🔥 [FIX ABSOLUTE FIRE-AND-FORGET - CRITICAL] 🔥🔥🔥
+    // User Report: POST /web-order MASIH PENDING FOREVER (stuck 15%).
+    // Root Cause: `estimateEtaSeconds()` and `await etaPromise` BEFORE 202 response
+    //             causes BullMQ/Redis connection to BLOCK the HTTP response stream!
+    //             Even `submissionStates` lookup can trigger Queue/Bull init.
+    // Solution EXACTLY per user spec:
+    //   1. SEND RESPONSE 202 IMMEDIATELY AT THE VERY TOP (right after validation!)
+    //   2. ZERO awaits for queue/BullMQ/Redis/enqueue BEFORE response.
+    //   3. All background work via `setTimeout(..., 0)` ABSOLUTE detach.
+    // =====================================================
 
-    // 1️⃣ IDEMPOTENCY CHECK DULU (SYNCHRONOUS, sebelum response):
+    // 1️⃣ ✅ SEND HTTP RESPONSE FIRST. IMMEDIATELY. NO AWAITS ABOVE THIS LINE.
+    //    User Network Tab: POST web-order status = 202 Accepted < 500ms.
+    //    No queue operations, no Redis, no BullMQ touched before this.
+    const transactionId = body.transactionId || body.transaction_id || null;
+    const pollHintByTx =
+      transactionId
+        ? `/api/v1/relay/orders/by-transaction/${encodeURIComponent(String(transactionId))}`
+        : '';
+    res.status(202).json({
+      ok: true,
+      ackStatus: 'PENDING_ACK',
+      message:
+        'Pesanan diterima Bridge POS. Jalur enqueue berjalan di background (fire-and-forget absolute). Silakan polling ack-status setiap 2 detik.',
+      submissionId,
+      transactionId,
+      etaNextQueue: 0,
+      pollIntervalMs: 2000,
+      pollHintUrls: {
+        bySubmissionId: `/api/v1/relay/orders/by-submission/${encodeURIComponent(submissionId)}/ack-status`,
+        byTransactionId: pollHintByTx,
+      },
+    });
+
+    // 2️⃣ 💻 BACKGROUND PROCESSING - ABSOLUTE DETACH.
+    //    - setTimeout(fn, 0): pastikan response socket flush DULU sebelum CPU queue.
+    //    - No await wrapping, no return, no catch propagate to request.
+    setTimeout(() => {
+      _submitWebOrderBackgroundWorker({
+        submissionId,
+        tenantId,
+        branchId,
+        transactionId,
+        targetDeviceUuid: body.targetDeviceUuid ? String(body.targetDeviceUuid).trim() : undefined,
+        orderPayload: body.orderPayload || body.order_payload || body,
+        salesRecordId: body.salesRecordId || body.sales_record_id || null,
+        rawBody: body,
+      });
+    }, 0);
+  } catch (err) {
+    try {
+      if (!res.headersSent) {
+        return res.status(500).json({
+          ok: false,
+          error: 'INTERNAL_ERROR',
+          message: err && err.message ? err.message : 'Internal server error',
+          retryAvailable: true,
+        });
+      }
+    } catch (_) { /* fail open */ }
+    console.error('[posRelayController] submitWebOrderToPos outer catch (after response sent unlikely):', err && err.stack ? err.stack : err);
+  }
+};
+
+// ==========================================================
+// 🧰 BACKGROUND WORKER (ABSOLUTE DETACH FROM HTTP REQUEST)
+// Semua code yang berhubungan dengan Queue, BullMQ, Redis,
+// submissionStates cache, estimateEta, enqueueWebOrderForPrinting
+// PINDAH KESINI SEMUA. TIDAK BOLEH blocking request lifecycle!
+// ==========================================================
+const _submitWebOrderBackgroundWorker = async (args) => {
+  const { submissionId, tenantId, branchId, transactionId, targetDeviceUuid, orderPayload, salesRecordId } = args;
+  try {
+    // (A) Idempotency cache check (BACKGROUND ONLY):
     let existingState = null;
-    try { existingState = getOrderSubmissionState(submissionId) || submissionStates.get(submissionId) || null; } catch(_) { existingState = null; }
+    try {
+      existingState =
+        (typeof getOrderSubmissionState === 'function' ? getOrderSubmissionState(submissionId) : null) ||
+        (submissionStates instanceof Map ? submissionStates.get(submissionId) : null) ||
+        null;
+    } catch (_) { existingState = null; }
+
+    // Jika SUDAH terminal state → tidak perlu enqueue ulang.
     if (existingState) {
       const cachedStatus = String(
         existingState.status ||
@@ -82,137 +154,84 @@ const submitWebOrderToPos = async (req, res) => {
         existingState.state ||
         'PENDING_ACK',
       ).toUpperCase();
-      let etaCached = 0;
-      try { etaCached = Number(await etaPromise.catch(() => 0)) || 0; } catch(_) { etaCached = 0; }
-      try { res.setHeader('X-Queue-Eta', String(etaCached)); } catch(_) {}
       const alreadyTerminal =
         cachedStatus === 'POS_PRINTED' ||
         cachedStatus === 'POS_ACKNOWLEDGED' ||
         cachedStatus === 'FAILED_DELIVERY' ||
         cachedStatus === 'TIMEOUT';
-      if (alreadyTerminal) {
-        return res.status(200).json({
-          ok: true,
-          _fromCache: true,
-          ackStatus: cachedStatus,
-          resolvedDeviceUuid: existingState.resolvedDeviceUuid || existingState.targetDeviceUuid || null,
-          acknowledgedAt: existingState.resolvedAt || existingState.ackedAt || existingState.printedAt || null,
-          failedDeliveryAt: existingState.failedAt || null,
-          submissionId,
-          etaNextQueue: etaCached,
-          detail: existingState,
-        });
-      }
-      return res.status(202).json({
-        ok: true,
-        _fromCache: true,
-        ackStatus: cachedStatus,
-        message: 'Pesanan sedang diantrikan di POS (cache idempotency). Silakan poll ack-status untuk update.',
-        submissionId,
-        etaNextQueue: etaCached,
-        pollHintUrl: `/api/v1/relay/orders/by-submission/${encodeURIComponent(submissionId)}/ack-status`,
-      });
+      if (alreadyTerminal) return;
     }
 
-    // 🔴 2️⃣ [PENTING!] SEMENTARA TULIS submissionId PENDING ke SUBMISSION STATES AGAR IDEMPOTENCY
-    //    TIDAK RACE CONDITION (setelah response dikirim tapi enqueue belum jalan user Retry).
+    // (B) Tulis stub idempotency PENDING_ACK ke cache:
     const enqueueArgs = Object.freeze({
       tenantId,
       branchId,
-      targetDeviceUuid: body.targetDeviceUuid ? String(body.targetDeviceUuid).trim() : undefined,
-      orderPayload: body.orderPayload || body.order_payload || body,
+      targetDeviceUuid,
+      orderPayload,
       submissionId,
-      transactionId: body.transactionId || body.transaction_id || null,
-      salesRecordId: body.salesRecordId || body.sales_record_id || null,
+      transactionId,
+      salesRecordId,
     });
     try {
-      submissionStates.set(submissionId, Object.freeze({
-        status: 'PENDING_ACK',
-        ackStatus: 'PENDING_ACK',
-        submissionId,
-        transactionId: enqueueArgs.transactionId,
-        tenantId,
-        branchId,
-        targetDeviceUuid: enqueueArgs.targetDeviceUuid || null,
-        envelope: enqueueArgs.orderPayload,
-        queuedAt: Date.now(),
-        _stubBeforeEnqueue: true,
-      }));
-    } catch(_submissionCacheErr) {
-      // Fail open: cache gagal tulis → lanjut response saja, tidak fatal.
+      if (submissionStates instanceof Map) {
+        submissionStates.set(submissionId, Object.freeze({
+          status: 'PENDING_ACK',
+          ackStatus: 'PENDING_ACK',
+          submissionId,
+          transactionId,
+          tenantId,
+          branchId,
+          targetDeviceUuid: targetDeviceUuid || null,
+          envelope: orderPayload,
+          queuedAt: Date.now(),
+          _stubBeforeEnqueue: true,
+        }));
+      }
+    } catch (_submissionCacheErr) {
+      // Fail open: cache gagal tulis → lanjut enqueue.
     }
 
-    // 🔴 3️⃣ [WAJIB!] KIRIM HTTP RESPONSE SEKARANG - SEBELUM BACKGROUND ENQUEUE.
-    //    Ini menjamin Network Tab browser TIDAK LAGI PENDING FOREVER.
-    let etaAccepted = 0;
-    try { etaAccepted = Number(await etaPromise.catch(() => 0)) || 0; } catch(_) { etaAccepted = 0; }
-    try { res.setHeader('X-Queue-Eta', String(etaAccepted)); } catch(_) {}
-    let connectedCount = 0;
-    let perDeviceSnap = Object.create(null);
-    try { connectedCount = Number(getConnectedDevicesCount() || 0); } catch(_) { connectedCount = 0; }
-    try { perDeviceSnap = getPerDeviceStatus() || Object.create(null); } catch(_) { perDeviceSnap = Object.create(null); }
-    // 🔴 Send response to client NOW:
-    res.status(202).json({
-      ok: true,
-      ackStatus: 'PENDING_ACK',
-      message: 'Pesanan berhasil masuk antrian Bridge POS. Silakan polling status ack-status setiap 2 detik.',
-      submissionId,
-      transactionId: enqueueArgs.transactionId,
-      etaNextQueue: etaAccepted,
-      pollIntervalMs: 2000,
-      pollHintUrls: {
-        bySubmissionId: `/api/v1/relay/orders/by-submission/${encodeURIComponent(submissionId)}/ack-status`,
-        byTransactionId: `/api/v1/relay/orders/by-transaction/${encodeURIComponent(
-          enqueueArgs.transactionId || String(body.transactionId || ''),
-        )}`,
-      },
-      connectedDevicesOnline: connectedCount,
-      perDeviceStatus: perDeviceSnap,
-    });
-
-    // 🔴 4️⃣ BARU SETELAH RESPONSE TERKIRIM: Jalankan enqueue DI BACKGROUND.
-    //    2x async detachment: process.nextTick() di dalam setTimeout(fn, 0)
-    //    untuk pastikan HTTP socket buffer FLUSH duluan sebelum CPU enqueue.
-    setTimeout(() => {
-      process.nextTick(async () => {
-        try {
-          await enqueueWebOrderForPrinting(enqueueArgs);
-        } catch (_enqueueErr) {
-          try {
-            submissionStates.set(submissionId, Object.freeze({
-              status: 'FAILED_DELIVERY',
-              ackStatus: 'FAILED_DELIVERY',
-              submissionId,
-              transactionId: enqueueArgs.transactionId,
-              tenantId,
-              branchId,
-              targetDeviceUuid: enqueueArgs.targetDeviceUuid || null,
-              failedAt: new Date().toISOString(),
-              failedReason:
-                (_enqueueErr && (_enqueueErr.code || _enqueueErr.message))
-                  ? String((_enqueueErr.code ? _enqueueErr.code + ': ' : '') + (_enqueueErr.message || '')).slice(0, 400)
-                  : 'ENQUEUE_BACKGROUND_ERROR',
-              retryAvailable: true,
-              envelope: enqueueArgs.orderPayload,
-            }));
-          } catch(_cacheWriteErr) { /* fail open */ }
-          try {
-            console.error(
-              '[posRelayController] background enqueue ERROR (visible via ack-status poll FAILED_DELIVERY):',
-              _enqueueErr && _enqueueErr.stack ? String(_enqueueErr.stack).slice(0, 1200) : String(_enqueueErr || ''),
-              { submissionId, tenantId, branchId },
-            );
-          } catch(_logErr) { /* fail open, never crash event loop */ }
+    // (C) Enqueue untuk POS print (ABSOLUTE FIRE-AND-FORGET):
+    try {
+      await enqueueWebOrderForPrinting(enqueueArgs);
+    } catch (_enqueueErr) {
+      // Tulis status FAILED_DELIVERY ke cache untuk ack-status polling.
+      try {
+        if (submissionStates instanceof Map) {
+          submissionStates.set(submissionId, Object.freeze({
+            status: 'FAILED_DELIVERY',
+            ackStatus: 'FAILED_DELIVERY',
+            submissionId,
+            transactionId,
+            tenantId,
+            branchId,
+            targetDeviceUuid: targetDeviceUuid || null,
+            failedAt: new Date().toISOString(),
+            failedReason:
+              (_enqueueErr && (_enqueueErr.code || _enqueueErr.message))
+                ? String((_enqueueErr.code ? _enqueueErr.code + ': ' : '') + (_enqueueErr.message || '')).slice(0, 400)
+                : 'ENQUEUE_BACKGROUND_ERROR',
+            retryAvailable: true,
+            envelope: orderPayload,
+          }));
         }
-      });
-    }, 0);
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: 'INTERNAL_ERROR',
-      message: err.message || 'Internal server error',
-      retryAvailable: true,
-    });
+      } catch (_cacheWriteErr) { /* fail open */ }
+      try {
+        console.error(
+          '[posRelayController] _submitWebOrderBackgroundWorker enqueue ERROR (visible via ack-status poll FAILED_DELIVERY):',
+          _enqueueErr && _enqueueErr.stack ? String(_enqueueErr.stack).slice(0, 1500) : String(_enqueueErr || ''),
+          { submissionId, tenantId, branchId },
+        );
+      } catch (_logErr) { /* fail open, never crash event loop */ }
+    }
+  } catch (_workerOuterErr) {
+    try {
+      console.error(
+        '[posRelayController] _submitWebOrderBackgroundWorker OUTER CATCH (unknown worker fatal, swallow):',
+        _workerOuterErr && _workerOuterErr.stack ? String(_workerOuterErr.stack).slice(0, 2000) : String(_workerOuterErr || ''),
+        { submissionId },
+      );
+    } catch (_) { /* fail open */ }
   }
 };
 
