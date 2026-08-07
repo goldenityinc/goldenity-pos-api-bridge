@@ -97,11 +97,58 @@ const resolveProductMutationTarget = async ({
   payload,
   tenantId,
 }) => {
+  const rawIdStr = (idValue ?? '').toString().trim();
+
   if (table !== 'products' || idField !== 'id') {
-    return { idField, idValue };
+    if (idField !== 'id' || /^\d+$/.test(rawIdStr) || table !== 'sales_records') {
+      return { idField, idValue };
+    }
+
+    const candidateFallbackFields = ['reference_id', 'receipt_number'];
+    if (rawIdStr.startsWith('TX-')) {
+      candidateFallbackFields.unshift('receipt_number');
+    }
+    const columnSet = (await getTableColumnSet(tenantDb, table)) || new Set();
+
+    const fallbackFields = candidateFallbackFields.filter((f) => columnSet.has(f));
+    for (const f of fallbackFields) {
+      try {
+        const rows = await runSelect(tenantDb, table, {
+          [`eq__${f}`]: rawIdStr,
+          maybeSingle: true,
+        }, { tenantId });
+        const existingId = (rows?.id ?? '').toString().trim();
+        if (/^\d+$/.test(existingId)) {
+          return { idField: 'id', idValue: existingId };
+        }
+      } catch (_selectErr) {
+        continue;
+      }
+    }
+
+    for (const f of fallbackFields) {
+      try {
+        const stripped = rawIdStr.startsWith('TX-') || rawIdStr.startsWith('tx-')
+          ? rawIdStr.slice(3)
+          : rawIdStr;
+        if (!stripped) continue;
+        const rows = await runSelect(tenantDb, table, {
+          [`eq__${f}`]: stripped,
+          maybeSingle: true,
+        }, { tenantId });
+        const existingId = (rows?.id ?? '').toString().trim();
+        if (/^\d+$/.test(existingId)) {
+          return { idField: 'id', idValue: existingId };
+        }
+      } catch (_stripErr) {
+        continue;
+      }
+    }
+
+    return { idField, idValue: idValue };
   }
 
-  const normalizedId = (idValue ?? '').toString().trim();
+  const normalizedId = rawIdStr;
   if (/^\d+$/.test(normalizedId)) {
     return { idField, idValue: normalizedId };
   }
@@ -2090,12 +2137,62 @@ const deleteRecordById = async (req, res) => {
       table,
       tenantId,
       async () => {
-        const idField = req.query.idField || 'id';
+        const idFieldRaw = req.query.idField || 'id';
+        const idValueRaw = req.params.id;
+        const idStr = (idValueRaw ?? '').toString().trim();
         const columnSet = await getTableColumnSet(req.tenantDb, table);
+        const needBigintFallback = table === 'sales_records' && idFieldRaw === 'id' && !/^\d+$/.test(idStr);
+        let resolvedIdField = idFieldRaw;
+        let resolvedIdValue = idValueRaw;
+
+        if (needBigintFallback) {
+          const candidateFallbackFields = ['reference_id', 'receipt_number'];
+          if (idStr.startsWith('TX-') || idStr.startsWith('tx-')) {
+            candidateFallbackFields.unshift('receipt_number');
+          }
+          const fallbackFields = candidateFallbackFields.filter((f) => columnSet.has(f));
+          let foundBigintId = null;
+          for (const f of fallbackFields) {
+            try {
+              const row = await runSelect(req.tenantDb, table, {
+                [`eq__${f}`]: idStr,
+                maybeSingle: true,
+              }, { tenantId });
+              const existingId = (row?.id ?? '').toString().trim();
+              if (/^\d+$/.test(existingId)) {
+                foundBigintId = existingId;
+                break;
+              }
+            } catch (_) {}
+            try {
+              const stripped = idStr.startsWith('TX-') || idStr.startsWith('tx-')
+                ? idStr.slice(3)
+                : idStr;
+              if (!stripped) continue;
+              const row = await runSelect(req.tenantDb, table, {
+                [`eq__${f}`]: stripped,
+                maybeSingle: true,
+              }, { tenantId });
+              const existingId = (row?.id ?? '').toString().trim();
+              if (/^\d+$/.test(existingId)) {
+                foundBigintId = existingId;
+                break;
+              }
+            } catch (_) {}
+          }
+          if (foundBigintId !== null) {
+            resolvedIdField = 'id';
+            resolvedIdValue = foundBigintId;
+          } else if (fallbackFields[0]) {
+            resolvedIdField = fallbackFields[0];
+            resolvedIdValue = idStr;
+          }
+        }
+
         const { sql, values } = buildDeleteQuery(
           table,
-          idField,
-          req.params.id,
+          resolvedIdField,
+          resolvedIdValue,
           { tenantId, hasTenantColumn: columnSet.has('tenant_id') },
         );
         return req.tenantDb.query(sql, values);
