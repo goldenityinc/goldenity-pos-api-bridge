@@ -479,6 +479,46 @@ const normalizePayloadByColumnDefinitions = (payload, columnDefinitions) => {
   return normalizeObjectByColumnDefinitions(payload, columnDefinitions);
 };
 
+const _looksLikeNonBigintStringId = (val) =>
+  typeof val === 'string' && val.trim().length > 2 && !/^\d+$/.test(val.trim());
+
+const _detectAndRewriteBigintFallback = (scopedQuery, columnSet) => {
+  const candidateKeys = [
+    'eq__id', 'in__id', 'ne__id', 'lt__id', 'lte__id', 'gt__id', 'gte__id',
+    'eq__sales_record_id', 'in__sales_record_id',
+    'eq__recordId', 'eq__record_id',
+    'eq__salesRecordId', 'eq__sales_record_id',
+    'eq__transaction_id', 'in__transaction_id',
+    'eq__salesRecord', 'eq__sales_record',
+  ];
+  const rewritePairs = [
+    { from: /^eq__(id|sales_record_id|recordId|record_id|salesRecordId|sales_record_id|transaction_id|salesRecord|sales_record)$/, to: 'eq__receipt_number' },
+    { from: /^in__(id|sales_record_id|transaction_id)$/, to: 'in__receipt_number' },
+    { from: /^ne__(id)$/, to: 'ne__receipt_number' },
+    { from: /^(lt|lte|gt|gte)__(id)$/, to: (m, op) => `${op}__receipt_number` },
+  ];
+  if (!columnSet || !(columnSet instanceof Set) || !columnSet.has('receipt_number')) {
+    return null;
+  }
+  let touched = false;
+  const next = {};
+  for (const k of Object.keys(scopedQuery || {})) {
+    const v = scopedQuery[k];
+    let newKey = k;
+    if (candidateKeys.includes(k) && _looksLikeNonBigintStringId(Array.isArray(v) ? (v[0] ?? '') : v)) {
+      for (const pair of rewritePairs) {
+        if (typeof pair.to === 'function' ? pair.from.test(k) : pair.from.test(k)) {
+          newKey = typeof pair.to === 'function' ? k.replace(pair.from, pair.to) : pair.to;
+          touched = true;
+          break;
+        }
+      }
+    }
+    next[newKey] = v;
+  }
+  return touched ? next : null;
+};
+
 const runSelect = async (tenantDb, table, query = {}, options = {}) => {
   const tenantId = normalizeTenantId(options.tenantId);
 
@@ -507,8 +547,48 @@ const runSelect = async (tenantDb, table, query = {}, options = {}) => {
 
   scopedQuery = sanitizeSelectQueryByColumnSet(scopedQuery, columnSet);
 
-  const { sql, values } = buildSelectQuery(table, scopedQuery);
-  const result = await tenantDb.query(sql, values);
+  const attempts = [];
+  const primarySqlObj = buildSelectQuery(table, scopedQuery);
+  attempts.push({
+    label: 'primary',
+    sql: primarySqlObj.sql,
+    values: primarySqlObj.values,
+  });
+
+  const fallbackRewrite = _detectAndRewriteBigintFallback(scopedQuery, columnSet);
+  if (fallbackRewrite) {
+    const sanitized = sanitizeSelectQueryByColumnSet(fallbackRewrite, columnSet);
+    const f = buildSelectQuery(table, sanitized);
+    attempts.push({
+      label: 'fallback-receipt_number',
+      sql: f.sql,
+      values: f.values,
+    });
+  }
+
+  let lastError = null;
+  let result = null;
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i];
+    try {
+      result = await tenantDb.query(attempt.sql, attempt.values);
+      lastError = null;
+      break;
+    } catch (err) {
+      const code = String(err?.code ?? err?.pgCode ?? err?.name ?? '').trim();
+      lastError = err;
+      if (code !== '22P02') {
+        throw err;
+      }
+      if (i === attempts.length - 1) {
+        throw err;
+      }
+    }
+  }
+
+  if (!result && lastError) {
+    throw lastError;
+  }
 
   if (toBool(query.single)) {
     if (result.rows.length !== 1) {
