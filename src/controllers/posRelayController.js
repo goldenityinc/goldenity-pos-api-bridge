@@ -5,6 +5,8 @@ const {
   getQueuePendingCount,
   getQueueLengthPerBranch,
   estimateEtaSeconds,
+  submissionStates,
+  getOrderSubmissionState,
 } = require('../services/posOrderQueue');
 const {
   getConnectedDevicesCount,
@@ -60,85 +62,105 @@ const submitWebOrderToPos = async (req, res) => {
       });
     }
 
+    // 🔴 [FIX STUCK 15% WEB ORDERING]
+    //    Blocking async await enqueueWebOrderForPrinting MENYEBABKAN HTTP response TIDAK DIKIRIM
+    //    SAMPAI POS ACK atau timeout 30 detik penuh → browser menampilkan "Mengirim ke kasir..."
+    //    stuck 15% FOREVER (HTTP PENDING dari Network Tab screenshot user).
+    //    SOLUSI QUEUE PATTERN YANG BENAR:
+    //    1) Check IDEMPOTENCY CACHE dulu (jika submissionId SUDAH ADA result → return SEGERA).
+    //    2) ENQUEUE di BACKGROUND (TANPA await = fire & forget async) dengan .catch handler.
+    //    3) KEMBALIKAN RESPONSE 202 ACCEPTED SEGERA (PENDING_ACK) ke client dalam < 500ms.
+    //    4) Client polling ack-status 2s interval untuk detect POS_PRINTED (sudah implement).
     const etaPromise = estimateEtaSeconds();
 
-    try {
-      const result = await enqueueWebOrderForPrinting({
-        tenantId,
-        branchId,
-        targetDeviceUuid: body.targetDeviceUuid ? String(body.targetDeviceUuid).trim() : undefined,
-        orderPayload: body.orderPayload || body.order_payload || body,
-        submissionId,
-        transactionId: body.transactionId || body.transaction_id || null,
-        salesRecordId: body.salesRecordId || body.sales_record_id || null,
-      });
-
-      const etaNextQueue = await etaPromise.catch(() => 0);
-      res.setHeader('X-Queue-Eta', String(etaNextQueue));
-
-      if (result && result.ok) {
+    // 1️⃣ IDEMPOTENCY CHECK DULU: Jika submissionId SUDAH ADA hasil → return result TANPA enqueue ulang.
+    const existingState = getOrderSubmissionState(submissionId) || submissionStates.get(submissionId);
+    if (existingState) {
+      const cachedStatus = String(
+        existingState.status ||
+        existingState.ackStatus ||
+        existingState.ack_status ||
+        existingState.state ||
+        'PENDING_ACK',
+      ).toUpperCase();
+      const etaCached = await etaPromise.catch(() => 0);
+      res.setHeader('X-Queue-Eta', String(etaCached));
+      const alreadyTerminal =
+        cachedStatus === 'POS_PRINTED' ||
+        cachedStatus === 'POS_ACKNOWLEDGED' ||
+        cachedStatus === 'FAILED_DELIVERY' ||
+        cachedStatus === 'TIMEOUT';
+      if (alreadyTerminal) {
         return res.status(200).json({
           ok: true,
-          ackStatus: result.ackStatus || 'POS_PRINTED',
-          resolvedDeviceUuid: result.resolvedDeviceUuid,
-          acknowledgedAt: result.acknowledgedAt,
-          etaNextQueue,
-          deviceUuid: result.deviceUuid,
+          _fromCache: true,
+          ackStatus: cachedStatus,
+          resolvedDeviceUuid: existingState.resolvedDeviceUuid || existingState.targetDeviceUuid || null,
+          acknowledgedAt: existingState.resolvedAt || existingState.ackedAt || existingState.printedAt || null,
+          failedDeliveryAt: existingState.failedAt || null,
           submissionId,
-          _fromCache: result._fromCache === true,
+          etaNextQueue: etaCached,
+          detail: existingState,
         });
       }
-
-      const etaNextQueueFallback = await etaPromise.catch(() => 0);
-      res.setHeader('X-Queue-Eta', String(etaNextQueueFallback));
-      return res.status(502).json({
-        ok: false,
-        error: 'QUEUE_RESOLVE_UNKNOWN',
-        message: 'Queue selesai tanpa status jelas',
-        retryAvailable: true,
+      // Non-terminal cached (PENDING_ACK) -> return 202 polling hint.
+      return res.status(202).json({
+        ok: true,
+        _fromCache: true,
+        ackStatus: cachedStatus,
+        message: 'Pesanan sedang diantrikan di POS (cache idempotency). Silakan poll /api/v1/relay/orders/*/ack-status untuk update status realtime.',
         submissionId,
-        etaNextQueue: etaNextQueueFallback,
-      });
-    } catch (queueErr) {
-      const statusCode = Number(queueErr.statusCode) || 500;
-      const errorCode = queueErr.code || 'QUEUE_ERROR';
-      const message = queueErr.message || 'Terjadi kesalahan pada queue relay';
-      const retryAvailable = queueErr.retryAvailable !== false;
-
-      const etaNextQueue = await etaPromise.catch(() => 0);
-      res.setHeader('X-Queue-Eta', String(etaNextQueue));
-
-      if (statusCode === 504) {
-        return res.status(504).json({
-          ok: false,
-          error: 'POS_ACK_TIMEOUT',
-          message: message || 'Perangkat POS tidak merespon dalam waktu timeout',
-          retryAvailable,
-          submissionId,
-          etaNextQueue,
-        });
-      }
-
-      if (statusCode === 503) {
-        return res.status(503).json({
-          ok: false,
-          error: 'POS_DEVICE_OFFLINE',
-          message: message || 'Perangkat printer target tidak online',
-          retryAvailable,
-          submissionId,
-          etaNextQueue,
-        });
-      }
-
-      return res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 500).json({
-        ok: false,
-        error: errorCode,
-        message,
-        retryAvailable,
-        submissionId,
-        etaNextQueue,
+        etaNextQueue: etaCached,
+        pollHintUrl: `/api/v1/relay/orders/by-submission/${encodeURIComponent(submissionId)}/ack-status`,
       });
     }
+
+    // 2️⃣ FIRE & FORGET ENQUEUE (TIDAK DI AWAIT → HTTP response cepat < 500ms).
+    //    Hasil POS ACK akan di-sync ke submissionStates cache, client akan detect via polling.
+    const enqueueArgs = Object.freeze({
+      tenantId,
+      branchId,
+      targetDeviceUuid: body.targetDeviceUuid ? String(body.targetDeviceUuid).trim() : undefined,
+      orderPayload: body.orderPayload || body.order_payload || body,
+      submissionId,
+      transactionId: body.transactionId || body.transaction_id || null,
+      salesRecordId: body.salesRecordId || body.sales_record_id || null,
+    });
+    setImmediate(async () => {
+      try {
+        await enqueueWebOrderForPrinting(enqueueArgs);
+      } catch (_enqueueErr) {
+        // Error enqueue akan otomatis masuk submissionStates cache FAILED_DELIVERY via internal queue,
+        // yang bisa di-poll oleh client ack-status endpoint (return FAILED_DELIVERY + retryAvailable).
+        // Tidak throw ke global event loop.
+        console.error(
+          '[posRelayController] background enqueue error (will be visible via ack-status poll):',
+          _enqueueErr && _enqueueErr.stack ? _enqueueErr.stack : _enqueueErr,
+          { submissionId, tenantId },
+        );
+      }
+    });
+
+    // 3️⃣ INSTANT HTTP 202 RESPONSE (PENDING_ACK status, polling hint).
+    const etaAccepted = await etaPromise.catch(() => 0);
+    res.setHeader('X-Queue-Eta', String(etaAccepted));
+    return res.status(202).json({
+      ok: true,
+      ackStatus: 'PENDING_ACK',
+      message: 'Pesanan berhasil masuk antrian Bridge POS. Silakan polling status ack-status setiap 2 detik.',
+      submissionId,
+      transactionId: enqueueArgs.transactionId,
+      etaNextQueue: etaAccepted,
+      pollIntervalMs: 2000,
+      pollHintUrls: {
+        bySubmissionId: `/api/v1/relay/orders/by-submission/${encodeURIComponent(submissionId)}/ack-status`,
+        byTransactionId: `/api/v1/relay/orders/by-transaction/${encodeURIComponent(
+          enqueueArgs.transactionId || String(body.transactionId || ''),
+        )}`,
+      },
+      connectedDevicesOnline: getConnectedDevicesCount(),
+      perDeviceStatus: getPerDeviceStatus(),
+    });
   } catch (err) {
     return res.status(500).json({
       ok: false,
