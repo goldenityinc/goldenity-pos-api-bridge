@@ -6,7 +6,22 @@ const getAckTimeoutSeconds = () => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ACK_TIMEOUT_SECONDS;
 };
 
-const ADMIN_CORE_URL = (process.env.ADMIN_CORE_API_BASE_URL || 'http://localhost:5000').replace(/\/$/, '');
+// 🔴 CRITICAL REGRESSION FIX HR3: Fallback chain ENV VAR NAME COMPATIBILITY!
+//    Lama (historical): env var = ADMIN_CORE_API_URL
+//    Baru (posOrderQueue original L9): env var = ADMIN_CORE_API_BASE_URL (TIDAK ADA fallback ke nama lama)
+//    Jika Railway user setup var LAMA (ADMIN_CORE_API_URL) tapi TIDAK setup var BARU →
+//    posOrderQueue fallback ke http://localhost:5000 → container Railway tidak ada localhost service →
+//    fetch failed ECONNREFUSED → HTTP 502 "fetch failed" (BUG B screenshot 2).
+//    SOLUSI: Gunakan fallback chain SAMA SEPERTI accountingAutomationService.js + controllers:
+//    ADMIN_CORE_API_BASE_URL || ADMIN_CORE_API_URL || ADMIN_CORE_URL || 'http://localhost:5000'
+const ADMIN_CORE_URL_RAW =
+  process.env.ADMIN_CORE_API_BASE_URL ||
+  process.env.ADMIN_CORE_API_URL ||
+  process.env.ADMIN_CORE_BASE_URL ||
+  process.env.ADMIN_CORE_URL ||
+  process.env.ADMIN_CORE_BACKEND_URL ||
+  'http://localhost:5000';
+const ADMIN_CORE_URL = ADMIN_CORE_URL_RAW.replace(/\/$/, '');
 const ADMIN_CORE_INTERNAL_TOKEN = process.env.ADMIN_CORE_INTERNAL_TOKEN || '';
 const ADMIN_CORE_TIMEOUT_MS = Number.parseInt(process.env.ADMIN_CORE_API_TIMEOUT_MS || '5000', 10) || 5000;
 
@@ -53,7 +68,26 @@ const notifyLongPollWaiters = (key) => {
 };
 
 const adminCoreFetch = async (path, options = {}) => {
-  const url = `${ADMIN_CORE_URL}${path}`;
+  // 🔴 CRITICAL REGRESSION FIX HR2: URL Normalize double slashes (selain protocol https://)
+  //    Masalah: ADMIN_CORE_URL = https://admin.example.com/api (DIAKHIRI /api tanpa slash),
+  //    atau env var Railway USER setup TRAILING SLASH → https://admin.example.com/,
+  //    atau path param CONTAIN double // sebelum di encode → url fetch INVALID.
+  //    Node.js native fetch() (undici) strict terhadap URL format: double slashes
+  //    setelah origin = path salah, kadang ECONNREFUSED / ENOTFOUND "fetch failed".
+  const rawUrl = `${ADMIN_CORE_URL}/${path.replace(/^\//, '')}`; // selalu inject 1 slash antara base + path
+  const url = rawUrl.replace(/([^:])\/{2,}/g, '$1/'); // replace 2+ slashes jadi 1 slash, KECUALI setelah protocol colon (:) biarkan https:// tetap.
+  // 🔴 [Instrument HR2-HR3 pre-fix evidence] SELALU log actual fetch URL ke console (Railway logs capture):
+  console.error('[dbg HR2-HR3 deviceFetch] ADMIN_CORE_ENV_SET:', {
+    hasADMIN_CORE_API_BASE_URL: Boolean(process.env.ADMIN_CORE_API_BASE_URL),
+    hasADMIN_CORE_API_URL: Boolean(process.env.ADMIN_CORE_API_URL),
+    ADMIN_CORE_URL_RAW_len: String(ADMIN_CORE_URL_RAW || '').length,
+    ADMIN_CORE_URL_resolved: ADMIN_CORE_URL,
+    rawUrlBeforeNormalize: rawUrl,
+    finalUrlAfterNormalize: url,
+    doubleSlashesAfterProtocol: (url.match(/:\/\/[^/]+\/(.*)$/) || [])[1]?.split('//').length - 1 || 0,
+    path_input: path,
+    method: (options.method || 'GET').toUpperCase(),
+  });
   const headers = {
     'Content-Type': 'application/json',
     ...(options.headers || {}),
