@@ -43,23 +43,61 @@ const getPerDeviceStatus = () => {
 };
 
 const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
-  if (!ioInstance) return { emitted: false, reason: 'IO_NOT_INITIALIZED' };
+  if (!ioInstance) return { emitted: false, reason: 'IO_NOT_INITIALIZED', fallback: null };
   const posNamespace = ioInstance.of('/pos-relay');
   const deviceRoom = buildDeviceRoom(targetDeviceUuid);
-  const socketsInRoom = posNamespace.adapter?.rooms?.get(deviceRoom);
-  if (socketsInRoom && socketsInRoom.size > 0) {
+  const socketsInDeviceRoom = posNamespace.adapter?.rooms?.get(deviceRoom);
+  if (socketsInDeviceRoom && socketsInDeviceRoom.size > 0) {
     posNamespace.to(deviceRoom).emit('incoming-web-order', orderPayload);
-    return { emitted: true, target: 'device', room: deviceRoom };
+    return { emitted: true, target: 'device', room: deviceRoom, sockets: socketsInDeviceRoom.size, fallback: 'none' };
   }
+  let fallbackReason = 'DEVICE_ROOM_EMPTY';
+  let socketsInBranchRoom = null;
   if (branchId) {
     const branchRoom = buildBranchRoom(branchId);
-    const branchSockets = posNamespace.adapter?.rooms?.get(branchRoom);
-    if (branchSockets && branchSockets.size > 0) {
+    socketsInBranchRoom = posNamespace.adapter?.rooms?.get(branchRoom);
+    if (socketsInBranchRoom && socketsInBranchRoom.size > 0) {
       posNamespace.to(branchRoom).emit('incoming-web-order', orderPayload);
-      return { emitted: true, target: 'branch-fallback', room: branchRoom };
+      return { emitted: true, target: 'branch-fallback', room: branchRoom, sockets: socketsInBranchRoom.size, fallback: 'branch', deviceUuid: targetDeviceUuid || null };
     }
+    fallbackReason = 'DEVICE_AND_BRANCH_ROOMS_EMPTY';
   }
-  return { emitted: false, reason: 'DEVICE_AND_BRANCH_OFFLINE' };
+  const tenantIdFromPayload =
+    (orderPayload && typeof orderPayload === 'object' && (orderPayload.tenantId || orderPayload.tenant_id)) ||
+    (targetDeviceUuid && connectedDevices.get(targetDeviceUuid)?.tenantId) ||
+    '';
+  if (tenantIdFromPayload) {
+    const tenantRoom = buildTenantRoom(String(tenantIdFromPayload).trim());
+    const socketsInTenantRoom = posNamespace.adapter?.rooms?.get(tenantRoom);
+    if (socketsInTenantRoom && socketsInTenantRoom.size > 0) {
+      posNamespace.to(tenantRoom).emit('incoming-web-order', orderPayload);
+      return { emitted: true, target: 'tenant-fallback', room: tenantRoom, sockets: socketsInTenantRoom.size, fallback: 'tenant', deviceUuid: targetDeviceUuid || null, branchId: branchId || null };
+    }
+    fallbackReason = 'DEVICE_BRANCH_TENANT_ROOMS_EMPTY';
+  }
+  const allConnected = Array.from(posNamespace.sockets?.values?.() || []).filter(s => {
+    const d = s.data?.posDevice || {};
+    if (!d.branchId || !d.tenantId) return false;
+    if (branchId && String(d.branchId) === String(branchId)) return true;
+    if (tenantIdFromPayload && String(d.tenantId) === String(tenantIdFromPayload)) return true;
+    return false;
+  });
+  if (allConnected.length > 0) {
+    for (const s of allConnected) {
+      try { s.emit('incoming-web-order', orderPayload); } catch (_) {}
+    }
+    return { emitted: true, target: 'manual-iterate-pos-sockets', sockets: allConnected.length, fallback: 'manual-iterate', deviceUuid: targetDeviceUuid || null, branchId: branchId || null, tenantId: tenantIdFromPayload || null };
+  }
+  return {
+    emitted: false,
+    reason: fallbackReason || 'DEVICE_AND_BRANCH_OFFLINE',
+    deviceRoomSize: socketsInDeviceRoom?.size || 0,
+    branchRoomSize: socketsInBranchRoom?.size || 0,
+    debugConnectedDevices: connectedDevices.size,
+    debugTargetDeviceUuid: targetDeviceUuid || null,
+    debugBranchId: branchId || null,
+    debugTenantId: tenantIdFromPayload || null,
+  };
 };
 
 const extractHandshakeToken = (socket) => {
