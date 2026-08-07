@@ -713,4 +713,5 @@ module.exports = {
   estimateEtaSeconds,
   submissionStates,
   getOrderSubmissionState,
+  adminCoreFetch,
 };
