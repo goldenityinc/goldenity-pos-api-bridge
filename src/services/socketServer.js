@@ -50,6 +50,16 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
     (targetDeviceUuid && connectedDevices.get(targetDeviceUuid)?.tenantId) ||
     '';
 
+  // 🔴 CRITICAL FIX 1b: EMIT MULTIPLE EVENT NAMES SEKALIGUS (COMPAT DENGAN SEMUA LISTENER VERSION)
+  //    POS Flutter lama listen "incoming-web-order".
+  //    POS Flutter baru / Admin Web listen "incoming_qr_order" atau "new_web_order".
+  //    SOLUSI: EMIT KETIGA EVENT NAME DENGAN PAYLOAD YANG SAMA → pastikan tertangkap apapun listener nya.
+  const emitMultiEvent = (targetObj, payload) => {
+    try { targetObj.emit('incoming-web-order', payload); } catch (_) {}
+    try { targetObj.emit('incoming_qr_order', payload); } catch (_) {}
+    try { targetObj.emit('new_web_order', payload); } catch (_) {}
+  };
+
   // 🔴 CRITICAL FIX 1 — SOCKET BROADCAST:
   //    SEBELUMNYA: Hanya emit ke 1 targetDeviceUuid room, LALU RETURN!
   //    Akibatnya device lain (Tablet Printer, PC Kasir Kedua) di BRANCH YANG SAMA
@@ -74,7 +84,7 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
     const branchRoom = buildBranchRoom(branchId);
     const socketsInBranchRoom = posNamespace.adapter?.rooms?.get(branchRoom);
     if (socketsInBranchRoom && socketsInBranchRoom.size > 0) {
-      posNamespace.to(branchRoom).emit('incoming-web-order', orderPayload);
+      emitMultiEvent(posNamespace.to(branchRoom), orderPayload);
       stats.branchEmitted = true;
       stats.branchSockets = socketsInBranchRoom.size;
     } else {
@@ -90,7 +100,7 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
     const deviceRoom = buildDeviceRoom(targetDeviceUuid);
     const socketsInDeviceRoom = posNamespace.adapter?.rooms?.get(deviceRoom);
     if (socketsInDeviceRoom && socketsInDeviceRoom.size > 0) {
-      posNamespace.to(deviceRoom).emit('incoming-web-order', orderPayload);
+      emitMultiEvent(posNamespace.to(deviceRoom), orderPayload);
       stats.deviceEmitted = true;
       stats.deviceSockets = socketsInDeviceRoom.size;
     } else {
@@ -103,7 +113,7 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
     const tenantRoom = buildTenantRoom(String(tenantIdFromPayload).trim());
     const socketsInTenantRoom = posNamespace.adapter?.rooms?.get(tenantRoom);
     if (socketsInTenantRoom && socketsInTenantRoom.size > 0) {
-      posNamespace.to(tenantRoom).emit('incoming-web-order', orderPayload);
+      emitMultiEvent(posNamespace.to(tenantRoom), orderPayload);
       stats.tenantEmitted = true;
       stats.tenantSockets = socketsInTenantRoom.size;
     } else {
@@ -123,7 +133,7 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
     });
     if (allConnected.length > 0) {
       for (const s of allConnected) {
-        try { s.emit('incoming-web-order', orderPayload); } catch (_) {}
+        try { emitMultiEvent(s, orderPayload); } catch (_) {}
       }
       stats.manualEmitted = true;
       stats.manualSockets = allConnected.length;
