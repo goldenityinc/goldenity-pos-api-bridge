@@ -547,11 +547,22 @@ const normalizeTopLevelOrderEnvelopeFields = (orderPayloadRaw, ctx = {}) => {
 
 const buildOrderEnvelope = (submissionId, tenantId, branchId, deviceUuid, orderPayload, transactionId, salesRecordId) => {
   const normalizedTop = normalizeTopLevelOrderEnvelopeFields(orderPayload, { transactionId, salesRecordId, tenantId, branchId });
-  // 🔴 CRITICAL FIX: FLATTEN SEMUA normalizedTop KE TOP-LEVEL envelope (JANGAN hanya nested di envelope:{})
-  //    Flutter POS listener di pos_web_order_listener.dart + qr_order_payload_utils.dart CARI FIELD DI TOP LEVEL DULU.
-  //    Sebelumnya: cuma ada tableNumber / customerName / notes di dalam envelope:{} dan orderPayload:{} →
-  //      Flutter kadang-kadang TIDAK DAPATKAN (karena extractor prefer top-level, maka pakai default "-" atau "Umum").
-  //    SEKARANG: SEMUA alias field ada di TOP LEVEL envelope object → 100% terambil POS receipt builder.
+  // 🔴 2-STEP QRIS FLOW: Detect print_type dari payload (dari Admin Core socket payload).
+  //    - print_type = 'CHECKER_ONLY' (Step 1 QRIS): POS HANYA cetak Kitchen Checker, JANGAN cetak Struk Sales Receipt.
+  //    - print_type = 'RECEIPT_ONLY' (Step 2 QRIS PAID): POS HANYA cetak Struk Sales Receipt, JANGAN cetak Checker lagi.
+  //    - print_type = 'FULL' atau undefined (normal CASHIER flow): POS cetak keduanya.
+  const rawPay = (orderPayload && typeof orderPayload === 'object') ? orderPayload : {};
+  const rawTop = normalizedTop || {};
+  const detectedPrintTypeRaw =
+    rawTop.print_type || rawTop.printType ||
+    rawPay.print_type || rawPay.printType ||
+    (rawTop.__qris_unpaid_checker_only === true || rawPay.__qris_unpaid_checker_only === true ? 'CHECKER_ONLY' : '') ||
+    (rawTop.order_stage === 'CHECKER_PRINT' || rawPay.order_stage === 'CHECKER_PRINT' ? 'CHECKER_ONLY' : '') ||
+    (rawTop.order_stage === 'SALES_RECEIPT_PRINT' || rawPay.order_stage === 'SALES_RECEIPT_PRINT' ? 'RECEIPT_ONLY' : '') ||
+    '';
+  const normalizedPrintType =
+    detectedPrintTypeRaw === 'CHECKER_ONLY' ? 'CHECKER_ONLY' :
+    detectedPrintTypeRaw === 'RECEIPT_ONLY' ? 'RECEIPT_ONLY' : 'FULL';
   return {
     submissionId,
     tenantId: normalizedTop.tenantId || tenantId,
@@ -561,7 +572,15 @@ const buildOrderEnvelope = (submissionId, tenantId, branchId, deviceUuid, orderP
     targetDeviceUuid: deviceUuid,
     orderPayload: { ...(orderPayload || {}), ...normalizedTop },
     envelope: normalizedTop,
-    // TOP LEVEL METADATA FIELDS (Flutter Receipt Builder CARI DISINI DULU):
+    print_type: normalizedPrintType,
+    printType: normalizedPrintType,
+    order_stage:
+      normalizedPrintType === 'CHECKER_ONLY' ? 'CHECKER_PRINT' :
+      normalizedPrintType === 'RECEIPT_ONLY' ? 'SALES_RECEIPT_PRINT' : 'FULL_PRINT',
+    orderStage:
+      normalizedPrintType === 'CHECKER_ONLY' ? 'CHECKER_PRINT' :
+      normalizedPrintType === 'RECEIPT_ONLY' ? 'SALES_RECEIPT_PRINT' : 'FULL_PRINT',
+    __qris_unpaid_checker_only: normalizedPrintType === 'CHECKER_ONLY',
     transactionId: normalizedTop.transactionId || transactionId || null,
     transaction_id: normalizedTop.transaction_id || transactionId || null,
     salesRecordId: salesRecordId || normalizedTop.orderId || null,

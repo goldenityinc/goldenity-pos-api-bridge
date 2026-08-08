@@ -13,6 +13,15 @@ const {
   getPerDeviceStatus,
 } = require('../services/socketServer');
 
+const ADMIN_CORE_URL = (
+  process.env.ADMIN_CORE_API_BASE_URL ||
+  process.env.ADMIN_CORE_API_URL ||
+  process.env.ADMIN_CORE_BASE_URL ||
+  process.env.ADMIN_CORE_URL ||
+  process.env.ADMIN_CORE_BACKEND_URL ||
+  'http://localhost:5000'
+).replace(/\/$/, '');
+
 const resolveTenantId = (req) => {
   const fromHeader = (req.headers['x-tenant-id'] || '').toString().trim();
   if (fromHeader) return fromHeader;
@@ -24,6 +33,127 @@ const resolveTenantId = (req) => {
   if (fromBody) return fromBody;
   const fromQuery = (req.query?.tenantId || req.query?.tenant_id || '').toString().trim();
   return fromQuery;
+};
+
+const relayUploadQrOrderPayment = async (req, res) => {
+  try {
+    const orderId = (req.params?.id || req.params?.orderId || '').toString().trim();
+    const tenantId = resolveTenantId(req);
+
+    if (!orderId) {
+      return res.status(400).json({
+        success: false,
+        error: 'MISSING_ORDER_ID',
+        message: 'orderId wajib disediakan di path parameter',
+      });
+    }
+    if (!tenantId) {
+      return res.status(400).json({
+        success: false,
+        error: 'MISSING_TENANT_ID',
+        message: 'tenantId wajib disediakan (body/header/query)',
+      });
+    }
+
+    const adminCoreEndpoint = `${ADMIN_CORE_URL}/api/v1/qr-orders/${encodeURIComponent(orderId)}/payment`;
+    const isFormData =
+      Boolean(req.is?.('multipart/form-data')) ||
+      Boolean(req.file) ||
+      Boolean(req.files);
+
+    let upstreamResponse;
+    if (isFormData || req.file || (Array.isArray(req.files) && req.files.length > 0) || (req.files && Object.keys(req.files).length > 0)) {
+      const FormData = require('form-data');
+      const form = new FormData();
+      form.append('tenantId', tenantId);
+      form.append('tenant_id', tenantId);
+      const branchIdRaw = (req.body?.branchId || req.body?.branch_id || req.query?.branchId || '').toString().trim();
+      if (branchIdRaw) {
+        form.append('branchId', branchIdRaw);
+        form.append('branch_id', branchIdRaw);
+      }
+      const pmRaw = (req.body?.paymentMethod || req.body?.payment_method || 'QRIS').toString().trim();
+      form.append('paymentMethod', pmRaw);
+      form.append('payment_method', pmRaw);
+      const proofUrl = (req.body?.payment_proof_url || req.body?.paymentProofUrl || '').toString().trim();
+      if (proofUrl) {
+        form.append('payment_proof_url', proofUrl);
+        form.append('paymentProofUrl', proofUrl);
+      }
+      // Multer variants:
+      //   multer.single(x)  → req.file
+      //   multer.fields(...) → req.files = { key: [file,..], ... } (object)
+      //   multer.any()       → req.files = [ { fieldname, buffer, originalname, mimetype }, ... ] (array)
+      let theFile = req.file || null;
+      if (!theFile && Array.isArray(req.files) && req.files.length > 0) {
+        const preferredNames = new Set(['payment_proof', 'paymentProof', 'proof', 'file', 'paymentProofFile', 'image', 'qris_proof', 'bukti_transfer']);
+        let best = null;
+        for (const f of req.files) {
+          const fn = (f.fieldname || '').toString();
+          if (preferredNames.has(fn)) { best = f; break; }
+        }
+        theFile = best || req.files[0];
+      } else if (!theFile && req.files && typeof req.files === 'object') {
+        const preferredKeys = ['payment_proof', 'paymentProof', 'proof', 'file', 'paymentProofFile', 'image', 'qris_proof'];
+        for (const k of preferredKeys) {
+          if (Array.isArray(req.files[k]) && req.files[k][0]) { theFile = req.files[k][0]; break; }
+        }
+        if (!theFile) {
+          const firstKey = Object.keys(req.files)[0];
+          if (firstKey && Array.isArray(req.files[firstKey]) && req.files[firstKey][0]) theFile = req.files[firstKey][0];
+        }
+      }
+      if (theFile) {
+        const fieldName = (theFile.fieldname || 'payment_proof').toString();
+        form.append(fieldName, theFile.buffer || theFile, {
+          filename: theFile.originalname || theFile.name || `proof-${orderId}.png`,
+          contentType: theFile.mimetype || theFile.type || 'image/png',
+        });
+      }
+      upstreamResponse = await fetch(adminCoreEndpoint, {
+        method: 'PUT',
+        headers: {
+          'X-Internal-Relay': '1',
+          'X-Tenant-Id': tenantId,
+          ...form.getHeaders(),
+        },
+        body: form,
+      });
+    } else {
+      const payload = {
+        tenantId,
+        tenant_id: tenantId,
+        branchId: (req.body?.branchId || req.body?.branch_id || req.query?.branchId || '').toString().trim() || undefined,
+        branch_id: (req.body?.branchId || req.body?.branch_id || req.query?.branchId || '').toString().trim() || undefined,
+        paymentMethod: (req.body?.paymentMethod || req.body?.payment_method || 'QRIS').toString().trim(),
+        payment_method: (req.body?.paymentMethod || req.body?.payment_method || 'QRIS').toString().trim(),
+        payment_proof_url: (req.body?.payment_proof_url || req.body?.paymentProofUrl || '').toString().trim() || undefined,
+        paymentProofUrl: (req.body?.payment_proof_url || req.body?.paymentProofUrl || '').toString().trim() || undefined,
+      };
+      upstreamResponse = await fetch(adminCoreEndpoint, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Internal-Relay': '1',
+          'X-Tenant-Id': tenantId,
+        },
+        body: JSON.stringify(payload),
+      });
+    }
+
+    const rawText = await upstreamResponse.text();
+    let parsedJson;
+    try { parsedJson = rawText ? JSON.parse(rawText) : {}; } catch (_) { parsedJson = { rawFallback: rawText }; }
+
+    const status = upstreamResponse.ok ? 200 : (upstreamResponse.status || 500);
+    return res.status(status).json(parsedJson);
+  } catch (err) {
+    return res.status(502).json({
+      success: false,
+      error: 'RELAY_UPLOAD_PAYMENT_FAILED',
+      message: err && err.message ? err.message : 'Gagal meneruskan upload bukti pembayaran ke Admin Core',
+    });
+  }
 };
 
 const submitWebOrderToPos = async (req, res) => {
@@ -365,4 +495,5 @@ module.exports = {
   acknowledgeOrderFromPos,
   pollIncomingOrdersHandler,
   getQueueStatus,
+  relayUploadQrOrderPayment,
 };

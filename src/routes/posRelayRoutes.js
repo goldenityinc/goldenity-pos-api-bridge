@@ -1,10 +1,19 @@
 const express = require('express');
+const multer = require('multer');
 const {
   submitWebOrderToPos,
   acknowledgeOrderFromPos,
   pollIncomingOrdersHandler,
   getQueueStatus,
+  relayUploadQrOrderPayment,
 } = require('../controllers/posRelayController');
+
+const paymentProofUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 8 * 1024 * 1024,
+  },
+});
 // 🔴 IMPORT submissionStates & adminCoreFetch untuk:
 //    (1) ack-status wildcard segment resolver
 //    (2) by-transaction lookup endpoint (home page client polling list order)
@@ -290,5 +299,13 @@ router.get('/orders/active', async (req, res) => {
 
 router.get('/poll', pollIncomingOrdersHandler);
 router.get('/queue-status', getQueueStatus);
+
+// 🔴 2-STEP QRIS FLOW Step 2: Upload payment proof untuk QR order yang sudah dibuat (Step 1 = checker only)
+//    PUT /api/v1/relay/qr-orders/:id/payment
+//    Request: multipart/form-data (payment_proof file) atau JSON (payment_proof_url string)
+//    Relay ke Admin Core PUT /api/v1/qr-orders/:id/payment untuk update status PAID & trigger web_order_paid socket event.
+//    paymentProofUpload.any(): menerima nama field apapun (payment_proof, paymentProofFile, dll) sebagai file buffer.
+router.put('/qr-orders/:id/payment', paymentProofUpload.any(), relayUploadQrOrderPayment);
+router.put('/qr-orders/:orderId/payment', paymentProofUpload.any(), relayUploadQrOrderPayment);
 
 module.exports = router;

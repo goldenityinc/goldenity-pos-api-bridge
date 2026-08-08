@@ -50,14 +50,33 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
     (targetDeviceUuid && connectedDevices.get(targetDeviceUuid)?.tenantId) ||
     '';
 
-  // 🔴 CRITICAL FIX 1b: EMIT MULTIPLE EVENT NAMES SEKALIGUS (COMPAT DENGAN SEMUA LISTENER VERSION)
+  // 🔴 CRITICAL FIX 1b + 2-STEP QRIS FLOW: EMIT MULTIPLE EVENT NAMES SEKALIGUS
   //    POS Flutter lama listen "incoming-web-order".
   //    POS Flutter baru / Admin Web listen "incoming_qr_order" atau "new_web_order".
-  //    SOLUSI: EMIT KETIGA EVENT NAME DENGAN PAYLOAD YANG SAMA → pastikan tertangkap apapun listener nya.
+  //    2-STEP QRIS BARU: "new_web_order_checker" (Step 1: checker only), "web_order_paid" (Step 2: receipt paid)
+  //    SOLUSI: EMIT SEMUA EVENT NAME RELEVAN DENGAN PAYLOAD YANG SAMA → pastikan tertangkap apapun listener nya.
   const emitMultiEvent = (targetObj, payload) => {
     try { targetObj.emit('incoming-web-order', payload); } catch (_) {}
     try { targetObj.emit('incoming_qr_order', payload); } catch (_) {}
     try { targetObj.emit('new_web_order', payload); } catch (_) {}
+    try { targetObj.emit('new_web_order_checker', payload); } catch (_) {}
+    try { targetObj.emit('web_order_paid', payload); } catch (_) {}
+    try { targetObj.emit('web_order_paid_receipt', payload); } catch (_) {}
+  };
+
+  // Fungsi khusus 2-step: emit HANYA event CHECKER (Step 1) — dipanggil manual dari queue jika payload print_type=CHECKER_ONLY
+  const emitCheckerOnly = (targetObj, payload) => {
+    try { targetObj.emit('new_web_order_checker', payload); } catch (_) {}
+    try { targetObj.emit('incoming_qr_order', payload); } catch (_) {}
+    try { targetObj.emit('incoming-web-order', payload); } catch (_) {}
+  };
+
+  // Fungsi khusus 2-step: emit HANYA event PAID RECEIPT (Step 2) — untuk relay dari Admin Core socket
+  const emitPaidReceiptOnly = (targetObj, payload) => {
+    try { targetObj.emit('web_order_paid', payload); } catch (_) {}
+    try { targetObj.emit('web_order_paid_receipt', payload); } catch (_) {}
+    try { targetObj.emit('qris_paid', payload); } catch (_) {}
+    try { targetObj.emit('payment_success', payload); } catch (_) {}
   };
 
   // 🔴 CRITICAL FIX 1 — SOCKET BROADCAST:
