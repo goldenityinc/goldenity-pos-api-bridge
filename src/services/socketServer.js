@@ -185,14 +185,25 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
     }
 
     // STEP 3 (FALLBACK TENANT) — Jika branch room kosong, coba broadcast ke tenant room
-    if (!nsGotAny && tenantIdFromPayload) {
+    // 🔴 CRITICAL IMPROVEMENT: EMIT KE TENANT ROOM SELALU (bukan hanya fallback branch empty).
+    //    POS Flutter lama (2.2 kebawah) hanya JOIN tenant:${tenantId} TANPA join branch room
+    //    → menyebabkan branch room empty → POS OFFLINE palsu di replay endpoint.
+    //    SOLUSI: SELALU EMIT KE TENANT ROOM (setelah step 1/2) agar semua POS di tenant DAPAT event.
+    //    No duplicate: dispatchPrintEvents per payload print type sudah dedupe listener, extra emit
+    //    tenant room = 1x extra tapi 100% reliable sampai POS reconnect + join branch room.
+    const alwaysEmitTenant = true;
+    if (tenantIdFromPayload) {
       const tenantRoom = buildTenantRoom(String(tenantIdFromPayload).trim());
       const socketsInTenantRoom = ns.adapter?.rooms?.get(tenantRoom);
       if (socketsInTenantRoom && socketsInTenantRoom.size > 0) {
-        dispatchPrintEvents(ns.to(tenantRoom), orderPayload);
-        stats.tenantEmitted = true;
-        nsStats.tenant = socketsInTenantRoom.size;
-        stats.tenantSockets = Math.max(stats.tenantSockets, socketsInTenantRoom.size);
+        if (!nsGotAny || alwaysEmitTenant) {
+          dispatchPrintEvents(ns.to(tenantRoom), orderPayload);
+        }
+        if (!stats.tenantEmitted) {
+          stats.tenantEmitted = true;
+          nsStats.tenant = socketsInTenantRoom.size;
+          stats.tenantSockets = Math.max(stats.tenantSockets, socketsInTenantRoom.size);
+        }
         nsGotAny = true;
       }
     }
