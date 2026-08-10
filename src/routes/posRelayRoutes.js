@@ -6,6 +6,7 @@ const {
   pollIncomingOrdersHandler,
   getQueueStatus,
   relayUploadQrOrderPayment,
+  replayTransactionWebOrderSocket,
 } = require('../controllers/posRelayController');
 
 const paymentProofUpload = multer({
@@ -300,6 +301,15 @@ router.get('/orders/active', async (req, res) => {
 router.get('/poll', pollIncomingOrdersHandler);
 router.get('/queue-status', getQueueStatus);
 
+// 🔴 NEW: /replay endpoint untuk RESEND socket event ke POS jika POS OFFLINE saat submit order
+//    Skenario: user submit order → POS OFFLINE → POS kembali online → order TIDAK KELUAR di POS / Meja kosong.
+//    User klik Refresh di Order List → frontend call endpoint ini per transactionId → EMIT ULANG socket events
+//    (new_web_order / checker_only / paid_receipt) ke POS + mark meja OCCUPIED (seolah baru diterima).
+//    Pattern: POST /api/v1/relay/replay (body)  or POST /replay/by-transaction/:txId or POST /replay/by-submission/:submissionId
+router.post('/replay/by-transaction/:txId', replayTransactionWebOrderSocket);
+router.post('/replay/by-submission/:submissionId', replayTransactionWebOrderSocket);
+router.post('/replay', replayTransactionWebOrderSocket);
+
 // 🔴 2-STEP QRIS FLOW Step 2: Upload payment proof untuk QR order yang sudah dibuat (Step 1 = checker only)
 //    PUT /api/v1/relay/qr-orders/:id/payment
 //    Request: multipart/form-data (payment_proof file) atau JSON (payment_proof_url string)
@@ -307,5 +317,6 @@ router.get('/queue-status', getQueueStatus);
 //    paymentProofUpload.any(): menerima nama field apapun (payment_proof, paymentProofFile, dll) sebagai file buffer.
 router.put('/qr-orders/:id/payment', paymentProofUpload.any(), relayUploadQrOrderPayment);
 router.put('/qr-orders/:orderId/payment', paymentProofUpload.any(), relayUploadQrOrderPayment);
+router.put('/qr-orders/by-transaction/:txId/payment', paymentProofUpload.any(), relayUploadQrOrderPayment);
 
 module.exports = router;

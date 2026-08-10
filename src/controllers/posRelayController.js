@@ -13,6 +13,10 @@ const {
 const {
   getConnectedDevicesCount,
   getPerDeviceStatus,
+  buildBranchRoom,
+  buildDeviceRoom,
+  buildTenantRoom,
+  emitIncomingWebOrder,
 } = require('../services/socketServer');
 
 const ADMIN_CORE_URL = (
@@ -513,10 +517,74 @@ const getQueueStatus = async (req, res) => {
   }
 };
 
+const replayTransactionWebOrderSocket = async (req, res) => {
+  try {
+    const txIdRaw = (req.params.txId || req.params.transactionId || req.body?.transactionId || '').toString().trim();
+    const subIdRaw = (req.params.submissionId || req.body?.submissionId || '').toString().trim();
+    if (!txIdRaw && !subIdRaw) {
+      return res.status(400).json({ ok:false, message: 'txId (by-transaction) atau submissionId wajib diisi.' });
+    }
+
+    let resolvedEntry = null;
+    let resolvedSubmissionId = null;
+    const scanFrom = (storedSubId, st) => {
+      const envelope = st && st.envelope ? st.envelope : (st || {});
+      const storedTxId = String(envelope.transactionId || st.transactionId || envelope.txId || st.txId || '').trim();
+      if (subIdRaw && storedSubId === subIdRaw) return { match: true, subId: storedSubId, st };
+      if (txIdRaw && storedTxId === txIdRaw) return { match: true, subId: storedSubId, st };
+      if (txIdRaw) {
+        const orderIdNum = String(envelope.orderId || envelope.salesRecordId || envelope.id || st.orderId || '').trim();
+        if (orderIdNum && orderIdNum === txIdRaw) return { match: true, subId: storedSubId, st };
+      }
+      return { match: false };
+    };
+    for (const [subId, st] of submissionStates.entries()) {
+      const r = scanFrom(subId, st);
+      if (r.match) { resolvedEntry = r.st; resolvedSubmissionId = r.subId; break; }
+    }
+    if (!resolvedEntry) {
+      const direct = getOrderSubmissionState(subIdRaw || txIdRaw);
+      if (direct) { resolvedEntry = direct; resolvedSubmissionId = subIdRaw || txIdRaw; }
+    }
+    if (!resolvedEntry) {
+      return res.status(404).json({ ok:false, message: `Transaction/submission tidak ditemukan di bridge cache. ID=${txIdRaw || subIdRaw}. Submit order ulang dari web client (cache hanya simpan ~30 menit).`, submissionId: resolvedSubmissionId, transactionId: txIdRaw });
+    }
+    const envelope = resolvedEntry.envelope ? resolvedEntry.envelope : (resolvedEntry || {});
+    const orderPayload = (envelope.orderPayload && typeof envelope.orderPayload === 'object')
+      ? envelope.orderPayload
+      : (envelope.payload || envelope.order || envelope);
+    const safePayload = (orderPayload && typeof orderPayload === 'object') ? { ...orderPayload } : {};
+    const safeEnvelope = injectMissingOrderMetadata({
+      envelope: (envelope && typeof envelope === 'object') ? envelope : { orderPayload: safePayload },
+      rawBody: safePayload,
+    });
+    const finalEmitPayload = (safeEnvelope && safeEnvelope.orderPayload)
+      ? { ...(safeEnvelope.rawBody || safeEnvelope.orderPayload || safePayload), ...safeEnvelope.orderPayload }
+      : { ...safePayload, ...safeEnvelope };
+    const targetDeviceUuid = String(envelope.targetDeviceUuid || resolvedEntry.targetDeviceUuid || envelope.resolvedDeviceUuid || resolvedEntry.resolvedDeviceUuid || '').trim() || null;
+    const branchId = String(envelope.branchId || resolvedEntry.branchId || envelope.branch_id || resolvedEntry.branch_id || (orderPayload && orderPayload.branchId) || '').trim() || null;
+    const emitResult = emitIncomingWebOrder(targetDeviceUuid, branchId, finalEmitPayload);
+    return res.status(200).json({
+      ok: true,
+      message: emitResult?.emitted ? 'Replay socket broadcast BERHASIL dikirim ke POS. Meja OCCUPIED & order me-refresh otomatis.' : 'Perintah replay DITERIMA, tapi tidak ada device POS online. POS akan otomatis sync saat kembali online.',
+      transactionId: txIdRaw || (envelope.transactionId || null),
+      submissionId: resolvedSubmissionId,
+      ackStatus: resolvedEntry.status || resolvedEntry.ackStatus || envelope.status || 'UNKNOWN',
+      socket: emitResult || null,
+      orderId: envelope.orderId || resolvedEntry.orderId || finalEmitPayload.orderId || finalEmitPayload.id || null,
+      emittedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('[posRelayController] replayTransactionWebOrderSocket error:', err && err.stack ? err.stack : err);
+    return res.status(500).json({ ok:false, error:'INTERNAL_ERROR', message: err.message || String(err) });
+  }
+};
+
 module.exports = {
   submitWebOrderToPos,
   acknowledgeOrderFromPos,
   pollIncomingOrdersHandler,
   getQueueStatus,
   relayUploadQrOrderPayment,
+  replayTransactionWebOrderSocket,
 };
