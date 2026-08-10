@@ -691,5 +691,4 @@ module.exports = {
   getConnectedDevicesCount,
   getPerDeviceStatus,
   emitIncomingWebOrder,
-  dispatchPrintEvents,
 };
