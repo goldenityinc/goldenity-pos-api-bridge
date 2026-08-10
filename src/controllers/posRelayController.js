@@ -44,13 +44,17 @@ const resolveTenantId = (req) => {
 const relayUploadQrOrderPayment = async (req, res) => {
   try {
     const orderId = (req.params?.id || req.params?.orderId || '').toString().trim();
+    const txId = (req.params?.txId || req.body?.transactionId || req.body?.transaction_id || req.query?.transactionId || req.query?.transaction_id || '').toString().trim();
     const tenantId = resolveTenantId(req);
 
-    if (!orderId) {
+    // 🔴 FIX: BOTH ROUTE /by-transaction/:txId/payment: BISA orderId EMPTY tapi txId ADA.
+    //    route pattern: router.put('/qr-orders/by-transaction/:txId/payment') → orderId = undefined, tapi txId TIDAK kosong.
+    //    Sebelumnya force require orderId → "orderId wajib disediakan" error.
+    if (!orderId && !txId) {
       return res.status(400).json({
         success: false,
         error: 'MISSING_ORDER_ID',
-        message: 'orderId wajib disediakan di path parameter',
+        message: 'orderId or transactionId wajib disediakan di path parameter',
       });
     }
     if (!tenantId) {
@@ -61,7 +65,10 @@ const relayUploadQrOrderPayment = async (req, res) => {
       });
     }
 
-    const adminCoreEndpoint = `${ADMIN_CORE_URL}/api/v1/qr-orders/${encodeURIComponent(orderId)}/payment`;
+    // 🔴 FIX ENDPOINT: Kalau orderId empty (hanya punya txId via by-transaction route) → pakai by-transaction endpoint upstream admin core juga!
+    const adminCoreEndpoint = orderId
+      ? `${ADMIN_CORE_URL}/api/v1/qr-orders/${encodeURIComponent(orderId)}/payment`
+      : `${ADMIN_CORE_URL}/api/v1/qr-orders/by-transaction/${encodeURIComponent(txId)}/payment`;
     const isFormData =
       Boolean(req.is?.('multipart/form-data')) ||
       Boolean(req.file) ||
