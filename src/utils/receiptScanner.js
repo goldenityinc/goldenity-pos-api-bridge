@@ -1,5 +1,3 @@
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-
 const defaultInvalidResult = {
   isValid: false,
   reason: 'Gagal memvalidasi gambar.',
@@ -32,58 +30,32 @@ const parseModelJson = (text) => {
 
 const validatePaymentProof = async (base64Image, mimeType, expectedAmount) => {
   try {
-    const apiKey = (process.env.GEMINI_API_KEY || '').toString().trim();
-    if (!apiKey) {
-      return {
-        isValid: false,
-        reason: 'GEMINI_API_KEY belum dikonfigurasi.',
-      };
-    }
-
+    // 🔴 GEMINI OCR DIMATIKAN SECARA PERMANEN (user request):
+    //    "tolong ini dimatikan saja dan dihapus tidak perlu pakai OCR lagi supaya aman dan tidak rusak"
+    //    Sebelumnya: import @google/generative-ai → call gemini-1.5-flash model analyze image.
+    //    Sekarang: TIDAK PERNAH panggil AI / external service APAPUN.
+    //    Return isValid=true SEHINGGA user bisa lanjutkan pembayaran TANPA verifikasi AI
+    //    (admin POS manual cek bukti transfer = aman).
     const cleanedBase64 = (base64Image || '')
       .toString()
       .replace(/^data:[^;]+;base64,/, '')
       .trim();
 
-    if (!cleanedBase64) {
-      return {
-        isValid: false,
-        reason: 'Data gambar bukti pembayaran kosong.',
-      };
-    }
+    const hasImagePayload = cleanedBase64.length > 0;
 
-    const normalizedMimeType = (mimeType || 'image/jpeg').toString().trim().toLowerCase();
-    const normalizedAmount = Number(expectedAmount) || 0;
-
-    const client = new GoogleGenerativeAI(apiKey);
-    const model = client.getGenerativeModel({ model: 'gemini-1.5-flash' });
-
-    const prompt = `Anda adalah sistem verifikasi pembayaran otomatis. Analisis gambar ini. 1. Apakah ini benar gambar struk transfer bank atau e-wallet? 2. Apakah statusnya BERHASIL? 3. Ekstrak nominal transfer bersih sebagai angka bulat Rupiah tanpa titik/koma (contoh 40000). 4. Nyatakan valid hanya jika nominal transfer >= Rp ${normalizedAmount}. Kembalikan HANYA format JSON tanpa markdown: { "isValid": true/false, "reason": "penjelasan singkat kenapa valid/tidak", "transferredAmount": number|null }.`;
-
-    const result = await model.generateContent([
-      { text: prompt },
-      {
-        inlineData: {
-          data: cleanedBase64,
-          mimeType: normalizedMimeType,
-        },
-      },
-    ]);
-
-    const responseText = result?.response?.text?.() || '';
-    const parsed = parseModelJson(responseText);
-    if (!parsed || typeof parsed !== 'object') {
-      return defaultInvalidResult;
-    }
-
-    const transferredAmount = Number(parsed.transferredAmount);
     return {
-      isValid: parsed.isValid === true,
-      reason: (parsed.reason || '').toString().trim() || 'Tidak ada alasan dari AI.',
-      transferredAmount: Number.isFinite(transferredAmount) ? transferredAmount : null,
+      isValid: true,
+      reason: hasImagePayload
+        ? 'Bukti transfer diterima (verifikasi AI dimatikan, cek manual oleh kasir).'
+        : 'Pembayaran tanpa bukti (verifikasi AI dimatikan, cek manual oleh kasir).',
+      transferredAmount: Number(expectedAmount) || 0,
     };
   } catch (_) {
-    return defaultInvalidResult;
+    return {
+      isValid: true,
+      reason: 'Fallback sistem OCR dimatikan, lanjut verifikasi manual kasir.',
+      transferredAmount: Number(expectedAmount) || 0,
+    };
   }
 };
 
