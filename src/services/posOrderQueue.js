@@ -535,10 +535,38 @@ const enqueueInMemory = (jobData) => {
   return Promise.resolve();
 };
 
-const estimateEtaSeconds = async () => {
+const estimateEtaSeconds = async (branchId) => {
+  // 🔴 CRITICAL ETA DYNAMIC FIX (User exact request):
+  //    - 30 detik = benchmark JIKA SIBUK (bukan hardcoded 30 selaulu!)
+  //    - JIKA TIDAK ADA antrian (pending count=0) → 10 detik default (LEBIH CEPAT).
+  //    - BISA BERTAMBAH SESUAI QUEUE: base 10 + 15 detik per pending order, MAX 120s.
   const pending = await getQueuePendingCount();
-  const perJob = 1.5;
-  return Math.max(0, Math.round(pending * perJob));
+  const perPendingBonusSeconds = 15;
+  const baseNoQueueSeconds = 10;
+  const maxSeconds = 120;
+  // Branch length extra jika ada:
+  let branchAdjust = 0;
+  if (branchId && typeof inMemoryQueueLengthPerBranch.get === 'function') {
+    const branchLen = Number(inMemoryQueueLengthPerBranch.get(branchId)) || 0;
+    if (branchLen > 0) branchAdjust = Math.min(60, branchLen * 10); // max 60s extra dari branch
+  }
+  const total = Math.max(0, Math.round(baseNoQueueSeconds + (Number.isFinite(pending) ? pending : 0) * perPendingBonusSeconds + branchAdjust));
+  return Math.min(maxSeconds, total);
+};
+
+// Sync variant (TIDAK BOLEH await apapun, INSTANT, safe dipanggil sebelum response header)
+const estimateEtaSecondsSync = (branchId) => {
+  const perPendingBonusSeconds = 15;
+  const baseNoQueueSeconds = 10;
+  const maxSeconds = 120;
+  const inMemLen = Number(inMemoryQueue && Array.isArray(inMemoryQueue) ? inMemoryQueue.length : 0) || 0;
+  let branchAdjust = 0;
+  if (branchId && typeof inMemoryQueueLengthPerBranch.get === 'function') {
+    const branchLen = Number(inMemoryQueueLengthPerBranch.get(branchId)) || 0;
+    if (branchLen > 0) branchAdjust = Math.min(60, branchLen * 10);
+  }
+  const total = baseNoQueueSeconds + inMemLen * perPendingBonusSeconds + branchAdjust;
+  return Math.min(maxSeconds, Math.max(baseNoQueueSeconds, Math.round(total)));
 };
 
 const enqueueWebOrderForPrinting = async ({
@@ -1290,6 +1318,7 @@ module.exports = {
   getQueuePendingCount,
   getQueueLengthPerBranch,
   estimateEtaSeconds,
+  estimateEtaSecondsSync,
   submissionStates,
   getOrderSubmissionState,
   adminCoreFetch,

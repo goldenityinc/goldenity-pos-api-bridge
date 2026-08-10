@@ -5,6 +5,7 @@ const {
   getQueuePendingCount,
   getQueueLengthPerBranch,
   estimateEtaSeconds,
+  estimateEtaSecondsSync,
   submissionStates,
   getOrderSubmissionState,
   injectMissingOrderMetadata,
@@ -209,10 +210,18 @@ const submitWebOrderToPos = async (req, res) => {
     //    User Network Tab: POST web-order status = 202 Accepted < 500ms.
     //    No queue operations, no Redis, no BullMQ touched before this.
     const transactionId = body.transactionId || body.transaction_id || null;
+    // 🔴 DYNAMIC ETA (user request: 30 detik benchmark, 10 detik jika kosong):
+    //    estimateEtaSecondsSync() = SYNC INSTANT (NO BULLMQ AWAIT, 0ms overhead).
+    //    - Queue EMPTY → return 10s (baseNoQueueSeconds = 10).
+    //    - Ada 1 pending → 10 + 15 = 25s.
+    //    - Ada 2+ pending → 10 + (N * 15) + branchAdjust. MAX 120s.
+    const etaSyncSeconds = estimateEtaSecondsSync(branchId);
     const pollHintByTx =
       transactionId
         ? `/api/v1/relay/orders/by-transaction/${encodeURIComponent(String(transactionId))}`
         : '';
+    // Header X-Queue-Eta supaya frontend api.ts line 977 langsung tangkap tanpa parsing body.
+    try { res.setHeader('X-Queue-Eta', String(etaSyncSeconds)); } catch (_) { /* noop */ }
     res.status(202).json({
       ok: true,
       ackStatus: 'PENDING_ACK',
@@ -220,7 +229,7 @@ const submitWebOrderToPos = async (req, res) => {
         'Pesanan diterima Bridge POS. Jalur enqueue berjalan di background (fire-and-forget absolute). Silakan polling ack-status setiap 2 detik.',
       submissionId,
       transactionId,
-      etaNextQueue: 0,
+      etaNextQueue: etaSyncSeconds,
       pollIntervalMs: 2000,
       pollHintUrls: {
         bySubmissionId: `/api/v1/relay/orders/by-submission/${encodeURIComponent(submissionId)}/ack-status`,
@@ -265,7 +274,14 @@ const submitWebOrderToPos = async (req, res) => {
 // PINDAH KESINI SEMUA. TIDAK BOLEH blocking request lifecycle!
 // ==========================================================
 const _submitWebOrderBackgroundWorker = async (args) => {
-  const { submissionId, tenantId, branchId, transactionId, targetDeviceUuid, orderPayload, salesRecordId } = args;
+  // 🔴 FIX ReferenceError rawBody not defined: INCLUDE rawBody dalam destructure!
+  //    line 243 invoke passing rawBody: body, tapi line 268 destructure TIDAK ADA →
+  //    line 299/300/310/316/319 pakai rawBody → ReferenceError (screenshot Railway).
+  const { submissionId, tenantId, branchId, transactionId, targetDeviceUuid, orderPayload, salesRecordId, rawBody } = args;
+  // Pastikan rawBody selalu object (bukan undefined/null), supaya downstream tidak throw.
+  const safeRawBody = (rawBody && typeof rawBody === 'object') ? rawBody : (orderPayload && typeof orderPayload === 'object' ? orderPayload : {});
+  // Safety: override nama variable rawBody ke safeRawBody (kalau sebelumnya undefined, sekarang aman)
+  const _unusedOverrideRaw = null;
   try {
     // (A) Idempotency cache check (BACKGROUND ONLY):
     let existingState = null;
@@ -295,9 +311,9 @@ const _submitWebOrderBackgroundWorker = async (args) => {
 
     // (B) Tulis stub idempotency PENDING_ACK ke cache:
     // 🔴 [MISSING METADATA FIX] PERTAMA: inject missing order metadata (scan nested orderData/transactionData dll)
-    //    ke orderPayload dan rawBody → supaya submissionStates cache + downstream enqueue DAPAT semuanya.
-    try { injectMissingOrderMetadata(orderPayload, { rawBody, tenantId, branchId, transactionId, salesRecordId, submissionId }); } catch (_) { /* noop */ }
-    try { injectMissingOrderMetadata(rawBody, { tenantId, branchId, transactionId, salesRecordId, submissionId }); } catch (_) { /* noop */ }
+    //    ke orderPayload dan safeRawBody → supaya submissionStates cache + downstream enqueue DAPAT semuanya.
+    try { injectMissingOrderMetadata(orderPayload, { rawBody: safeRawBody, tenantId, branchId, transactionId, salesRecordId, submissionId }); } catch (_) { /* noop */ }
+    try { injectMissingOrderMetadata(safeRawBody, { tenantId, branchId, transactionId, salesRecordId, submissionId }); } catch (_) { /* noop */ }
 
     const enqueueArgs = Object.freeze({
       tenantId,
@@ -307,19 +323,19 @@ const _submitWebOrderBackgroundWorker = async (args) => {
       submissionId,
       transactionId,
       salesRecordId,
-      rawBody,
+      rawBody: safeRawBody,
     });
     try {
       if (submissionStates instanceof Map) {
         const normalizedTopFields = (() => {
           try {
-            const payload = (orderPayload && typeof orderPayload === 'object') ? orderPayload : (rawBody || {});
+            const payload = (orderPayload && typeof orderPayload === 'object') ? orderPayload : (safeRawBody || {});
             const table = payload.table && typeof payload.table === 'object' ? payload.table : {};
             return Object.freeze({
-              tableId: String(payload.tableId || payload.table_id || table.id || table.tableId || table.table_id || rawBody.tableId || rawBody.table_id || '').trim(),
-              table_id: String(payload.table_id || payload.tableId || table.id || table.table_id || table.tableId || rawBody.table_id || rawBody.tableId || '').trim(),
-              tableNumber: String(payload.tableNumber || payload.table_number || payload.tableName || payload.table_name || payload.tableLabel || payload.tableNo || payload.noMeja || payload.nomorMeja || table.tableNumber || table.table_number || table.name || table.label || table.number || table.no || rawBody.tableNumber || rawBody.table || '').trim(),
-              table_number: String(payload.table_number || payload.tableNumber || payload.tableNo || payload.noMeja || table.table_number || table.tableNumber || table.name || table.label || table.number || rawBody.table || '').trim(),
+              tableId: String(payload.tableId || payload.table_id || table.id || table.tableId || table.table_id || safeRawBody.tableId || safeRawBody.table_id || '').trim(),
+              table_id: String(payload.table_id || payload.tableId || table.id || table.table_id || table.tableId || safeRawBody.table_id || safeRawBody.tableId || '').trim(),
+              tableNumber: String(payload.tableNumber || payload.table_number || payload.tableName || payload.table_name || payload.tableLabel || payload.tableNo || payload.noMeja || payload.nomorMeja || table.tableNumber || table.table_number || table.name || table.label || table.number || table.no || safeRawBody.tableNumber || safeRawBody.table || '').trim(),
+              table_number: String(payload.table_number || payload.tableNumber || payload.tableNo || payload.noMeja || table.table_number || table.tableNumber || table.name || table.label || table.number || safeRawBody.table || '').trim(),
             });
           } catch (_e) {
             return Object.freeze({ tableId: '', table_id: '', tableNumber: '', table_number: '' });
