@@ -848,8 +848,137 @@ const normalizeTopLevelOrderEnvelopeFields = (orderPayloadRaw, ctx = {}) => {
   return fallback;
 };
 
+// 🔴 CRITICAL FIX: ITEM QUANTITY FALLBACK AGGRESSIVE (user report: Receipt 0 x Rp 10.000 padahal total benar)
+//    Web ordering / Admin Core kirim item field nama BEDA-BEDA: qty, quantity, qty_ordered, item_qty, order_qty, count, amount.
+//    TANPA FALLBACK INI: POS Flutter extract quantity dari field yang SALAH → default 0 → "0 x Rp 10.000" di cetakan.
+//    DEFAULT MINIMUM 1 BUKAN 0 (jika SEMUA field tidak ada = setidaknya 1 item, bukan 0).
+const normalizeEachItemWithAllFieldFallbacks = (itemsRaw) => {
+  if (!Array.isArray(itemsRaw)) return [];
+  return itemsRaw.map((itRaw, idx) => {
+    const it = (itRaw && typeof itRaw === 'object') ? itRaw : {};
+    // 🔴 QUANTITY PRIORITY FALLBACK: default MIN = 1 BUKAN 0!
+    const qtyCandidates = [
+      it.quantity, it.qty, it.item_qty, it.itemQuantity, it.item_quantity,
+      it.qty_ordered, it.order_qty, it.orderedQty, it.ordered_qty,
+      it.count, it.qtyValue, it.qty_value, it.amount, it.number,
+      it.quantityValue, it.quantity_value, it['qty-ordered'], it['quantity-ordered'],
+      (it.product && it.product.qty), (it.product && it.product.quantity),
+    ];
+    let resolvedQty = NaN;
+    for (const qv of qtyCandidates) {
+      if (qv === null || qv === undefined || qv === '') continue;
+      const num = Number(qv);
+      if (Number.isFinite(num)) { resolvedQty = num; break; }
+    }
+    // MINIMUM 1 BUKAN 0. 0 = tidak masuk akal (user pasti pesan setidaknya 1).
+    if (!Number.isFinite(resolvedQty) || resolvedQty <= 0) resolvedQty = 1;
+    // 🔴 PRICE FALLBACK
+    const priceCandidates = [
+      it.unitPrice, it.unit_price, it.pricePerUnit, it.price_per_unit, it.basePrice, it.base_price,
+      it.sellPrice, it.sell_price, it.finalUnitPrice, it.final_unit_price,
+      it.price, it.productPrice, it.product_price, it.amount, it.unit_amount,
+      (it.product && (it.product.price || it.product.sellPrice || it.product.unitPrice)),
+    ];
+    let resolvedUnitPrice = NaN;
+    for (const pv of priceCandidates) {
+      if (pv === null || pv === undefined || pv === '') continue;
+      const num = Number(pv);
+      if (Number.isFinite(num)) { resolvedUnitPrice = num; break; }
+    }
+    if (!Number.isFinite(resolvedUnitPrice) || resolvedUnitPrice < 0) resolvedUnitPrice = 0;
+    // 🔴 SUBTOTAL FALLBACK
+    const subtotalCandidates = [
+      it.subtotal, it.sub_total, it.lineTotal, it.line_total, it.totalPrice, it.total_price,
+      it.lineAmount, it.line_amount, it.amount, it.rowTotal, it.row_total,
+      (Number.isFinite(resolvedQty) && Number.isFinite(resolvedUnitPrice) ? resolvedQty * resolvedUnitPrice : NaN),
+    ];
+    let resolvedSubtotal = NaN;
+    for (const sv of subtotalCandidates) {
+      if (sv === null || sv === undefined || sv === '') continue;
+      const num = Number(sv);
+      if (Number.isFinite(num)) { resolvedSubtotal = num; break; }
+    }
+    if (!Number.isFinite(resolvedSubtotal) || resolvedSubtotal < 0) resolvedSubtotal = resolvedQty * resolvedUnitPrice;
+    // 🔴 NAME / PRODUCT FALLBACK
+    const nameCandidates = [
+      it.productName, it.product_name, it.name, it.itemName, it.item_name,
+      it.title, it.label, it.displayName, it.display_name, it.description,
+      (it.product && (it.product.name || it.product.productName || it.product.title || it.product.label)),
+    ];
+    let resolvedName = '';
+    for (const nv of nameCandidates) {
+      const ns = (nv !== null && nv !== undefined) ? String(nv).trim() : '';
+      if (ns.length > 0) { resolvedName = ns; break; }
+    }
+    if (resolvedName === '') resolvedName = `Item ${idx + 1}`;
+    // 🔴 ID FALLBACK
+    const idCandidates = [
+      it.productId, it.product_id, it.itemId, it.item_id, it.id, it.sku, it.SKU, it.code,
+      (it.product && (it.product.id || it.product.productId || it.product.sku)),
+    ];
+    let resolvedId = '';
+    for (const iv of idCandidates) {
+      const is = (iv !== null && iv !== undefined) ? String(iv).trim() : '';
+      if (is.length > 0) { resolvedId = is; break; }
+    }
+    // NOTES FALLBACK
+    const notesCandidates = [
+      it.notes, it.variantNotes, it.variant_notes, it.itemNote, it.item_note,
+      it.customization, it.customizations, it.comment, it.remark, it.variant,
+    ];
+    let resolvedNotes = '';
+    for (const nsv of notesCandidates) {
+      const s = (nsv !== null && nsv !== undefined) ? String(nsv).trim() : '';
+      if (s.length > 0) { resolvedNotes = s; break; }
+    }
+    return {
+      ...it,
+      // WRITE BACK BANYAK KEY VARIANTS AGAR BAGaimanapun POS Flutter extractor ambil → DAPAT!
+      quantity: resolvedQty,
+      qty: resolvedQty,
+      item_qty: resolvedQty,
+      itemQuantity: resolvedQty,
+      item_quantity: resolvedQty,
+      qty_ordered: resolvedQty,
+      order_qty: resolvedQty,
+      count: resolvedQty,
+      unitPrice: resolvedUnitPrice,
+      unit_price: resolvedUnitPrice,
+      price: resolvedUnitPrice,
+      pricePerUnit: resolvedUnitPrice,
+      price_per_unit: resolvedUnitPrice,
+      sellPrice: resolvedUnitPrice,
+      lineTotal: resolvedSubtotal,
+      line_total: resolvedSubtotal,
+      subtotal: resolvedSubtotal,
+      sub_total: resolvedSubtotal,
+      totalPrice: resolvedSubtotal,
+      total_price: resolvedSubtotal,
+      lineAmount: resolvedSubtotal,
+      productName: resolvedName,
+      product_name: resolvedName,
+      name: resolvedName,
+      itemName: resolvedName,
+      item_name: resolvedName,
+      productId: resolvedId,
+      product_id: resolvedId,
+      itemId: resolvedId,
+      item_id: resolvedId,
+      notes: resolvedNotes,
+      itemNotes: resolvedNotes,
+      item_notes: resolvedNotes,
+      variantNotes: resolvedNotes,
+      index: idx,
+    };
+  });
+};
+
 const buildOrderEnvelope = (submissionId, tenantId, branchId, deviceUuid, orderPayload, transactionId, salesRecordId) => {
   const normalizedTop = normalizeTopLevelOrderEnvelopeFields(orderPayload, { transactionId, salesRecordId, tenantId, branchId });
+  // 🔴 APPLY ITEM NORMALIZATION SEKARANG: quantity / unitPrice / name / id / subtotal fallback semua variants.
+  const normalizedItemsResolved = normalizeEachItemWithAllFieldFallbacks(normalizedTop.items);
+  normalizedTop.items = normalizedItemsResolved;
+  normalizedTop.items_json = normalizedItemsResolved;
   // 🔴 2-STEP QRIS FLOW: Detect print_type dari payload (dari Admin Core socket payload).
   //    - print_type = 'CHECKER_ONLY' (Step 1 QRIS): POS HANYA cetak Kitchen Checker, JANGAN cetak Struk Sales Receipt.
   //    - print_type = 'RECEIPT_ONLY' (Step 2 QRIS PAID): POS HANYA cetak Struk Sales Receipt, JANGAN cetak Checker lagi.

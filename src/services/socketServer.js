@@ -57,14 +57,50 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
   //    POS Flutter lama listen "incoming-web-order".
   //    POS Flutter baru / Admin Web listen "incoming_qr_order" atau "new_web_order".
   //    2-STEP QRIS BARU: "new_web_order_checker" (Step 1: checker only), "web_order_paid" (Step 2: receipt paid)
-  //    SOLUSI: EMIT SEMUA EVENT NAME RELEVAN DENGAN PAYLOAD YANG SAMA → pastikan tertangkap apapun listener nya.
-  const emitMultiEvent = (targetObj, payload) => {
+  //    🔴 PREVENT DUPLICATE PRINT DISPATCHER (user complaint: checker 2x + struk 3x):
+  //       JANGAN PERNAH emit FULL (new_web_order) BARENG CHECKER_ONLY atau PAID_RECEIPT_ONLY
+  //       karena POS Flutter masing2 listener print sendiri2 → HELAI GANDA!
+  const _resolvePrintType = (payload) => {
+    const pt = String(
+      (payload && (
+        payload.printType ||
+        payload.print_type ||
+        payload.__print_type ||
+        payload.printTarget ||
+        payload.print_target ||
+        ''
+      )) || ''
+    ).trim().toUpperCase();
+    const isCheckerOnly =
+      pt === 'CHECKER_ONLY' ||
+      pt === 'KITCHEN' ||
+      pt === 'CHECKER' ||
+      Boolean(payload && (
+        payload.__qris_unpaid_checker_only === true ||
+        payload.checkerOnly === true ||
+        payload.checker_only === true
+      ));
+    const isPaidReceiptOnly =
+      pt === 'PAID_RECEIPT_ONLY' ||
+      pt === 'RECEIPT_ONLY' ||
+      pt === 'PAID' ||
+      pt === 'CASHIER_RECEIPT' ||
+      Boolean(payload && (
+        payload.__paid_only === true ||
+        payload.paidReceiptOnly === true ||
+        payload.paid_receipt_only === true
+      ));
+    if (isCheckerOnly) return 'CHECKER_ONLY';
+    if (isPaidReceiptOnly) return 'PAID_RECEIPT_ONLY';
+    return 'FULL_ORDER';
+  };
+
+  // [A] FULL ORDER DISPATCHER (Pay At Cashier default): HANYA emit general order events TANPA checker/paid spesifik
+  //     → POS Flutter listen new_web_order → yang ngehandle WRITE LOCAL + NOTIF + PRINT CHECKER + PRINT UNPAID RECEIPT
+  const emitFullOrderEvents = (targetObj, payload) => {
     try { targetObj.emit('incoming-web-order', payload); } catch (_) {}
     try { targetObj.emit('incoming_qr_order', payload); } catch (_) {}
     try { targetObj.emit('new_web_order', payload); } catch (_) {}
-    try { targetObj.emit('new_web_order_checker', payload); } catch (_) {}
-    try { targetObj.emit('web_order_paid', payload); } catch (_) {}
-    try { targetObj.emit('web_order_paid_receipt', payload); } catch (_) {}
   };
 
   // Fungsi khusus 2-step: emit HANYA event CHECKER (Step 1) — dipanggil manual dari queue jika payload print_type=CHECKER_ONLY
@@ -80,6 +116,15 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
     try { targetObj.emit('web_order_paid_receipt', payload); } catch (_) {}
     try { targetObj.emit('qris_paid', payload); } catch (_) {}
     try { targetObj.emit('payment_success', payload); } catch (_) {}
+  };
+
+  // 🎯 PICK EMITTER BERDASARKAN PAYLOAD PRINT TYPE (HINDARI DOUBLE / TRIPLE PRINT!)
+  const dispatchPrintEvents = (targetObj, payload) => {
+    const mode = _resolvePrintType(payload);
+    if (mode === 'CHECKER_ONLY') return emitCheckerOnly(targetObj, payload);
+    if (mode === 'PAID_RECEIPT_ONLY') return emitPaidReceiptOnly(targetObj, payload);
+    // DEFAULT FULL ORDER: Pay-at-Cashier / unknown mode
+    return emitFullOrderEvents(targetObj, payload);
   };
 
   // 🔴 CRITICAL FIX 1 — SOCKET BROADCAST (DUAL-NAMESPACE DELIVERY):
@@ -118,7 +163,7 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
       const branchRoom = buildBranchRoom(branchId);
       const socketsInBranchRoom = ns.adapter?.rooms?.get(branchRoom);
       if (socketsInBranchRoom && socketsInBranchRoom.size > 0) {
-        emitMultiEvent(ns.to(branchRoom), orderPayload);
+        dispatchPrintEvents(ns.to(branchRoom), orderPayload);
         stats.branchEmitted = true;
         nsStats.branch = socketsInBranchRoom.size;
         stats.branchSockets = Math.max(stats.branchSockets, socketsInBranchRoom.size);
@@ -131,7 +176,7 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
       const deviceRoom = buildDeviceRoom(targetDeviceUuid);
       const socketsInDeviceRoom = ns.adapter?.rooms?.get(deviceRoom);
       if (socketsInDeviceRoom && socketsInDeviceRoom.size > 0) {
-        emitMultiEvent(ns.to(deviceRoom), orderPayload);
+        dispatchPrintEvents(ns.to(deviceRoom), orderPayload);
         stats.deviceEmitted = true;
         nsStats.device = socketsInDeviceRoom.size;
         stats.deviceSockets = Math.max(stats.deviceSockets, socketsInDeviceRoom.size);
@@ -144,7 +189,7 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
       const tenantRoom = buildTenantRoom(String(tenantIdFromPayload).trim());
       const socketsInTenantRoom = ns.adapter?.rooms?.get(tenantRoom);
       if (socketsInTenantRoom && socketsInTenantRoom.size > 0) {
-        emitMultiEvent(ns.to(tenantRoom), orderPayload);
+        dispatchPrintEvents(ns.to(tenantRoom), orderPayload);
         stats.tenantEmitted = true;
         nsStats.tenant = socketsInTenantRoom.size;
         stats.tenantSockets = Math.max(stats.tenantSockets, socketsInTenantRoom.size);
@@ -165,7 +210,7 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
       });
       if (allConnected.length > 0) {
         for (const s of allConnected) {
-          try { emitMultiEvent(s, orderPayload); } catch (_) {}
+          try { dispatchPrintEvents(s, orderPayload); } catch (_) {}
         }
         stats.manualEmitted = true;
         nsStats.manual = allConnected.length;
