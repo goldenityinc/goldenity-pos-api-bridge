@@ -449,47 +449,92 @@ const startWatchdog = (stateEntry, submissionId, tenantId, branchId, deviceUuid,
   if (stateEntry.watchdogTimer) {
     clearTimeout(stateEntry.watchdogTimer);
   }
+  // 🔴 100% UNHANDLED REJECTION SAFETY WRAPPER:
+  // onWatchdogTimeout is async, so if ANY exception throws inside it
+  // (updateOrderSyncStatus / finalizeReject / emitIncomingWebOrder),
+  // the setTimeout callback would otherwise produce an unhandled promise
+  // rejection that bubbles up to Node.js processTicksAndRejections crash.
+  // We swallow and log here so the NODE SERVER STAYS ALIVE no matter what.
   stateEntry.watchdogTimer = setTimeout(() => {
-    onWatchdogTimeout(stateEntry, submissionId, tenantId, branchId, deviceUuid, orderPayload, transactionId, salesRecordId);
+    Promise.resolve()
+      .then(() => onWatchdogTimeout(
+        stateEntry, submissionId, tenantId, branchId, deviceUuid, orderPayload, transactionId, salesRecordId,
+      ))
+      .catch((err) => {
+        try {
+          const ts = new Date().toISOString();
+          // eslint-disable-next-line no-console
+          console.error(
+            `[${ts}] [posOrderQueue::startWatchdog] CAUGHT UNHANDLED EXCEPTION inside onWatchdogTimeout (server continue alive). ` +
+            `submissionId=${submissionId} tenant=${tenantId} branch=${branchId} errName=${err?.name || '-'} errMsg=${err?.message || err} errStack=${(err?.stack || '').split('\n').slice(0, 4).join(' | ')}`,
+          );
+        } catch (_) { /* double safety: logger error never kills watchdog either */ }
+      });
   }, timeoutSec * 1000);
 };
 
 const onWatchdogTimeout = async (stateEntry, submissionId, tenantId, branchId, deviceUuid, orderPayload, transactionId, salesRecordId) => {
-  if (stateEntry.resolved) return;
-  stateEntry.watchdogTimer = null;
-
-  if (stateEntry.retries <= 0) {
-    stateEntry.retries += 1;
-    // 🔴 CRITICAL FIX - BROADCAST RETRY KE BRANCH ROOM, BUKAN 1 device:
-    //    Pass deviceUuid = '' supaya emitIncomingWebOrder SELALU broadcast BRANCH.
-    const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
-    const emitResult = emitIncomingWebOrder('', branchId, envelope);
-    // Selalu append ke long-poll branch-level juga (jika ada longpoll clients)
-    const branchKey = `__branch:${branchId}`;
-    const branchBucket = getLongPollBucket(branchKey);
-    branchBucket.push({ ...envelope, queuedAt: Date.now() });
-    if (branchBucket.length > 200) branchBucket.splice(0, branchBucket.length - 200);
-    notifyLongPollWaiters(branchKey);
-    startWatchdog(stateEntry, submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
-    return;
-  }
-
   try {
-    await updateOrderSyncStatus(submissionId, tenantId, 'FAILED_DELIVERY', {
-      resolvedTargetDeviceUuid: deviceUuid,
-      failureReason: 'POS_ACK_TIMEOUT',
-      transactionId,
-      salesRecordId,
-    });
-  } catch (_) {}
+    if (stateEntry.resolved) return;
+    stateEntry.watchdogTimer = null;
 
-  finalizeReject(stateEntry, submissionId, {
-    statusCode: 504,
-    code: 'POS_ACK_TIMEOUT',
-    message: `Perangkat POS tidak merespon dalam ${getAckTimeoutSeconds()} detik`,
-    retryAvailable: true,
-    submissionId,
-  });
+    if (stateEntry.retries <= 0) {
+      stateEntry.retries += 1;
+      // 🔴 CRITICAL FIX - BROADCAST RETRY KE BRANCH ROOM, BUKAN 1 device:
+      //    Pass deviceUuid = '' supaya emitIncomingWebOrder SELALU broadcast BRANCH.
+      const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
+      try {
+        const emitResult = emitIncomingWebOrder('', branchId, envelope);
+      } catch (_) { /* emit failure must NEVER kill watchdog */ }
+      // Selalu append ke long-poll branch-level juga (jika ada longpoll clients)
+      try {
+        const branchKey = `__branch:${branchId}`;
+        const branchBucket = getLongPollBucket(branchKey);
+        branchBucket.push({ ...envelope, queuedAt: Date.now() });
+        if (branchBucket.length > 200) branchBucket.splice(0, branchBucket.length - 200);
+        try { notifyLongPollWaiters(branchKey); } catch (_) {}
+      } catch (_) { /* longpoll push failure never kills flow */ }
+      startWatchdog(stateEntry, submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
+      return;
+    }
+
+    try {
+      await updateOrderSyncStatus(submissionId, tenantId, 'FAILED_DELIVERY', {
+        resolvedTargetDeviceUuid: deviceUuid,
+        failureReason: 'POS_ACK_TIMEOUT',
+        transactionId,
+        salesRecordId,
+      });
+    } catch (_) { /* core notification failure -> ignore, continue finalize */ }
+
+    // 🔴 SAFE FINALIZE (never throw). Instead of propagating a promise
+    // rejection that no caller is awaiting (watchdog callbacks have no
+    // caller awaiting the returned promise), finalizeReject below:
+    //   (a) resolves the user-facing stateEntry.promise with the error
+    //       (so poll/ack callers who AWAIT that promise get a proper result)
+    //   (b) but NEVER allows that Error object to bubble up to
+    //       processTicksAndRejections as an "unhandledRejection".
+    finalizeReject(stateEntry, submissionId, {
+      statusCode: 504,
+      code: 'POS_ACK_TIMEOUT',
+      message: `Perangkat POS tidak merespon dalam ${getAckTimeoutSeconds()} detik`,
+      retryAvailable: true,
+      submissionId,
+      _fromWatchdog: true,
+    });
+  } catch (topLevelErr) {
+    // ⚠️ 100% final safety net for onWatchdogTimeout body.
+    // If anything above (envelope build, retries check, state checks, ...)
+    // somehow throws, we log it and swallow. NO RE-THROW here.
+    try {
+      const ts = new Date().toISOString();
+      // eslint-disable-next-line no-console
+      console.error(
+        `[${ts}] [posOrderQueue::onWatchdogTimeout] TOP-LEVEL catch (server continue alive). ` +
+        `submissionId=${submissionId} tenant=${tenantId} branch=${branchId} err=${topLevelErr?.message || topLevelErr}`,
+      );
+    } catch (_) { /* logger error double guard */ }
+  }
 };
 
 const normalizeTopLevelOrderEnvelopeFields = (orderPayloadRaw, ctx = {}) => {
