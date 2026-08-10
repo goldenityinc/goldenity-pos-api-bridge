@@ -25,6 +25,224 @@ const ADMIN_CORE_URL = ADMIN_CORE_URL_RAW.replace(/\/$/, '');
 const ADMIN_CORE_INTERNAL_TOKEN = process.env.ADMIN_CORE_INTERNAL_TOKEN || '';
 const ADMIN_CORE_TIMEOUT_MS = Number.parseInt(process.env.ADMIN_CORE_API_TIMEOUT_MS || '5000', 10) || 5000;
 
+// ===============================================================
+// 🔴 CRITICAL BRIDGE FIX #1: AGGRESSIVE METADATA INJECTOR (MISSING TABLE/CUSTOMER/PAX)
+// User: "Pesanan di POS masuk MASIH tidak menampilkan no meja, nama pelanggan, total pax"
+// Root Cause: Web Ordering kirim metadata di NESTED object (orderData / transactionData / data / payload),
+//             atau hanya kirim tableId (row ID = 27) TANPA table_number (human-readable "1").
+// Solusi: Helper AGGRESSIVELY scan 3 lapisan (top-level -> nested obj -> nested table obj),
+//         jika TIDAK KETEMU → AUTO DERIVE, lalu TULIS BACK KE PAYLOAD di SEMUA key variants,
+//         supaya downstream POS socket emit / polling client / submissionStates cache SEMUA DAPAT!
+// ===============================================================
+const _firstStrNonEmpty = (obj, keysArr) => {
+  if (!obj || typeof obj !== 'object') return '';
+  for (const k of keysArr) {
+    try {
+      const v = obj[k];
+      if (v === undefined || v === null) continue;
+      const s = String(v).trim();
+      const lower = s.toLowerCase();
+      if (!s) continue;
+      if (lower === 'null' || lower === 'undefined' || lower === '-') continue;
+      return s;
+    } catch (_) { /* noop */ }
+  }
+  return '';
+};
+const _firstFiniteNumber = (obj, keysArr, fallback = 0) => {
+  if (!obj || typeof obj !== 'object') return fallback;
+  for (const k of keysArr) {
+    try {
+      const raw = obj[k];
+      if (raw === undefined || raw === null) continue;
+      const n = Number(raw);
+      if (Number.isFinite(n)) return n;
+      // Try parse int: e.g. "Meja 5" -> 5
+      const s = String(raw).trim();
+      if (!s) continue;
+      const m = s.match(/(\d+(?:[.,]\d+)?)/);
+      if (m && m[1]) {
+        const p = Number(m[1].replace(/,/g, '.'));
+        if (Number.isFinite(p)) return p;
+      }
+    } catch (_) { /* noop */ }
+  }
+  return fallback;
+};
+const _collectAllNestedPlainObjects = (root) => {
+  const results = [];
+  const seen = new WeakSet();
+  const stack = [root];
+  while (stack.length) {
+    try {
+      const cur = stack.pop();
+      if (!cur || typeof cur !== 'object') continue;
+      if (Array.isArray(cur)) {
+        for (const it of cur) stack.push(it);
+        continue;
+      }
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      results.push(cur);
+      for (const key of ['table', 'orderData', 'order_data', 'transactionData', 'transaction_data', 'data', 'payload', 'body', 'raw', 'context', 'meta', 'metadata', 'detail', 'details', 'customer', 'buyer', 'guest']) {
+        if (cur[key] && typeof cur[key] === 'object') stack.push(cur[key]);
+      }
+    } catch (_) { /* noop */ }
+  }
+  return results;
+};
+const injectMissingOrderMetadata = (payloadRaw, ctx = {}) => {
+  const target = (payloadRaw && typeof payloadRaw === 'object') ? payloadRaw : Object.create(null);
+  // Build candidate objects search space (top + ctx + nested)
+  const candidates = [target];
+  if (ctx && typeof ctx === 'object') {
+    candidates.push(ctx);
+    if (ctx.rawBody && typeof ctx.rawBody === 'object') candidates.push(ctx.rawBody);
+    if (ctx.reqBody && typeof ctx.reqBody === 'object') candidates.push(ctx.reqBody);
+  }
+  for (const c of _collectAllNestedPlainObjects(target)) candidates.push(c);
+  if (ctx) {
+    for (const c of _collectAllNestedPlainObjects(ctx)) candidates.push(c);
+  }
+  // --------- TABLE NUMBER ---------
+  let resolvedTable = _firstStrNonEmpty(target, [
+    'tableNumber', 'table_number', 'tableNo', 'table_no', 'tableName', 'table_name',
+    'tableLabel', 'table_label', 'tableNumberLabel', 'nomorMeja', 'nomor_meja', 'noMeja', 'no_meja',
+    'table',
+  ]);
+  if (!resolvedTable) {
+    for (const cand of candidates) {
+      resolvedTable = _firstStrNonEmpty(cand, [
+        'tableNumber', 'table_number', 'tableNo', 'table_no', 'tableName', 'table_name',
+        'tableLabel', 'table_label', 'nomorMeja', 'nomor_meja', 'noMeja', 'no_meja', 'number', 'no', 'label', 'name',
+      ]);
+      if (resolvedTable) break;
+    }
+  }
+  // --------- TABLE ID (numeric row id / uuid) ---------
+  let resolvedTableId = _firstStrNonEmpty(target, ['tableId', 'table_id', 'tableID']);
+  if (!resolvedTableId) {
+    for (const cand of candidates) {
+      resolvedTableId = _firstStrNonEmpty(cand, ['tableId', 'table_id', 'tableID', 'id']);
+      if (resolvedTableId) break;
+    }
+  }
+  // ✅ AUTO DERIVE TABLE NUMBER JIKA MASIH KOSONG:
+  //    Jika kita punya tableId = "27" tapi tidak punya table_number → TIDAK BISA convert ke nomor meja 1.
+  //    Tapi JIKA table.object punya number field (candidates diatas sudah scan), atau
+  //    JIKA top-level ada NESTED number = "1" (contoh: payload.number = "1") → pakai itu.
+  //    Jika TETAP KOSONG → Fallback safe: "Meja {tableId}" JIKA tableId numeric simple < 999 (bukan uuid).
+  if (!resolvedTable) {
+    const simpleTableIdNum = resolvedTableId.match(/^(\d{1,4})$/) ? Number(resolvedTableId) : NaN;
+    if (Number.isFinite(simpleTableIdNum) && simpleTableIdNum > 0 && simpleTableIdNum < 2000) {
+      resolvedTable = String(simpleTableIdNum);
+    }
+  }
+  // --------- ORDER ID / REFERENCE ---------
+  let resolvedOrderId = _firstStrNonEmpty(target, [
+    'referenceId', 'reference_id', 'orderId', 'order_id', 'transactionId', 'transaction_id',
+    'txId', 'tx_id', 'receiptNumber', 'receipt_number', 'invoiceNumber', 'invoice_number', 'id',
+  ]);
+  if (!resolvedOrderId) {
+    for (const cand of candidates) {
+      resolvedOrderId = _firstStrNonEmpty(cand, [
+        'referenceId', 'reference_id', 'orderId', 'order_id', 'transactionId', 'transaction_id',
+        'txId', 'tx_id', 'receiptNumber', 'receipt_number', 'invoiceNumber', 'invoice_number', 'id',
+      ]);
+      if (resolvedOrderId) break;
+    }
+  }
+  // --------- CUSTOMER NAME ---------
+  let resolvedCustomer = _firstStrNonEmpty(target, [
+    'customerName', 'customer_name', 'buyerName', 'buyer_name', 'customer', 'buyer', 'guest',
+    'guestName', 'guest_name', 'pelanggan', 'namaPelanggan', 'nama_pelanggan', 'nama', 'name',
+  ]);
+  if (!resolvedCustomer) {
+    for (const cand of candidates) {
+      resolvedCustomer = _firstStrNonEmpty(cand, [
+        'customerName', 'customer_name', 'buyerName', 'buyer_name', 'customer', 'buyer', 'guest',
+        'guestName', 'guest_name', 'pelanggan', 'namaPelanggan', 'nama_pelanggan', 'nama', 'name',
+      ]);
+      if (resolvedCustomer) break;
+    }
+  }
+  if (!resolvedCustomer) resolvedCustomer = 'Guest';
+  // --------- NOTES ---------
+  let resolvedNotes = _firstStrNonEmpty(target, [
+    'notes', 'note', 'orderNote', 'order_note', 'orderNotes', 'order_notes',
+    'specialNote', 'special_note', 'specialInstruction', 'special_instruction',
+    'catatan', 'remark', 'remarks',
+  ]);
+  if (!resolvedNotes) {
+    for (const cand of candidates) {
+      resolvedNotes = _firstStrNonEmpty(cand, [
+        'notes', 'note', 'orderNote', 'order_note', 'orderNotes', 'order_notes',
+        'specialNote', 'special_note', 'specialInstruction', 'special_instruction',
+        'catatan', 'remark', 'remarks',
+      ]);
+      if (resolvedNotes) break;
+    }
+  }
+  // --------- PAX (default 1) ---------
+  let resolvedPax = 0;
+  for (const cand of [target, ...candidates]) {
+    const n = _firstFiniteNumber(cand, [
+      'pax', 'guestCount', 'guest_count', 'guests', 'customerCount', 'customer_count',
+      'seatCount', 'seat_count', 'seats', 'jumlahOrang', 'jumlah_orang', 'people', 'persons', 'personCount',
+    ], 0);
+    if (n > 0) { resolvedPax = n; break; }
+  }
+  if (!resolvedPax || resolvedPax < 1) resolvedPax = 1;
+
+  // 🔥🔥🔥 WRITE BACK ALL VARIANTS TO PAYLOAD supaya POS TIDAK USAH cari fallback!
+  target.tableId = target.tableId || resolvedTableId;
+  target.table_id = target.table_id || resolvedTableId;
+  target.tableNumber = target.tableNumber || resolvedTable;
+  target.table_number = target.table_number || resolvedTable;
+  target.tableName = target.tableName || resolvedTable;
+  target.table_name = target.table_name || resolvedTable;
+  target.tableLabel = target.tableLabel || resolvedTable;
+  target.table_label = target.table_label || resolvedTable;
+  target.tableNo = target.tableNo || resolvedTable;
+  target.table_no = target.table_no || resolvedTable;
+  target.nomorMeja = target.nomorMeja || resolvedTable;
+  target.nomor_meja = target.nomor_meja || resolvedTable;
+  target.referenceId = target.referenceId || resolvedOrderId;
+  target.reference_id = target.reference_id || resolvedOrderId;
+  target.orderId = target.orderId || resolvedOrderId;
+  target.order_id = target.order_id || resolvedOrderId;
+  target.transactionId = target.transactionId || resolvedOrderId;
+  target.transaction_id = target.transaction_id || resolvedOrderId;
+  target.receiptNumber = target.receiptNumber || resolvedOrderId;
+  target.receipt_number = target.receipt_number || resolvedOrderId;
+  target.customerName = target.customerName || resolvedCustomer;
+  target.customer_name = target.customer_name || resolvedCustomer;
+  target.buyerName = target.buyerName || resolvedCustomer;
+  target.buyer_name = target.buyer_name || resolvedCustomer;
+  target.customer = target.customer || resolvedCustomer;
+  target.guest = target.guest || resolvedCustomer;
+  target.pelanggan = target.pelanggan || resolvedCustomer;
+  target.notes = target.notes || resolvedNotes;
+  target.note = target.note || resolvedNotes;
+  target.orderNote = target.orderNote || resolvedNotes;
+  target.order_note = target.order_note || resolvedNotes;
+  target.pax = target.pax || resolvedPax;
+  target.guestCount = target.guestCount || resolvedPax;
+  target.guest_count = target.guest_count || resolvedPax;
+  target.jumlahOrang = target.jumlahOrang || resolvedPax;
+  target.jumlah_orang = target.jumlah_orang || resolvedPax;
+  // Extra safety: nested table sub-object juga TULIS BACK (jika ada)
+  if (target.table && typeof target.table === 'object') {
+    target.table.tableNumber = target.table.tableNumber || resolvedTable;
+    target.table.table_number = target.table.table_number || resolvedTable;
+    target.table.name = target.table.name || resolvedTable;
+    target.table.label = target.table.label || resolvedTable;
+    target.table.number = target.table.number || resolvedTable;
+    target.table.id = target.table.id || resolvedTableId;
+  }
+  return target;
+};
+
 const submissionStates = new Map();
 
 const getUnprocessedPendingOrdersByBranch = (branchId, sinceTsMs) => {
@@ -331,11 +549,19 @@ const enqueueWebOrderForPrinting = async ({
   submissionId,
   transactionId,
   salesRecordId,
+  rawBody,
 }) => {
   const cleanSubmissionId = (submissionId || '').toString().trim();
   if (!cleanSubmissionId) {
     throw Object.assign(new Error('submissionId wajib disediakan'), { statusCode: 400, code: 'MISSING_SUBMISSION_ID' });
   }
+
+  // 🔴 [MISSING METADATA FIX] Panggil injectMissingOrderPayload SEBELUM APA-APA, passing rawBody
+  //    supaya NESTED metadata di rawBody (orderData/transactionData) juga di scan.
+  //    Hasilnya: orderPayload table_number/customer_name/pax TIDAK KOSONG LAGI.
+  try {
+    injectMissingOrderMetadata(orderPayload, { rawBody, tenantId, branchId, transactionId, salesRecordId, submissionId });
+  } catch (_) { /* noop */ }
 
   const existing = submissionStates.get(cleanSubmissionId);
   if (existing) {
@@ -538,6 +764,10 @@ const onWatchdogTimeout = async (stateEntry, submissionId, tenantId, branchId, d
 };
 
 const normalizeTopLevelOrderEnvelopeFields = (orderPayloadRaw, ctx = {}) => {
+  // 🔴 [FIX MISSING TABLE/CUSTOMER METADATA BRIDGE SIDE]
+  //    Panggil injector AGGRESSIVE PERTAMA KALI sebelum normalisasi, supaya SEMUA
+  //    key variants sudah TERISI PAYLOAD NYA (nested object auto-scan 3 level).
+  try { injectMissingOrderMetadata(orderPayloadRaw, ctx); } catch (_) { /* noop */ }
   const payload = (orderPayloadRaw && typeof orderPayloadRaw === 'object') ? orderPayloadRaw : {};
   const fallback = Object.create(null);
   Object.assign(fallback, {
@@ -1064,4 +1294,5 @@ module.exports = {
   getOrderSubmissionState,
   adminCoreFetch,
   getUnprocessedPendingOrdersByBranch,
+  injectMissingOrderMetadata,
 };

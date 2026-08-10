@@ -7,6 +7,7 @@ const {
   estimateEtaSeconds,
   submissionStates,
   getOrderSubmissionState,
+  injectMissingOrderMetadata,
 } = require('../services/posOrderQueue');
 const {
   getConnectedDevicesCount,
@@ -293,6 +294,11 @@ const _submitWebOrderBackgroundWorker = async (args) => {
     }
 
     // (B) Tulis stub idempotency PENDING_ACK ke cache:
+    // 🔴 [MISSING METADATA FIX] PERTAMA: inject missing order metadata (scan nested orderData/transactionData dll)
+    //    ke orderPayload dan rawBody → supaya submissionStates cache + downstream enqueue DAPAT semuanya.
+    try { injectMissingOrderMetadata(orderPayload, { rawBody, tenantId, branchId, transactionId, salesRecordId, submissionId }); } catch (_) { /* noop */ }
+    try { injectMissingOrderMetadata(rawBody, { tenantId, branchId, transactionId, salesRecordId, submissionId }); } catch (_) { /* noop */ }
+
     const enqueueArgs = Object.freeze({
       tenantId,
       branchId,
@@ -301,6 +307,7 @@ const _submitWebOrderBackgroundWorker = async (args) => {
       submissionId,
       transactionId,
       salesRecordId,
+      rawBody,
     });
     try {
       if (submissionStates instanceof Map) {
@@ -311,8 +318,8 @@ const _submitWebOrderBackgroundWorker = async (args) => {
             return Object.freeze({
               tableId: String(payload.tableId || payload.table_id || table.id || table.tableId || table.table_id || rawBody.tableId || rawBody.table_id || '').trim(),
               table_id: String(payload.table_id || payload.tableId || table.id || table.table_id || table.tableId || rawBody.table_id || rawBody.tableId || '').trim(),
-              tableNumber: String(payload.tableNumber || payload.table_number || payload.tableName || payload.table_name || payload.tableLabel || table.tableNumber || table.table_number || table.name || table.label || rawBody.tableNumber || rawBody.table || '').trim(),
-              table_number: String(payload.table_number || payload.tableNumber || table.table_number || table.tableNumber || table.name || table.label || rawBody.table || '').trim(),
+              tableNumber: String(payload.tableNumber || payload.table_number || payload.tableName || payload.table_name || payload.tableLabel || payload.tableNo || payload.noMeja || payload.nomorMeja || table.tableNumber || table.table_number || table.name || table.label || table.number || table.no || rawBody.tableNumber || rawBody.table || '').trim(),
+              table_number: String(payload.table_number || payload.tableNumber || payload.tableNo || payload.noMeja || table.table_number || table.tableNumber || table.name || table.label || table.number || rawBody.table || '').trim(),
             });
           } catch (_e) {
             return Object.freeze({ tableId: '', table_id: '', tableNumber: '', table_number: '' });
