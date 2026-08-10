@@ -44,7 +44,10 @@ const getPerDeviceStatus = () => {
 
 const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
   if (!ioInstance) return { emitted: false, reason: 'IO_NOT_INITIALIZED', fallback: null };
-  const posNamespace = ioInstance.of('/pos-relay');
+
+  const relayNs = ioInstance.of('/pos-relay');
+  const defaultNs = ioInstance.of('/');
+
   const tenantIdFromPayload =
     (orderPayload && typeof orderPayload === 'object' && (orderPayload.tenantId || orderPayload.tenant_id)) ||
     (targetDeviceUuid && connectedDevices.get(targetDeviceUuid)?.tenantId) ||
@@ -79,11 +82,12 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
     try { targetObj.emit('payment_success', payload); } catch (_) {}
   };
 
-  // 🔴 CRITICAL FIX 1 — SOCKET BROADCAST:
-  //    SEBELUMNYA: Hanya emit ke 1 targetDeviceUuid room, LALU RETURN!
-  //    Akibatnya device lain (Tablet Printer, PC Kasir Kedua) di BRANCH YANG SAMA
-  //    TIDAK PERNAH menerima event incoming-web-order kalo 1 device default printer online.
-  //    SEKARANG: SELALU BROADCAST KE BRANCH ROOM DULU (ALL devices connected to that branch),
+  // 🔴 CRITICAL FIX 1 — SOCKET BROADCAST (DUAL-NAMESPACE DELIVERY):
+  //    SEBELUMNYA: Hanya emit ke /pos-relay namespace.
+  //    POS Flutter saat ini konek ke DEFAULT / namespace → events TIDAK PERNAH SAMPAI.
+  //    SOLUSI: BROADCAST KE DUA NAMESPACE SEKALIGUS — /pos-relay DAN default / —
+  //    PASTIKAN SEMUA ROOM STRATEGY (branch, device, tenant, manual) JALAN DI KEDUA NAMESPACE.
+  //    SELALU BROADCAST KE BRANCH ROOM DULU (ALL devices connected to that branch),
   //    BARU emit tambahan ke targetDeviceUuid (guaranteed delivery ke printer default).
   //    JANGAN ada early-return! Semua level room harus di-emit.
   const stats = {
@@ -95,70 +99,104 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
     tenantSockets: 0,
     manualEmitted: false,
     manualSockets: 0,
+    defaultNsEmitted: false,
+    relayNsEmitted: false,
   };
   let fallbackReason = '';
 
-  // STEP 1 (PRIMARY) — BROADCAST TO ALL DEVICES IN BRANCH ROOM
-  if (branchId) {
-    const branchRoom = buildBranchRoom(branchId);
-    const socketsInBranchRoom = posNamespace.adapter?.rooms?.get(branchRoom);
-    if (socketsInBranchRoom && socketsInBranchRoom.size > 0) {
-      emitMultiEvent(posNamespace.to(branchRoom), orderPayload);
-      stats.branchEmitted = true;
-      stats.branchSockets = socketsInBranchRoom.size;
-    } else {
-      fallbackReason = fallbackReason || 'BRANCH_ROOM_EMPTY';
-    }
-  } else {
-    fallbackReason = fallbackReason || 'NO_BRANCH_ID';
-  }
+  const namespaces = [
+    { key: 'posRelay', ns: relayNs, tag: '/pos-relay' },
+    { key: 'default', ns: defaultNs, tag: '/' },
+  ];
 
-  // STEP 2 (TARGETED DELIVERY) — EMIT DIRECTLY TO TARGET DEVICE ROOM (printer default)
-  //    Jangan RETURN! Hanya tambahan emit guarantee, tidak menggantikan branch broadcast.
-  if (targetDeviceUuid) {
-    const deviceRoom = buildDeviceRoom(targetDeviceUuid);
-    const socketsInDeviceRoom = posNamespace.adapter?.rooms?.get(deviceRoom);
-    if (socketsInDeviceRoom && socketsInDeviceRoom.size > 0) {
-      emitMultiEvent(posNamespace.to(deviceRoom), orderPayload);
-      stats.deviceEmitted = true;
-      stats.deviceSockets = socketsInDeviceRoom.size;
-    } else {
-      fallbackReason = fallbackReason || 'DEVICE_ROOM_EMPTY';
-    }
-  }
+  const emitToNs = (ns, tag) => {
+    const nsStats = { branch: 0, device: 0, tenant: 0, manual: 0 };
+    let nsGotAny = false;
 
-  // STEP 3 (FALLBACK TENANT) — Jika branch room kosong, coba broadcast ke tenant room
-  if (!stats.branchEmitted && tenantIdFromPayload) {
-    const tenantRoom = buildTenantRoom(String(tenantIdFromPayload).trim());
-    const socketsInTenantRoom = posNamespace.adapter?.rooms?.get(tenantRoom);
-    if (socketsInTenantRoom && socketsInTenantRoom.size > 0) {
-      emitMultiEvent(posNamespace.to(tenantRoom), orderPayload);
-      stats.tenantEmitted = true;
-      stats.tenantSockets = socketsInTenantRoom.size;
-    } else {
-      fallbackReason = fallbackReason || 'DEVICE_BRANCH_TENANT_ROOMS_EMPTY';
-    }
-  }
-
-  // STEP 4 (FALLBACK MANUAL ITERATE) — Jika SEMUA room strategy kosong, iterate manual
-  const emittedAny = stats.branchEmitted || stats.deviceEmitted || stats.tenantEmitted;
-  if (!emittedAny) {
-    const allConnected = Array.from(posNamespace.sockets?.values?.() || []).filter(s => {
-      const d = s.data?.posDevice || {};
-      if (!d.branchId || !d.tenantId) return false;
-      if (branchId && String(d.branchId) === String(branchId)) return true;
-      if (tenantIdFromPayload && String(d.tenantId) === String(tenantIdFromPayload)) return true;
-      return false;
-    });
-    if (allConnected.length > 0) {
-      for (const s of allConnected) {
-        try { emitMultiEvent(s, orderPayload); } catch (_) {}
+    // STEP 1 (PRIMARY) — BROADCAST TO ALL DEVICES IN BRANCH ROOM
+    if (branchId) {
+      const branchRoom = buildBranchRoom(branchId);
+      const socketsInBranchRoom = ns.adapter?.rooms?.get(branchRoom);
+      if (socketsInBranchRoom && socketsInBranchRoom.size > 0) {
+        emitMultiEvent(ns.to(branchRoom), orderPayload);
+        stats.branchEmitted = true;
+        nsStats.branch = socketsInBranchRoom.size;
+        stats.branchSockets = Math.max(stats.branchSockets, socketsInBranchRoom.size);
+        nsGotAny = true;
       }
-      stats.manualEmitted = true;
-      stats.manualSockets = allConnected.length;
-    } else {
-      fallbackReason = fallbackReason || 'DEVICE_AND_BRANCH_OFFLINE';
     }
+
+    // STEP 2 (TARGETED DELIVERY) — EMIT DIRECTLY TO TARGET DEVICE ROOM (printer default)
+    if (targetDeviceUuid) {
+      const deviceRoom = buildDeviceRoom(targetDeviceUuid);
+      const socketsInDeviceRoom = ns.adapter?.rooms?.get(deviceRoom);
+      if (socketsInDeviceRoom && socketsInDeviceRoom.size > 0) {
+        emitMultiEvent(ns.to(deviceRoom), orderPayload);
+        stats.deviceEmitted = true;
+        nsStats.device = socketsInDeviceRoom.size;
+        stats.deviceSockets = Math.max(stats.deviceSockets, socketsInDeviceRoom.size);
+        nsGotAny = true;
+      }
+    }
+
+    // STEP 3 (FALLBACK TENANT) — Jika branch room kosong, coba broadcast ke tenant room
+    if (!nsGotAny && tenantIdFromPayload) {
+      const tenantRoom = buildTenantRoom(String(tenantIdFromPayload).trim());
+      const socketsInTenantRoom = ns.adapter?.rooms?.get(tenantRoom);
+      if (socketsInTenantRoom && socketsInTenantRoom.size > 0) {
+        emitMultiEvent(ns.to(tenantRoom), orderPayload);
+        stats.tenantEmitted = true;
+        nsStats.tenant = socketsInTenantRoom.size;
+        stats.tenantSockets = Math.max(stats.tenantSockets, socketsInTenantRoom.size);
+        nsGotAny = true;
+      }
+    }
+
+    // STEP 4 (FALLBACK MANUAL ITERATE) — Jika SEMUA room strategy kosong, iterate manual
+    if (!nsGotAny) {
+      const allConnected = Array.from(ns.sockets?.values?.() || []).filter(s => {
+        const d = (s.data?.posDevice || (s.data?.auth && s.data) || {});
+        const sBranch = String(d.branchId ?? d.branch_id ?? '').trim();
+        const sTenant = String(d.tenantId ?? d.tenant_id ?? '').trim();
+        if (!sBranch && !sTenant) return false;
+        if (branchId && sBranch === String(branchId)) return true;
+        if (tenantIdFromPayload && sTenant === String(tenantIdFromPayload).trim()) return true;
+        return false;
+      });
+      if (allConnected.length > 0) {
+        for (const s of allConnected) {
+          try { emitMultiEvent(s, orderPayload); } catch (_) {}
+        }
+        stats.manualEmitted = true;
+        nsStats.manual = allConnected.length;
+        stats.manualSockets = Math.max(stats.manualSockets, allConnected.length);
+        nsGotAny = true;
+      }
+    }
+
+    if (tag === '/pos-relay' && nsGotAny) stats.relayNsEmitted = true;
+    if (tag === '/' && nsGotAny) stats.defaultNsEmitted = true;
+    return nsGotAny;
+  };
+
+  for (const { ns, tag } of namespaces) {
+    try { emitToNs(ns, tag); } catch (err) {
+      console.warn('[socketServer] emitToNs failed for ns=' + tag + ' err=' + (err && err.message));
+    }
+  }
+
+  if (!stats.branchEmitted) {
+    fallbackReason = fallbackReason ||
+      (branchId ? 'BRANCH_ROOM_EMPTY' : 'NO_BRANCH_ID');
+  }
+  if (!stats.deviceEmitted && targetDeviceUuid) {
+    fallbackReason = fallbackReason || 'DEVICE_ROOM_EMPTY';
+  }
+  if (!stats.tenantEmitted && tenantIdFromPayload) {
+    fallbackReason = fallbackReason || 'TENANT_ROOM_EMPTY';
+  }
+  if (!stats.manualEmitted && !(stats.branchEmitted || stats.deviceEmitted || stats.tenantEmitted)) {
+    fallbackReason = fallbackReason || 'DEVICE_BRANCH_TENANT_ROOMS_EMPTY';
   }
 
   const finalEmitted = stats.branchEmitted || stats.deviceEmitted || stats.tenantEmitted || stats.manualEmitted;
@@ -215,8 +253,47 @@ const initializeSocketServer = (server) => {
 
   ioInstance = new Server(server, {
     cors: {
-      origin: '*',
-      methods: ['GET', 'POST'],
+      origin: (origin, callback) => {
+        if (!origin) return callback(null, true);
+        const lower = String(origin).toLowerCase();
+        const explicitAllowed = new Set([
+          'https://pos-web-ordering-sttaging.up.railway.app',
+          'https://pos-web-ordering-production.up.railway.app',
+          'https://pos-web-ordering.up.railway.app',
+          'http://localhost:3000',
+          'http://127.0.0.1:3000',
+          'http://localhost:3001',
+          'http://127.0.0.1:3001',
+          'http://localhost:5173',
+          'http://127.0.0.1:5173',
+          'http://localhost:5174',
+          'http://127.0.0.1:5174',
+          'http://localhost:8080',
+          'http://127.0.0.1:8080',
+        ]);
+        if (explicitAllowed.has(origin) ||
+            lower.endsWith('.up.railway.app') ||
+            lower.startsWith('http://localhost:') ||
+            lower.startsWith('http://127.0.0.1:') ||
+            lower.startsWith('capacitor://') ||
+            lower.startsWith('file://')) {
+          return callback(null, true);
+        }
+        return callback(null, origin);
+      },
+      methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+      credentials: true,
+      allowedHeaders: [
+        'Origin', 'X-Requested-With', 'Content-Type', 'Accept',
+        'Authorization', 'X-Tenant-ID', 'X-Branch-ID', 'X-Device-ID',
+        'X-Device-Id', 'x-tenant-id', 'x-branch-id', 'x-device-id',
+        // 🔴 FIX: match index.js Express CORS — frontend relay & polling
+        // requests can send custom header 'x-internal-relay' / 'X-Internal-Relay'
+        // without triggering Socket.IO preflight failure.
+        'X-Internal-Relay',
+        'x-internal-relay',
+        'Cache-Control',
+      ],
     },
     transports: ['websocket', 'polling'],
   });
@@ -270,6 +347,212 @@ const initializeSocketServer = (server) => {
         joinedAt: new Date().toISOString(),
       });
     });
+
+    // 🔴 CRITICAL BACKWARD COMPATIBILITY HANDLERS for DEFAULT / namespace POS Flutter:
+    //    POS Flutter saat ini konek ke default / dan EMIT events join_branch / branch:join / join_room
+    //    (bukan connect ke /pos-relay). Handler dibawah ini memastikan POS Flutter default /
+    //    bisa JOIN rooms branch:X & device:X & tenant:X SECARA MANUAL, lalu receive broadcast events.
+    //    Juga menerima POS device register heartbeat untuk populate connectedDevices Map routing.
+    const defaultNsResolveAckDevice = (socket, payload) => {
+      const auth = socket.handshake.auth || {};
+      const deviceUuid = String(
+        payload.deviceUuid ?? payload.deviceId ?? payload.device_id ?? auth.deviceUuid ?? auth.deviceId ?? auth.device_id ?? ''
+      ).trim();
+      const tId = String(
+        payload.tenantId ?? payload.tenant_id ?? tenantId ?? auth.tenantId ?? auth.tenant_id ?? ''
+      ).trim();
+      const bId = String(
+        payload.branchId ?? payload.branch_id ?? auth.branchId ?? auth.branch_id ?? ''
+      ).trim();
+      return { deviceUuid, tenantId: tId, branchId: bId };
+    };
+
+    const ackResolver = (ackPayload = {}, fallbackDevice = {}) => {
+      const { resolveOrderAcknowledgement } = require('./posOrderQueue');
+      const submissionId = String(
+        ackPayload.submissionId ?? ackPayload.submission_id ?? ackPayload.orderId ?? ackPayload.order_id ?? ''
+      ).trim();
+      const ackStatus = String(
+        ackPayload.ackStatus ?? ackPayload.ack_status ?? ackPayload.status ?? 'POS_ACKNOWLEDGED'
+      ).trim();
+      const deviceUuid = String(
+        ackPayload.deviceUuid ?? ackPayload.resolvedDeviceUuid ?? ackPayload.deviceId ?? ackPayload.device_id ?? fallbackDevice.deviceUuid ?? ''
+      ).trim();
+      const printedAt = String(
+        ackPayload.printedAt ?? ackPayload.printed_at ?? ackPayload.processedAt ?? ackPayload.acknowledgedAt ?? ''
+      ).trim() || new Date().toISOString();
+      if (!submissionId) return;
+      resolveOrderAcknowledgement({
+        submissionId,
+        ackStatus,
+        ackPayload: ackPayload.ackPayload || ackPayload,
+        deviceUuid,
+        printedAt,
+      }).catch(() => {});
+    };
+
+    // Join branch (manual POS Flutter emit)
+    socket.on('join_branch', (payload = {}) => {
+      try {
+        const { deviceUuid, tenantId: tId, branchId: bId } = defaultNsResolveAckDevice(socket, payload);
+        if (bId) { socket.join(buildBranchRoom(bId)); }
+        if (tId) { socket.join(buildTenantRoom(tId)); }
+        if (deviceUuid) {
+          socket.join(buildDeviceRoom(deviceUuid));
+          if (tId) {
+            connectedDevices.set(deviceUuid, {
+              socketId: socket.id,
+              connectedAt: Date.now(),
+              lastPing: Date.now(),
+              tenantId: tId,
+              branchId: bId || connectedDevices.get(deviceUuid)?.branchId || '',
+            });
+          }
+        }
+        socket.emit('branch_joined', {
+          tenantId: tId, branchId: bId, deviceUuid,
+          joinedAt: new Date().toISOString(),
+        });
+      } catch (e) {
+        try { socket.emit('socket_error', { message: 'join_branch failed: ' + (e.message || String(e)) }); } catch (_) {}
+      }
+    });
+
+    socket.on('branch:join', (payload = {}) => {
+      try {
+        const { deviceUuid, tenantId: tId, branchId: bId } = defaultNsResolveAckDevice(socket, payload);
+        if (bId) { socket.join(buildBranchRoom(bId)); }
+        if (tId) { socket.join(buildTenantRoom(tId)); }
+        if (deviceUuid) {
+          socket.join(buildDeviceRoom(deviceUuid));
+          if (tId) {
+            connectedDevices.set(deviceUuid, {
+              socketId: socket.id,
+              connectedAt: Date.now(),
+              lastPing: Date.now(),
+              tenantId: tId,
+              branchId: bId || connectedDevices.get(deviceUuid)?.branchId || '',
+            });
+          }
+        }
+        socket.emit('branch:joined', {
+          tenantId: tId, branchId: bId, deviceUuid,
+          joinedAt: new Date().toISOString(),
+        });
+      } catch (_) {}
+    });
+
+    socket.on('join_room', (payload = {}) => {
+      try {
+        const r = payload.room || payload.roomName || payload.name;
+        if (r) socket.join(String(r));
+        socket.emit('room_joined', { room: r });
+      } catch (_) {}
+    });
+
+    socket.on('join_device', (payload = {}) => {
+      try {
+        const { deviceUuid, tenantId: tId, branchId: bId } = defaultNsResolveAckDevice(socket, payload);
+        if (deviceUuid) {
+          socket.join(buildDeviceRoom(deviceUuid));
+          if (tId) {
+            connectedDevices.set(deviceUuid, {
+              socketId: socket.id,
+              connectedAt: Date.now(),
+              lastPing: Date.now(),
+              tenantId: tId,
+              branchId: bId || connectedDevices.get(deviceUuid)?.branchId || '',
+            });
+          }
+        }
+        socket.emit('device_joined', {
+          deviceUuid, joinedAt: new Date().toISOString(),
+        });
+      } catch (_) {}
+    });
+
+    socket.on('device:register', (payload = {}) => {
+      try {
+        const { deviceUuid, tenantId: tId, branchId: bId } = defaultNsResolveAckDevice(socket, payload);
+        if (deviceUuid && tId) {
+          connectedDevices.set(deviceUuid, {
+            socketId: socket.id,
+            connectedAt: Date.now(),
+            lastPing: Date.now(),
+            tenantId: tId,
+            branchId: bId || connectedDevices.get(deviceUuid)?.branchId || '',
+          });
+        }
+        socket.emit('device:registered', { deviceUuid, tenantId: tId, branchId: bId });
+      } catch (_) {}
+    });
+    socket.on('pos_device_register', (payload = {}) => {
+      try {
+        const { deviceUuid, tenantId: tId, branchId: bId } = defaultNsResolveAckDevice(socket, payload);
+        if (deviceUuid && tId) {
+          connectedDevices.set(deviceUuid, {
+            socketId: socket.id,
+            connectedAt: Date.now(),
+            lastPing: Date.now(),
+            tenantId: tId,
+            branchId: bId || connectedDevices.get(deviceUuid)?.branchId || '',
+          });
+        }
+      } catch (_) {}
+    });
+    socket.on('device_register', (payload = {}) => {
+      try {
+        const { deviceUuid, tenantId: tId, branchId: bId } = defaultNsResolveAckDevice(socket, payload);
+        if (deviceUuid && tId) {
+          connectedDevices.set(deviceUuid, {
+            socketId: socket.id,
+            connectedAt: Date.now(),
+            lastPing: Date.now(),
+            tenantId: tId,
+            branchId: bId || connectedDevices.get(deviceUuid)?.branchId || '',
+          });
+        }
+      } catch (_) {}
+    });
+
+    socket.on('pos-ping', () => {
+      try {
+        const auth = socket.handshake.auth || {};
+        const du = String(auth.deviceUuid ?? auth.deviceId ?? auth.device_id ?? '').trim();
+        if (du && connectedDevices.has(du)) {
+          const entry = connectedDevices.get(du);
+          entry.lastPing = Date.now();
+          socket.emit('pos-pong', { serverTs: Date.now() });
+        } else {
+          socket.emit('pos-pong', { serverTs: Date.now() });
+        }
+      } catch (_) {
+        try { socket.emit('pos-pong', { serverTs: Date.now() }); } catch (_) {}
+      }
+    });
+
+    // 🔴 DUAL-NAMESPACE ACK LISTENER: POS Flutter emit ACK via default / namespace
+    //    (event name variants web_order_acknowledged / pos_web_order_ack / order-acknowledged)
+    const ackHandlers = [
+      'order-acknowledged',
+      'web_order_acknowledged',
+      'pos_web_order_ack',
+      'pos_order_ack',
+    ];
+    for (const ev of ackHandlers) {
+      try {
+        socket.on(ev, (ackPayload = {}) => {
+          try {
+            const auth = socket.handshake.auth || {};
+            ackResolver(ackPayload, {
+              deviceUuid: String(
+                ackPayload.deviceUuid ?? ackPayload.resolvedDeviceUuid ?? ackPayload.deviceId ?? ackPayload.device_id ?? auth.deviceUuid ?? auth.deviceId ?? auth.device_id ?? ''
+              ).trim(),
+            });
+          } catch (_) {}
+        });
+      } catch (_) {}
+    }
   });
 
   const posRelayNamespace = ioInstance.of('/pos-relay');

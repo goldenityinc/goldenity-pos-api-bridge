@@ -123,6 +123,13 @@ const corsOptions = {
     'x-tenant-id',
     'x-branch-id',
     'x-device-id',
+    // 🔴 FIX: frontend web-ordering relay endpoint sends custom header
+    // 'x-internal-relay' for bypass / anti-tamper marking. Both case variants
+    // (lowercase + Pascal-Title) MUST be in allowedHeaders or the browser
+    // preflight OPTIONS will reject with "Request header field x-internal-relay
+    // is not allowed by Access-Control-Allow-Headers".
+    'X-Internal-Relay',
+    'x-internal-relay',
     'Cache-Control',
     'Accept-Encoding',
     'Accept-Language',
@@ -162,7 +169,7 @@ app.use((req, res, next) => {
   );
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Origin,X-Requested-With,Content-Type,Accept,Authorization,X-Tenant-ID,X-Branch-ID,X-Device-ID,X-Device-Id,x-tenant-id,x-branch-id,x-device-id,Cache-Control,Accept-Encoding,Accept-Language'
+    'Origin,X-Requested-With,Content-Type,Accept,Authorization,X-Tenant-ID,X-Branch-ID,X-Device-ID,X-Device-Id,x-tenant-id,x-branch-id,x-device-id,X-Internal-Relay,x-internal-relay,Cache-Control,Accept-Encoding,Accept-Language'
   );
   res.setHeader(
     'Access-Control-Expose-Headers',
