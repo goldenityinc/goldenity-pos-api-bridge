@@ -158,7 +158,72 @@ const relayUploadQrOrderPayment = async (req, res) => {
     let parsedJson;
     try { parsedJson = rawText ? JSON.parse(rawText) : {}; } catch (_) { parsedJson = { rawFallback: rawText }; }
 
-    const status = upstreamResponse.ok ? 200 : (upstreamResponse.status || 500);
+    const upstreamStatus = upstreamResponse.status || 500;
+    const upstreamOk = upstreamResponse.ok;
+
+    if (!upstreamOk && (upstreamStatus === 404 || upstreamStatus >= 500)) {
+      try {
+        const identifier = txId || orderId;
+        const matchedSubIds = [];
+        for (const [subId, st] of submissionStates.entries()) {
+          const envelope = st && st.envelope ? st.envelope : (st || {});
+          const storedTx = String(envelope.transactionId || envelope.txId || envelope.referenceId || envelope.reference_id || envelope.receipt_number || st.transactionId || '').trim();
+          const storedOrder = String(envelope.orderId || envelope.id || envelope.salesRecordId || st.orderId || '').trim();
+          if (identifier && (storedTx === identifier || storedOrder === identifier || subId === identifier)) {
+            matchedSubIds.push({ subId, state: st, envelope });
+          }
+        }
+        const fallbackProofUrl = (parsedJson && parsedJson.url) || (req.body && (req.body.payment_proof_url || req.body.paymentProofUrl)) || '';
+        const fallbackBase64 = (req.body && (req.body.proof_base64 || req.body.base64 || req.body.proofBase64)) || '';
+        const pendingProof = {
+          cachedAt: new Date().toISOString(),
+          tenantId,
+          txId,
+          orderId,
+          upstreamStatus,
+          upstreamMessage: parsedJson && (parsedJson.message || parsedJson.error || String(rawText || '')).toString().substring(0, 240),
+          proofUrl: fallbackProofUrl,
+          hasFile: Boolean(req.file || (Array.isArray(req.files) && req.files.length) || (typeof req.files === 'object' && req.files && Object.keys(req.files).length)),
+          paymentMethod: (req.body && (req.body.paymentMethod || req.body.payment_method)) || 'QRIS',
+        };
+        for (const { subId, state, envelope } of matchedSubIds) {
+          state.pendingProof = pendingProof;
+          state.proofPending = true;
+          state.lastProofAttemptAt = pendingProof.cachedAt;
+          submissionStates.set(subId, state);
+          const branchIdValue = String((req.body && (req.body.branchId || req.body.branch_id)) || envelope.branchId || envelope.branch_id || req.query?.branchId || '').trim();
+          const tenantRoom = buildTenantRoom(tenantId);
+          if (tenantRoom) {
+            try { emitIncomingWebOrder(tenantRoom, 'qr_order_payment_proof_pending', { submissionId: subId, ...pendingProof }); } catch (_e) {}
+          }
+          const branchRoom = branchIdValue ? buildBranchRoom(tenantId, branchIdValue) : null;
+          if (branchRoom) {
+            try { emitIncomingWebOrder(branchRoom, 'qr_order_payment_proof_pending', { submissionId: subId, ...pendingProof }); } catch (_e2) {}
+          }
+        }
+        const userMessage = upstreamStatus === 404
+          ? 'Bukti pembayaran diterima. Sistem sedang memvalidasi pesanan, silakan cek kembali dalam beberapa detik.'
+          : 'Bukti pembayaran diterima. Server pusat sedang sibuk, akan otomatis diproses kembali segera.';
+        return res.status(202).json({
+          ok: true,
+          success: true,
+          acknowledged: true,
+          relayed: false,
+          relayStatus: 'DEFERRED_LOCAL_CACHE',
+          matchedEntries: matchedSubIds.length,
+          upstreamStatusCode: upstreamStatus,
+          upstreamResponseBody: parsedJson,
+          message: userMessage,
+          userMessage,
+          txId,
+          orderId,
+        });
+      } catch (deferredErr) {
+        console.warn('[relayUploadQrOrderPayment] deferred local cache fallback failed:', deferredErr && deferredErr.stack ? deferredErr.stack : deferredErr);
+      }
+    }
+
+    const status = upstreamOk ? 200 : upstreamStatus;
     return res.status(status).json(parsedJson);
   } catch (err) {
     return res.status(502).json({
