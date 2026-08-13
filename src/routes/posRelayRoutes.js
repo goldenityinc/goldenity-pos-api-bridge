@@ -221,8 +221,11 @@ router.get('/orders/active', async (req, res) => {
     if (!tenantId || !tableId) return res.status(200).json([]);
     const results = [];
     const activeStatuses = new Set(['PENDING','PREPARING','READY_FOR_PICKUP','PENDING_PAYMENT','PENDING_ACK','POS_ACKNOWLEDGED','PARTIAL','NEW']);
-    // 1. FAST PATH LOCAL submissionStates cache (BARU < 120 detik):
-    const cutoffAgo = Date.now() - 120_000;
+    // 1. FAST PATH LOCAL submissionStates cache:
+    //    REGULAR cutoff = 120 detik (CASHIER / PREPARING dll)
+    //    QRIS PENDING_PAYMENT cutoff = 900 detik (15 menit)
+    const cutoffAgoRegular = Date.now() - 120_000;
+    const cutoffAgoQris = Date.now() - 900_000;
     for (const [subId, st] of submissionStates.entries()) {
       const envelope = st && st.envelope ? st.envelope : (st || {});
       const storedTableId = String(envelope.tableId || st.tableId || '').trim();
@@ -232,10 +235,17 @@ router.get('/orders/active', async (req, res) => {
         if (stBr && stBr !== branchId) continue;
       }
       const status = String(st.status || st.ackStatus || envelope.ackStatus || envelope.status || 'PENDING_ACK').toUpperCase();
+      const paymentStatusRaw = String(st.paymentStatus || envelope.paymentStatus || envelope.payment_status || st.payment_status || '').toUpperCase();
+      const paymentMethodRaw = String(envelope.orderPayload && envelope.orderPayload.paymentMethod ? envelope.orderPayload.paymentMethod : (st.paymentMethod || envelope.paymentMethod || '')).toUpperCase();
+      const isQrisPendingPayment =
+        status === 'PENDING_PAYMENT' ||
+        paymentStatusRaw === 'PENDING_PAYMENT' ||
+        paymentMethodRaw.includes('QRIS');
       if (!activeStatuses.has(status)) continue;
       const tCreated = st.queuedAt || st.createdAt || envelope.createdAt;
       const ts = tCreated ? new Date(tCreated).getTime() : Date.now();
-      if (Number.isFinite(ts) && ts < cutoffAgo) continue; // > 2 menit → biarkan Admin Core handle
+      const applicableCutoff = isQrisPendingPayment ? cutoffAgoQris : cutoffAgoRegular;
+      if (Number.isFinite(ts) && ts < applicableCutoff) continue;
       results.push({
         submissionId: subId,
         orderId: envelope.orderId || envelope.salesRecordId || envelope.id || st.orderId || null,
