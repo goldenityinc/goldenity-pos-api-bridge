@@ -460,9 +460,9 @@ const notifyAdminCoreAck = async (submissionId, tenantId, ackStatus, ackPayload 
     body: JSON.stringify(body),
   }).catch(() => ({ ok: false }));
   if (!result.ok) {
-    return adminCoreFetch(`/api/v1/orders/${encodeURIComponent(submissionId)}/ack`, {
+    return adminCoreFetch(`/api/v1/orders/${encodeURIComponent(submissionId)}/acknowledge`, {
       method: 'POST',
-      body: JSON.stringify({ ackStatus, ackPayload }),
+      body: JSON.stringify({ ackStatus, ackPayload, submissionId }),
     }).catch(() => ({ ok: false }));
   }
   return result;
@@ -825,6 +825,16 @@ const onWatchdogTimeout = async (stateEntry, submissionId, tenantId, branchId, d
 
     if (stateEntry.retries <= 0) {
       stateEntry.retries += 1;
+      //#region debug-point web-order-bugs-watchdog-retry
+      try {
+        const ts = new Date().toISOString();
+        const nowRetries = Number(stateEntry.retries || 0);
+        // eslint-disable-next-line no-console
+        console.error(
+          `[${ts}] [DEBUG-WEB-ORDER] [WATCHDOG-RETRY] submissionId=${submissionId} retriesCount=${nowRetries} tenant=${tenantId} branch=${branchId} beforeBroadcastDevice=${String(deviceUuid || '(empty=broadcast)')} upstreamSavedQueuedAt=${String(stateEntry.upstreamSavedQueuedAt || 0)} resolved=${!!stateEntry.resolved} processing=${!!stateEntry.processing}`,
+        );
+      } catch (_dbg) { /* noop */ }
+      //#endregion
       // 🔴 CRITICAL FIX - BROADCAST RETRY KE BRANCH ROOM, BUKAN 1 device:
       //    Pass deviceUuid = '' supaya emitIncomingWebOrder SELALU broadcast BRANCH.
       const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
@@ -1302,6 +1312,18 @@ const resolveOrderAcknowledgement = async ({
   }
 
   let stateEntry = submissionStates.get(cleanSubmissionId);
+  //#region debug-point web-order-bugs-ack
+  try {
+    const ts = new Date().toISOString();
+    const curResolved = stateEntry ? !!stateEntry.resolved : null;
+    const curStatus = stateEntry ? (stateEntry.status || stateEntry.ackStatus || '') : '';
+    const curRetries = stateEntry ? (stateEntry.retries || 0) : -1;
+    // eslint-disable-next-line no-console
+    console.error(
+      `[${ts}] [DEBUG-WEB-ORDER] [ACK] submissionId=${cleanSubmissionId} ackStatus=${String(ackStatus || 'POS_PRINTED')} state.resolved_before=${curResolved} state.status_before=${curStatus} retries=${curRetries} deviceUuid=${String(deviceUuid || '')} tenant=${String(tenantId || '')} branch=${String(branchId || '')}`,
+    );
+  } catch (_dbgA) { /* noop */ }
+  //#endregion
   const resolvedAckStatus = (ackStatus || 'POS_PRINTED').toString().trim();
   const resolvedPrintedAt = (printedAt || new Date().toISOString()).toString();
   const resolvedDeviceUuid = (deviceUuid || (stateEntry?.resolvedTargetDeviceUuid) || '').toString();

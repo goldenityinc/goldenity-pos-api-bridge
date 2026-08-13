@@ -43,6 +43,23 @@ const getPerDeviceStatus = () => {
 };
 
 const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
+  //#region debug-point web-order-bugs-emitter
+  try {
+    const ts = new Date().toISOString();
+    const submissionId = String(
+      (orderPayload && typeof orderPayload === 'object' && (orderPayload.submissionId || orderPayload.submission_id)) || ''
+    ).trim();
+    const s = (orderPayload && typeof orderPayload === 'object') ? orderPayload : {};
+    const pt = String(s.print_type || s.printType || s.pt || '');
+    const ti = String(s.tableId || s.table_id || '');
+    const tn = String(s.tableNumber || s.table_number || s.tableName || '');
+    const tenant = String(s.tenantId || s.tenant_id || '');
+    // eslint-disable-next-line no-console
+    console.error(
+      `[${ts}] [DEBUG-WEB-ORDER] [EMIT-COMBINED] submissionId=${submissionId} printType=${pt} tableId=${ti} tableNum=${tn} tenant=${tenant} branch=${String(branchId || '')} targetDeviceUuid=${String(targetDeviceUuid || '(broadcast)')}`,
+    );
+  } catch (_dbg) { /* DOUBLE SAFETY: debug log cannot break emit */ }
+  //#endregion
   if (!ioInstance) return { emitted: false, reason: 'IO_NOT_INITIALIZED', fallback: null };
 
   const relayNs = ioInstance.of('/pos-relay');

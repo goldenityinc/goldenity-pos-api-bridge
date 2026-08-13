@@ -79,6 +79,17 @@ const buildAckStatusResponseFromState = (submissionId, resolvedStyle) => {
 router.get('/orders/by-submission/:submissionId/ack-status', (req, res) => {
   try {
     const subId = (req.params.submissionId || '').toString().trim();
+    //#region debug-point web-order-bugs-ackpoll
+    try {
+      const ts = new Date().toISOString();
+      const st = submissionStates.get(subId);
+      const sstatus = st ? (st.status || st.ackStatus || '') : '';
+      const sresolved = st ? !!st.resolved : false;
+      console.error(
+        `[${ts}] [DEBUG-WEB-ORDER] [ACK-POLL-by-submission] submissionId=${subId} resolved=${sresolved} curStatus=${sstatus} resolvedStyle=exact-by-submission reqIp=${String(req.ip || '')}`,
+      );
+    } catch (_dbg) { /* noop */ }
+    //#endregion
     const r = buildAckStatusResponseFromState(subId, 'exact-by-submission');
     return res.status(r.statusCode).json(r.payload);
   } catch (e) {
@@ -91,6 +102,17 @@ router.get('/orders/:rawSegmentBase/:rawSegmentNested/ack-status', (req, res) =>
   try {
     const resolved = normalizeAndResolveSubmissionFromSegment(req);
     if (!resolved.submissionId) return res.status(400).json({ ok:false, message:'submissionId tidak bisa di-resolve dari URL.' });
+    //#region debug-point web-order-bugs-ackpoll
+    try {
+      const ts = new Date().toISOString();
+      const st = submissionStates.get(resolved.submissionId);
+      const sstatus = st ? (st.status || st.ackStatus || '') : '';
+      const sresolved = st ? !!st.resolved : false;
+      console.error(
+        `[${ts}] [DEBUG-WEB-ORDER] [ACK-POLL-wild2] submissionId=${resolved.submissionId} resolvedStyle=${resolved.resolvedStyle} resolved=${sresolved} curStatus=${sstatus}`,
+      );
+    } catch (_dbg) { /* noop */ }
+    //#endregion
     const r = buildAckStatusResponseFromState(resolved.submissionId, resolved.resolvedStyle);
     return res.status(r.statusCode).json(r.payload);
   } catch (e) {
@@ -103,6 +125,17 @@ router.get('/orders/:rawSegmentBase/ack-status', (req, res) => {
   try {
     const resolved = normalizeAndResolveSubmissionFromSegment(req);
     if (!resolved.submissionId) return res.status(400).json({ ok:false, message:'submissionId tidak bisa di-resolve dari URL.' });
+    //#region debug-point web-order-bugs-ackpoll
+    try {
+      const ts = new Date().toISOString();
+      const st = submissionStates.get(resolved.submissionId);
+      const sstatus = st ? (st.status || st.ackStatus || '') : '';
+      const sresolved = st ? !!st.resolved : false;
+      console.error(
+        `[${ts}] [DEBUG-WEB-ORDER] [ACK-POLL-wild1] submissionId=${resolved.submissionId} resolvedStyle=${resolved.resolvedStyle} resolved=${sresolved} curStatus=${sstatus}`,
+      );
+    } catch (_dbg) { /* noop */ }
+    //#endregion
     const r = buildAckStatusResponseFromState(resolved.submissionId, resolved.resolvedStyle);
     return res.status(r.statusCode).json(r.payload);
   } catch (e) {
