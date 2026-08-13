@@ -298,6 +298,11 @@ const buildUpdateQuery = (table, payload, idField, idValue, options = {}) => {
     throw new Error('Payload must contain at least one field');
   }
 
+  const idStr = (idValue ?? '').toString().trim();
+  if (idField === 'id' && !/^\d+$/.test(idStr)) {
+    throw Object.assign(new Error(`ID ${idStr} tidak valid untuk kolom ${idField} (harus numerik)`), { statusCode: 404, safeForClient: true });
+  }
+
   const values = [];
   const setClauses = entries.map(([key, value], index) => {
     values.push(value);
@@ -323,6 +328,11 @@ const buildUpdateQuery = (table, payload, idField, idValue, options = {}) => {
 };
 
 const buildDeleteQuery = (table, idField, idValue, options = {}) => {
+  const idStr = (idValue ?? '').toString().trim();
+  if (idField === 'id' && !/^\d+$/.test(idStr)) {
+    throw Object.assign(new Error(`ID ${idStr} tidak valid untuk kolom ${idField} (harus numerik)`), { statusCode: 404, safeForClient: true });
+  }
+
   const values = [parseQueryValue(idValue)];
   const whereClauses = [`${quoteIdentifier(idField, 'column')} = $1`];
 
@@ -536,7 +546,7 @@ const runSelect = async (tenantDb, table, query = {}, options = {}) => {
     throw new Error(`Security guard: tabel ${table} wajib memiliki kolom ${TENANT_COLUMN}`);
   }
 
-  let scopedQuery = { ...query };
+  const scopedQuery = { ...query };
   if (hasTenantColumn) {
     if (!tenantId) {
       throw new Error('Security guard: tenantId wajib tersedia untuk operasi read');
@@ -547,22 +557,58 @@ const runSelect = async (tenantDb, table, query = {}, options = {}) => {
 
   scopedQuery = sanitizeSelectQueryByColumnSet(scopedQuery, columnSet);
 
-  const attempts = [];
-  const primarySqlObj = buildSelectQuery(table, scopedQuery);
-  attempts.push({
-    label: 'primary',
-    sql: primarySqlObj.sql,
-    values: primarySqlObj.values,
-  });
-
+  // 🔴 CRITICAL HOTFIX 22P02: DETECT FALLBACK SEBELUM BUILD QUERIES
+  //    Jika eq__id non-numeric, LANGSUNG JALANKAN FALLBACK RECEIPT_NUMBER JANGAN PERNAH
+  //    MEMBUAT PRIMARY QUERY BIGINT ID DENGAN VALUE STRING TX-* (menyebabkan pool.on('release')
+  //    error 22P02 di Railway log walau catch block retry sukses, dan edge case fallback
+  //    gagal = sync dianggap FAIL walau sudah lunas).
   const fallbackRewrite = _detectAndRewriteBigintFallback(scopedQuery, columnSet);
+
+  const attempts = [];
   if (fallbackRewrite) {
-    const sanitized = sanitizeSelectQueryByColumnSet(fallbackRewrite, columnSet);
-    const f = buildSelectQuery(table, sanitized);
+    // ✅ Mode Bigint Fallback: hanya jalankan fallback receipt_number/reference.
+    //    SKIP total primary query WHERE id=TX-* yang pasti error 22P02.
+    const sanitizedFallback = sanitizeSelectQueryByColumnSet(fallbackRewrite, columnSet);
+    const f = buildSelectQuery(table, sanitizedFallback);
     attempts.push({
       label: 'fallback-receipt_number',
       sql: f.sql,
       values: f.values,
+    });
+    // Strip fallback suffix agar ID numeric yang valid juga dicoba.
+    const strippedQuery = {};
+    for (const k of Object.keys(scopedQuery || {})) {
+      const v = scopedQuery[k];
+      if (k === 'eq__id' && _looksLikeNonBigintStringId(v)) {
+        const trimmed = String(v ?? '').trim();
+        const stripped = (trimmed.startsWith('TX-') || trimmed.startsWith('tx-'))
+          ? trimmed.slice(3)
+          : trimmed;
+        if (stripped && /^\d+$/.test(stripped)) {
+          strippedQuery.eq__id = stripped;
+          continue;
+        }
+        continue;
+      }
+      strippedQuery[k] = v;
+    }
+    if (strippedQuery.eq__id && /^\d+$/.test(String(strippedQuery.eq__id))) {
+      const s = buildSelectQuery(table, sanitizeSelectQueryByColumnSet(strippedQuery, columnSet));
+      attempts.push({
+        label: 'fallback-stripped-numeric-id',
+        sql: s.sql,
+        values: s.values,
+      });
+    }
+    // LAST RESORT ONLY: Jika fallback receipt_number tidak ada (sangat jarang),
+    //   tetap masukkan primary tapi hanya jika previous attempt gagal return rows,
+    //   BUKAN karena 22P02 (kita sudah guard 22P02 di attempt label check).
+  } else {
+    const primarySqlObj = buildSelectQuery(table, scopedQuery);
+    attempts.push({
+      label: 'primary',
+      sql: primarySqlObj.sql,
+      values: primarySqlObj.values,
     });
   }
 

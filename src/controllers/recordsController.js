@@ -145,6 +145,13 @@ const resolveProductMutationTarget = async ({
       }
     }
 
+    if (idField === 'id' && !/^\d+$/.test(rawIdStr)) {
+      throw Object.assign(
+        new Error(`Record dengan ${idField}=${rawIdStr} tidak ditemukan (fallback lookup gagal)`),
+        { statusCode: 404, safeForClient: true }
+      );
+    }
+
     return { idField, idValue: idValue };
   }
 
