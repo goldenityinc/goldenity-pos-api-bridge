@@ -639,7 +639,10 @@ const enqueueWebOrderForPrinting = async ({
         transactionId,
         salesRecordId,
       });
-    } catch (_) {}
+      stateEntry.upstreamSavedQueuedAt = Date.now();
+    } catch (_) {
+      stateEntry.upstreamSavedQueuedAt = 0;
+    }
 
     const jobData = {
       tenantId,
@@ -749,6 +752,35 @@ const onWatchdogTimeout = async (stateEntry, submissionId, tenantId, branchId, d
         try { notifyLongPollWaiters(branchKey); } catch (_) {}
       } catch (_) { /* longpoll push failure never kills flow */ }
       startWatchdog(stateEntry, submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
+      return;
+    }
+
+    // 🔴 CRITICAL HOTFIX: If order already persisted upstream (QUEUED_FOR_POS sent successfully earlier)
+    //    we MUST NOT leave stateEntry.resolved=false FOREVER (causes infinite 204 polling).
+    //    Instead: resolve with SYNC_DELAYED — frontend sees success, POS will auto-pull within 3 min.
+    const upstreamSafe = Boolean(stateEntry.upstreamSavedQueuedAt && stateEntry.upstreamSavedQueuedAt > 0);
+    if (upstreamSafe) {
+      try {
+        await updateOrderSyncStatus(submissionId, tenantId, 'SYNC_DELAYED', {
+          resolvedTargetDeviceUuid: deviceUuid,
+          warning: 'POS_ACK_FALLBACK: Order disimpan di DB & akan di-pull POS otomatis dalam 1-3 menit.',
+          transactionId,
+          salesRecordId,
+        });
+      } catch (_) {}
+      finalizeResolve(stateEntry, submissionId, {
+        ok: true,
+        code: 'SYNC_DELAYED',
+        status: 'SYNC_DELAYED',
+        ackStatus: 'SYNC_DELAYED',
+        retryAvailable: false,
+        warning: 'POS tidak merespon dalam batas waktu. Pesanan TETAP AMAN di database & POS akan mengambil otomatis (Auto-Pull 3 menit).',
+        submissionId,
+        transactionId: transactionId || null,
+        orderId: salesRecordId || null,
+        resolvedAt: Date.now(),
+        _autoResolved: true,
+      });
       return;
     }
 
