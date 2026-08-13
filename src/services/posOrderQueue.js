@@ -366,27 +366,45 @@ const notifyLongPollWaiters = (key) => {
   }
 };
 
+// 🔴🔴 RAILWAY CPU SAVE HOTFIX:
+//    [dbg HR2-HR3 deviceFetch] ADMIN_CORE_ENV_SET mencetak 80+ lines SETIAP REQUEST.
+//    1 polling 200ms = 5 req/sec = 400 lines/sec = CPU 90% hanya ngeprint stderr.
+//    LOG INI TIDAK BERGUNA LAGI setelah fix HR2 double-slash deployed (host Railway sudah
+//    terkonfirmasi resolve normal). KITA COMMENT OUT 100%. Kalau perlu debug, aktifkan
+//    sementara di lokal (bukan production).
+const __DEBUG_ADMIN_CORE_FETCH_VERBOSE = false;
+const __SHORT_TERM_CACHE_TTL_MS = 500;
+const __shortTermFetchCache = new Map(); // key: method||url||bodyHash -> { expiresAt, result }
+
 const adminCoreFetch = async (path, options = {}) => {
   // 🔴 CRITICAL REGRESSION FIX HR2: URL Normalize double slashes (selain protocol https://)
-  //    Masalah: ADMIN_CORE_URL = https://admin.example.com/api (DIAKHIRI /api tanpa slash),
-  //    atau env var Railway USER setup TRAILING SLASH → https://admin.example.com/,
-  //    atau path param CONTAIN double // sebelum di encode → url fetch INVALID.
-  //    Node.js native fetch() (undici) strict terhadap URL format: double slashes
-  //    setelah origin = path salah, kadang ECONNREFUSED / ENOTFOUND "fetch failed".
-  const rawUrl = `${ADMIN_CORE_URL}/${path.replace(/^\//, '')}`; // selalu inject 1 slash antara base + path
-  const url = rawUrl.replace(/([^:])\/{2,}/g, '$1/'); // replace 2+ slashes jadi 1 slash, KECUALI setelah protocol colon (:) biarkan https:// tetap.
-  // 🔴 [Instrument HR2-HR3 pre-fix evidence] SELALU log actual fetch URL ke console (Railway logs capture):
-  console.error('[dbg HR2-HR3 deviceFetch] ADMIN_CORE_ENV_SET:', {
-    hasADMIN_CORE_API_BASE_URL: Boolean(process.env.ADMIN_CORE_API_BASE_URL),
-    hasADMIN_CORE_API_URL: Boolean(process.env.ADMIN_CORE_API_URL),
-    ADMIN_CORE_URL_RAW_len: String(ADMIN_CORE_URL_RAW || '').length,
-    ADMIN_CORE_URL_resolved: ADMIN_CORE_URL,
-    rawUrlBeforeNormalize: rawUrl,
-    finalUrlAfterNormalize: url,
-    doubleSlashesAfterProtocol: (url.match(/:\/\/[^/]+\/(.*)$/) || [])[1]?.split('//').length - 1 || 0,
-    path_input: path,
-    method: (options.method || 'GET').toUpperCase(),
-  });
+  const rawUrl = `${ADMIN_CORE_URL}/${path.replace(/^\//, '')}`;
+  const url = rawUrl.replace(/([^:])\/{2,}/g, '$1/');
+  const method = (options.method || 'GET').toUpperCase();
+  const bodyStr = (options.body && typeof options.body === 'string') ? options.body : '';
+  // Short-term cache: GET dengan URL YANG SAMA dalam 500ms → balikin hasil cache,
+  // tidak hammer Admin Core. Ini mencegah snowball infinite polling loop.
+  let cacheKey = null;
+  if (method === 'GET') {
+    cacheKey = `${method}||${url}`;
+    const cached = __shortTermFetchCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.result;
+    }
+  }
+  if (__DEBUG_ADMIN_CORE_FETCH_VERBOSE) {
+    console.error('[dbg HR2-HR3 deviceFetch] ADMIN_CORE_ENV_SET:', {
+      hasADMIN_CORE_API_BASE_URL: Boolean(process.env.ADMIN_CORE_API_BASE_URL),
+      hasADMIN_CORE_API_URL: Boolean(process.env.ADMIN_CORE_API_URL),
+      ADMIN_CORE_URL_RAW_len: String(ADMIN_CORE_URL_RAW || '').length,
+      ADMIN_CORE_URL_resolved: ADMIN_CORE_URL,
+      rawUrlBeforeNormalize: rawUrl,
+      finalUrlAfterNormalize: url,
+      doubleSlashesAfterProtocol: (url.match(/:\/\/[^/]+\/(.*)$/) || [])[1]?.split('//').length - 1 || 0,
+      path_input: path,
+      method,
+    });
+  }
   const headers = {
     'Content-Type': 'application/json',
     ...(options.headers || {}),
@@ -407,12 +425,29 @@ const adminCoreFetch = async (path, options = {}) => {
     const text = await res.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch (_) { data = { raw: text }; }
-    return { ok: res.ok, status: res.status, data };
+    const result = { ok: res.ok, status: res.status, data };
+    if (cacheKey) {
+      __shortTermFetchCache.set(cacheKey, { expiresAt: Date.now() + __SHORT_TERM_CACHE_TTL_MS, result });
+    }
+    return result;
   } catch (err) {
     clearTimeout(timeoutId);
-    return { ok: false, status: 0, data: null, error: err.message || String(err) };
+    const result = { ok: false, status: 0, data: null, error: err.message || String(err) };
+    if (cacheKey) {
+      // Cache failure juga (150ms only) supaya network error loop tidak retry 10x
+      __shortTermFetchCache.set(cacheKey, { expiresAt: Date.now() + 150, result });
+    }
+    return result;
   }
 };
+
+// GC cache periodic: hapus entry expired tiap 5 detik supaya Map tidak membesar tanpa batas
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of __shortTermFetchCache) {
+    if (v.expiresAt < now) __shortTermFetchCache.delete(k);
+  }
+}, 5000);
 
 const resolveDefaultPrinterDevice = async (branchId, tenantId) => {
   if (!branchId) return null;

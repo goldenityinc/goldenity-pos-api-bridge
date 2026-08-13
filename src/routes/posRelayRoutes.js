@@ -63,32 +63,86 @@ const normalizeAndResolveSubmissionFromSegment = (req) => {
   return { submissionId: '', resolvedStyle: 'empty-segment' };
 };
 
+// 🔴🔴 POLLING CAP 5x: mencegah infinite polling loop menghabiskan Railway CPU.
+//    Web Order frontend normal polling tiap 2 detik sampai dapat ack.
+//    Jika lebih dari 5 kali berturut-turut masih PENDING_ACK tanpa perubahan →
+//    RETURN SYNC_DELAYED (frontend akan berhenti aggressive polling).
+const __DEBUG_ACK_POLL_VERBOSE = false;
+const MAX_ACK_POLLS_BEFORE_THROTTLE = 5;
+const THROTTLE_WINDOW_MS = 60000; // 60 detik window
+const ackPollTracker = new Map(); // submissionId -> { count, windowStart }
+
+function applyAckPollCap(submissionId, curAckStatusRaw, builtResponse) {
+  if (!submissionId) return builtResponse;
+  const now = Date.now();
+  let tracker = ackPollTracker.get(submissionId);
+  if (!tracker || (now - tracker.windowStart) > THROTTLE_WINDOW_MS) {
+    tracker = { count: 0, windowStart: now, lastSeenStatus: '' };
+    ackPollTracker.set(submissionId, tracker);
+  }
+  const status = String(curAckStatusRaw || '').toUpperCase();
+  if (tracker.lastSeenStatus === status) {
+    tracker.count += 1;
+  } else {
+    tracker.count = 1;
+    tracker.lastSeenStatus = status;
+    tracker.windowStart = now;
+  }
+  // Cap: status PENDING / PENDING_ACK / POS_ACKNOWLEDGED TANPA perubahan > MAX →
+  //      override jadi SYNC_DELAYED supaya frontend STOP aggressive polling (diamond problem).
+  const stuckStatuses = new Set(['', 'PENDING', 'PENDING_ACK', 'POS_ACKNOWLEDGED', 'QUEUED_FOR_POS', 'QUEUED']);
+  if (tracker.count > MAX_ACK_POLLS_BEFORE_THROTTLE && stuckStatuses.has(status)) {
+    const payloadOverride = {
+      ...(builtResponse.payload || {}),
+      ackStatus: 'SYNC_DELAYED',
+      ok: true,
+      pollsThisWindow: tracker.count,
+      throttleUntil: new Date(now + THROTTLE_WINDOW_MS).toISOString(),
+      message: `Polling cap ${MAX_ACK_POLLS_BEFORE_THROTTLE}x reached. Status frozen -> SYNC_DELAYED. Pull dari POS sync queue auto fallback (3 menit).`,
+    };
+    return { ...builtResponse, found: true, statusCode: 200, payload: payloadOverride };
+  }
+  return builtResponse;
+}
+
 const buildAckStatusResponseFromState = (submissionId, resolvedStyle) => {
   const s = getOrderSubmissionState(submissionId);
   if (!s) {
     const st = submissionStates.get(submissionId);
-    if (!st) return { found: false, resolvedStyle, statusCode: 404, payload: { ok:false, message:`submissionId ${submissionId} tidak ada di Bridge queue (belum di-proses / sudah dihapus). Jika order baru submit: tunggu 2-3 detik lalu coba lagi.`, submissionId } };
+    if (!st) return applyAckPollCap(submissionId, '', { found: false, resolvedStyle, statusCode: 404, payload: { ok:false, message:`submissionId ${submissionId} tidak ada di Bridge queue (belum di-proses / sudah dihapus). Jika order baru submit: tunggu 2-3 detik lalu coba lagi.`, submissionId } });
     const status = String(st.status || st.ackStatus || st.state || 'PENDING_ACK').toUpperCase();
-    return { found: true, resolvedStyle, statusCode: 200, payload: { ok:true, submissionId, ackStatus: status, resolvedDeviceUuid: st.resolvedDeviceUuid || st.targetDeviceUuid || null, resolvedAt: st.resolvedAt || st.ackedAt || null, posPrintedAt: st.printedAt || null, failedDeliveryAt: st.failedAt || null, detail: st } };
+    const resp = { found: true, resolvedStyle, statusCode: 200, payload: { ok:true, submissionId, ackStatus: status, resolvedDeviceUuid: st.resolvedDeviceUuid || st.targetDeviceUuid || null, resolvedAt: st.resolvedAt || st.ackedAt || null, posPrintedAt: st.printedAt || null, failedDeliveryAt: st.failedAt || null, detail: st } };
+    return applyAckPollCap(submissionId, status, resp);
   }
   const status = String(s.status || s.ackStatus || 'PENDING_ACK').toUpperCase();
-  return { found: true, resolvedStyle, statusCode: 200, payload: { ok:true, submissionId, ackStatus: status, resolvedDeviceUuid: s.resolvedDeviceUuid || s.targetDeviceUuid || null, resolvedAt: s.resolvedAt || s.ackedAt || null, posPrintedAt: s.printedAt || null, failedDeliveryAt: s.failedAt || null, detail: s } };
+  const resp = { found: true, resolvedStyle, statusCode: 200, payload: { ok:true, submissionId, ackStatus: status, resolvedDeviceUuid: s.resolvedDeviceUuid || s.targetDeviceUuid || null, resolvedAt: s.resolvedAt || s.ackedAt || null, posPrintedAt: s.printedAt || null, failedDeliveryAt: s.failedAt || null, detail: s } };
+  return applyAckPollCap(submissionId, status, resp);
 };
+
+// GC ackPollTracker tiap 30 detik supaya Map tidak membesar tanpa batas
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of ackPollTracker) {
+    if ((now - v.windowStart) > (THROTTLE_WINDOW_MS * 2)) ackPollTracker.delete(k);
+  }
+}, 30000);
 
 // a) Explicit route untuk pattern EXACT by-submission/:submissionId/ack-status
 router.get('/orders/by-submission/:submissionId/ack-status', (req, res) => {
   try {
     const subId = (req.params.submissionId || '').toString().trim();
-    //#region debug-point web-order-bugs-ackpoll
-    try {
-      const ts = new Date().toISOString();
-      const st = submissionStates.get(subId);
-      const sstatus = st ? (st.status || st.ackStatus || '') : '';
-      const sresolved = st ? !!st.resolved : false;
-      console.error(
-        `[${ts}] [DEBUG-WEB-ORDER] [ACK-POLL-by-submission] submissionId=${subId} resolved=${sresolved} curStatus=${sstatus} resolvedStyle=exact-by-submission reqIp=${String(req.ip || '')}`,
-      );
-    } catch (_dbg) { /* noop */ }
+    //#region debug-point web-order-bugs-ackpoll 🔴 DISABLED for Railway CPU save
+    if (__DEBUG_ACK_POLL_VERBOSE) {
+      try {
+        const ts = new Date().toISOString();
+        const st = submissionStates.get(subId);
+        const sstatus = st ? (st.status || st.ackStatus || '') : '';
+        const sresolved = st ? !!st.resolved : false;
+        console.error(
+          `[${ts}] [DEBUG-WEB-ORDER] [ACK-POLL-by-submission] submissionId=${subId} resolved=${sresolved} curStatus=${sstatus} resolvedStyle=exact-by-submission reqIp=${String(req.ip || '')}`,
+        );
+      } catch (_dbg) { /* noop */ }
+    }
     //#endregion
     const r = buildAckStatusResponseFromState(subId, 'exact-by-submission');
     return res.status(r.statusCode).json(r.payload);
@@ -102,16 +156,18 @@ router.get('/orders/:rawSegmentBase/:rawSegmentNested/ack-status', (req, res) =>
   try {
     const resolved = normalizeAndResolveSubmissionFromSegment(req);
     if (!resolved.submissionId) return res.status(400).json({ ok:false, message:'submissionId tidak bisa di-resolve dari URL.' });
-    //#region debug-point web-order-bugs-ackpoll
-    try {
-      const ts = new Date().toISOString();
-      const st = submissionStates.get(resolved.submissionId);
-      const sstatus = st ? (st.status || st.ackStatus || '') : '';
-      const sresolved = st ? !!st.resolved : false;
-      console.error(
-        `[${ts}] [DEBUG-WEB-ORDER] [ACK-POLL-wild2] submissionId=${resolved.submissionId} resolvedStyle=${resolved.resolvedStyle} resolved=${sresolved} curStatus=${sstatus}`,
-      );
-    } catch (_dbg) { /* noop */ }
+    //#region debug-point web-order-bugs-ackpoll 🔴 DISABLED
+    if (__DEBUG_ACK_POLL_VERBOSE) {
+      try {
+        const ts = new Date().toISOString();
+        const st = submissionStates.get(resolved.submissionId);
+        const sstatus = st ? (st.status || st.ackStatus || '') : '';
+        const sresolved = st ? !!st.resolved : false;
+        console.error(
+          `[${ts}] [DEBUG-WEB-ORDER] [ACK-POLL-wild2] submissionId=${resolved.submissionId} resolvedStyle=${resolved.resolvedStyle} resolved=${sresolved} curStatus=${sstatus}`,
+        );
+      } catch (_dbg) { /* noop */ }
+    }
     //#endregion
     const r = buildAckStatusResponseFromState(resolved.submissionId, resolved.resolvedStyle);
     return res.status(r.statusCode).json(r.payload);
@@ -125,16 +181,18 @@ router.get('/orders/:rawSegmentBase/ack-status', (req, res) => {
   try {
     const resolved = normalizeAndResolveSubmissionFromSegment(req);
     if (!resolved.submissionId) return res.status(400).json({ ok:false, message:'submissionId tidak bisa di-resolve dari URL.' });
-    //#region debug-point web-order-bugs-ackpoll
-    try {
-      const ts = new Date().toISOString();
-      const st = submissionStates.get(resolved.submissionId);
-      const sstatus = st ? (st.status || st.ackStatus || '') : '';
-      const sresolved = st ? !!st.resolved : false;
-      console.error(
-        `[${ts}] [DEBUG-WEB-ORDER] [ACK-POLL-wild1] submissionId=${resolved.submissionId} resolvedStyle=${resolved.resolvedStyle} resolved=${sresolved} curStatus=${sstatus}`,
-      );
-    } catch (_dbg) { /* noop */ }
+    //#region debug-point web-order-bugs-ackpoll 🔴 DISABLED
+    if (__DEBUG_ACK_POLL_VERBOSE) {
+      try {
+        const ts = new Date().toISOString();
+        const st = submissionStates.get(resolved.submissionId);
+        const sstatus = st ? (st.status || st.ackStatus || '') : '';
+        const sresolved = st ? !!st.resolved : false;
+        console.error(
+          `[${ts}] [DEBUG-WEB-ORDER] [ACK-POLL-wild1] submissionId=${resolved.submissionId} resolvedStyle=${resolved.resolvedStyle} resolved=${sresolved} curStatus=${sstatus}`,
+        );
+      } catch (_dbg) { /* noop */ }
+    }
     //#endregion
     const r = buildAckStatusResponseFromState(resolved.submissionId, resolved.resolvedStyle);
     return res.status(r.statusCode).json(r.payload);
