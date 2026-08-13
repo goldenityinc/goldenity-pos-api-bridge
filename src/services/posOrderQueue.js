@@ -480,6 +480,80 @@ const queueJobMeta = new Map();
 const inMemoryQueue = [];
 let inMemoryProcessorRunning = false;
 let inMemoryQueueLengthPerBranch = new Map();
+// P4 BULLETPROOF (Concurrency Throttle per Branch):
+//   User requirement #1: 10 meja order bersamaan 100% tanpa gangguan.
+//   Kita throttle EMIT socket (processQueueJob) ke max 3 IN FLIGHT per branch.
+//   Alasan: Printer thermal hanya bisa cetak 1 dokumen dalam 1 waktu (serial).
+//     Jika kita blast 10 emit socket secara paralel → 10 print job dikirim
+//     ke printer buffer BERSAMAAN → bytes campur aduk → struk & checker
+//     TERCAMPUR potongan kertas.
+//   Algoritma: Map<branchId, { inFlight: int, queue: Array<() => Promise<void>> }>
+//     Setiap processQueueJob acquire slot: jika inFlight < CONCURRENCY_PER_BRANCH
+//     → jalankan langsung, ELSE → push ke waiters array & jalankan ketika
+//     release slot dipanggil (setelah emit done + ack / race timeout 25s).
+const CONCURRENCY_PER_BRANCH = 3;
+const BRANCH_EMIT_LOCK_TIMEOUT_MS = 25000;
+const branchConcurrency = new Map();
+function _getBranchConcurrencyState(branchId) {
+  const key = String(branchId || '__global').trim();
+  let s = branchConcurrency.get(key);
+  if (!s) {
+    s = { inFlight: 0, waiters: [], seq: 0 };
+    branchConcurrency.set(key, s);
+  }
+  return s;
+}
+async function _acquireBranchSlot(branchId) {
+  const state = _getBranchConcurrencyState(branchId);
+  if (state.inFlight < CONCURRENCY_PER_BRANCH) {
+    state.inFlight += 1;
+    const mySeq = (state.seq = (state.seq || 0) + 1);
+    return () => {
+      const s2 = _getBranchConcurrencyState(branchId);
+      if (s2.inFlight > 0) s2.inFlight -= 1;
+      const next = s2.waiters.shift();
+      if (next && typeof next === 'function') {
+        setImmediate(() => next());
+      }
+    };
+  }
+  const mySeq = (state.seq = (state.seq || 0) + 1);
+  return new Promise((resolve) => {
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      state.inFlight += 1;
+      resolve(() => {
+        const s2 = _getBranchConcurrencyState(branchId);
+        if (s2.inFlight > 0) s2.inFlight -= 1;
+        const next = s2.waiters.shift();
+        if (next && typeof next === 'function') setImmediate(() => next());
+      });
+    }, BRANCH_EMIT_LOCK_TIMEOUT_MS);
+    state.waiters.push(() => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      state.inFlight += 1;
+      resolve(() => {
+        const s2 = _getBranchConcurrencyState(branchId);
+        if (s2.inFlight > 0) s2.inFlight -= 1;
+        const next = s2.waiters.shift();
+        if (next && typeof next === 'function') setImmediate(() => next());
+      });
+    });
+  });
+}
+function _getQueueSnapshotForBranch(branchId) {
+  const state = _getBranchConcurrencyState(branchId);
+  return {
+    concurrency: CONCURRENCY_PER_BRANCH,
+    inFlight: state.inFlight,
+    waiting: state.waiters ? state.waiters.length : 0,
+    inMemoryPending: Number(inMemoryQueueLengthPerBranch.get(branchId || '__global') || 0),
+  };
+}
 
 const getQueuePendingCount = () => {
   if (useBullMq && posOrderQueueInstance) {
@@ -1019,7 +1093,7 @@ const normalizeEachItemWithAllFieldFallbacks = (itemsRaw) => {
   });
 };
 
-const buildOrderEnvelope = (submissionId, tenantId, branchId, deviceUuid, orderPayload, transactionId, salesRecordId) => {
+const buildOrderEnvelope = (submissionId, tenantId, branchId, deviceUuid, orderPayload, transactionId, salesRecordId, extraMeta) => {
   const normalizedTop = normalizeTopLevelOrderEnvelopeFields(orderPayload, { transactionId, salesRecordId, tenantId, branchId });
   // 🔴 APPLY ITEM NORMALIZATION SEKARANG: quantity / unitPrice / name / id / subtotal fallback semua variants.
   const normalizedItemsResolved = normalizeEachItemWithAllFieldFallbacks(normalizedTop.items);
@@ -1041,6 +1115,11 @@ const buildOrderEnvelope = (submissionId, tenantId, branchId, deviceUuid, orderP
   const normalizedPrintType =
     detectedPrintTypeRaw === 'CHECKER_ONLY' ? 'CHECKER_ONLY' :
     detectedPrintTypeRaw === 'RECEIPT_ONLY' ? 'RECEIPT_ONLY' : 'FULL';
+  const extra = extraMeta && typeof extraMeta === 'object' ? extraMeta : {};
+  const queuePosition = Number(extra.queuePosition || 0) || 0;
+  const queueTotal = Number(extra.queueTotal || 0) || 0;
+  const queueConcurrency = Number(extra.queueConcurrency || CONCURRENCY_PER_BRANCH) || CONCURRENCY_PER_BRANCH;
+  const queueInFlight = Number(extra.queueInFlight || 0) || 0;
   return {
     submissionId,
     tenantId: normalizedTop.tenantId || tenantId,
@@ -1105,6 +1184,13 @@ const buildOrderEnvelope = (submissionId, tenantId, branchId, deviceUuid, orderP
     invoice_number: normalizedTop.invoice_number,
     referenceId: normalizedTop.orderId,
     serverTs: Date.now(),
+    // P4 BULLETPROOF (Queue Position Meta):
+    // POS Flutter bisa menampilkan badge "Antrian ke X/Y" ke kasir jika ramai
+    // dan juga printQueue semaphore bisa menyesuaikan display.
+    queuePosition,
+    queueTotal,
+    queueConcurrency,
+    queueInFlight,
   };
 };
 
@@ -1122,18 +1208,48 @@ const processQueueJob = async (jobData) => {
   const stateEntry = submissionStates.get(submissionId);
   if (stateEntry && stateEntry.resolved) return;
 
-  const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
+  // P4 BULLETPROOF: Acquire concurrency slot per-branch supaya printer buffer
+  // tidak kebanjiran. Kalau 10 order bersamaan → 3 jalan, 7 nunggu.
+  const queueSnap = _getQueueSnapshotForBranch(branchId);
+  const queueMetaExtra = {
+    queuePosition: (queueSnap.inFlight + queueSnap.waiting + queueSnap.inMemoryPending + 1),
+    queueTotal: (queueSnap.inFlight + queueSnap.waiting + queueSnap.inMemoryPending + 1),
+    queueConcurrency: queueSnap.concurrency,
+    queueInFlight: queueSnap.inFlight,
+  };
+  const releaseSlotFn = await _acquireBranchSlot(branchId);
+  let released = false;
+  const releaseOnce = () => {
+    if (released) return;
+    released = true;
+    try { if (typeof releaseSlotFn === 'function') releaseSlotFn(); } catch (_) {}
+  };
+  // Safety auto-release setelah 30s supaya tidak deadlock kalau emit stuck.
+  const autoReleaseTimer = setTimeout(() => releaseOnce(), 30000);
+  const killAutoRelease = () => { try { clearTimeout(autoReleaseTimer); } catch (_) {} };
+  try {
+    const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId, queueMetaExtra);
 
-  // Selalu append branch-level long-poll (fallback kalau socket mati)
-  const branchKey = `__branch:${branchId}`;
-  const branchBucket = getLongPollBucket(branchKey);
-  branchBucket.push({ ...envelope, queuedAt: Date.now() });
-  if (branchBucket.length > 200) branchBucket.splice(0, branchBucket.length - 200);
-  notifyLongPollWaiters(branchKey);
+    // Selalu append branch-level long-poll (fallback kalau socket mati)
+    const branchKey = `__branch:${branchId}`;
+    const branchBucket = getLongPollBucket(branchKey);
+    branchBucket.push({ ...envelope, queuedAt: Date.now() });
+    if (branchBucket.length > 200) branchBucket.splice(0, branchBucket.length - 200);
+    notifyLongPollWaiters(branchKey);
 
-  // 🔴 CRITICAL FIX - SELALU emit dengan targetDeviceUuid='' agar BROADCAST BRANCH ROOM DULU.
-  //    Jangan pernah finalize reject "device offline" karena kita sudah BLAST ke seluruh room.
-  const emitResult = emitIncomingWebOrder('', branchId, envelope);
+    // 🔴 CRITICAL FIX - SELALU emit dengan targetDeviceUuid='' agar BROADCAST BRANCH ROOM DULU.
+    //    Jangan pernah finalize reject "device offline" karena kita sudah BLAST ke seluruh room.
+    const emitResult = emitIncomingWebOrder('', branchId, envelope);
+
+    // Jika emit sukses atau fallback ke longpoll, release slot cepat:
+    // Tunggu sebentar (6 detik) supaya POS bisa kirim POS_ACKNOWLEDGED atau socket
+    // ack, lalu lepas slot agar order nextnya bisa jalan.
+    await new Promise((r) => setTimeout(r, 6000));
+    return emitResult;
+  } finally {
+    killAutoRelease();
+    releaseOnce();
+  }
 };
 
 const finalizeResolve = (stateEntry, submissionId, result) => {
