@@ -546,7 +546,7 @@ const runSelect = async (tenantDb, table, query = {}, options = {}) => {
     throw new Error(`Security guard: tabel ${table} wajib memiliki kolom ${TENANT_COLUMN}`);
   }
 
-  const scopedQuery = { ...query };
+  let scopedQuery = { ...query };
   if (hasTenantColumn) {
     if (!tenantId) {
       throw new Error('Security guard: tenantId wajib tersedia untuk operasi read');
