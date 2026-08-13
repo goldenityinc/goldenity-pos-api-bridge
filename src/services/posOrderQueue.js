@@ -822,40 +822,40 @@ const onWatchdogTimeout = async (stateEntry, submissionId, tenantId, branchId, d
   try {
     if (stateEntry.resolved) return;
     stateEntry.watchdogTimer = null;
+    const MAX_WATCHDOG_RETRIES = 2;
+    const retriesSoFar = Number(stateEntry.retries || 0);
 
-    if (stateEntry.retries <= 0) {
-      stateEntry.retries += 1;
+    if (retriesSoFar < MAX_WATCHDOG_RETRIES) {
+      stateEntry.retries = retriesSoFar + 1;
+      const upstreamSafe = Boolean(stateEntry.upstreamSavedQueuedAt && stateEntry.upstreamSavedQueuedAt > 0);
       //#region debug-point web-order-bugs-watchdog-retry
       try {
         const ts = new Date().toISOString();
-        const nowRetries = Number(stateEntry.retries || 0);
         // eslint-disable-next-line no-console
         console.error(
-          `[${ts}] [DEBUG-WEB-ORDER] [WATCHDOG-RETRY] submissionId=${submissionId} retriesCount=${nowRetries} tenant=${tenantId} branch=${branchId} beforeBroadcastDevice=${String(deviceUuid || '(empty=broadcast)')} upstreamSavedQueuedAt=${String(stateEntry.upstreamSavedQueuedAt || 0)} resolved=${!!stateEntry.resolved} processing=${!!stateEntry.processing}`,
+          `[${ts}] [DEBUG-WEB-ORDER] [WATCHDOG-RETRY] submissionId=${submissionId} retriesCount=${stateEntry.retries} max=${MAX_WATCHDOG_RETRIES} tenant=${tenantId} branch=${branchId} beforeBroadcastDevice=${String(deviceUuid || '(empty=broadcast)')} upstreamSavedQueuedAt=${String(stateEntry.upstreamSavedQueuedAt || 0)} upstreamSafe=${upstreamSafe} resolved=${!!stateEntry.resolved} processing=${!!stateEntry.processing}`,
         );
       } catch (_dbg) { /* noop */ }
       //#endregion
-      // 🔴 CRITICAL FIX - BROADCAST RETRY KE BRANCH ROOM, BUKAN 1 device:
-      //    Pass deviceUuid = '' supaya emitIncomingWebOrder SELALU broadcast BRANCH.
-      const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
-      try {
-        const emitResult = emitIncomingWebOrder('', branchId, envelope);
-      } catch (_) { /* emit failure must NEVER kill watchdog */ }
-      // Selalu append ke long-poll branch-level juga (jika ada longpoll clients)
-      try {
-        const branchKey = `__branch:${branchId}`;
-        const branchBucket = getLongPollBucket(branchKey);
-        branchBucket.push({ ...envelope, queuedAt: Date.now() });
-        if (branchBucket.length > 200) branchBucket.splice(0, branchBucket.length - 200);
-        try { notifyLongPollWaiters(branchKey); } catch (_) {}
-      } catch (_) { /* longpoll push failure never kills flow */ }
+      // 🔴 CRITICAL FIX GHOST NOTIF: HANYA emit socket JIKA upstream DB SUDAH confirmed
+      //    (upstreamSavedQueuedAt > 0). Kalau upstream belum confirmed → jangan spam POS.
+      if (upstreamSafe) {
+        const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
+        try {
+          const emitResult = emitIncomingWebOrder('', branchId, envelope);
+        } catch (_) { /* emit failure must NEVER kill watchdog */ }
+        try {
+          const branchKey = `__branch:${branchId}`;
+          const branchBucket = getLongPollBucket(branchKey);
+          branchBucket.push({ ...envelope, queuedAt: Date.now() });
+          if (branchBucket.length > 200) branchBucket.splice(0, branchBucket.length - 200);
+          try { notifyLongPollWaiters(branchKey); } catch (_) {}
+        } catch (_) { /* longpoll push failure never kills flow */ }
+      }
       startWatchdog(stateEntry, submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
       return;
     }
 
-    // 🔴 CRITICAL HOTFIX: If order already persisted upstream (QUEUED_FOR_POS sent successfully earlier)
-    //    we MUST NOT leave stateEntry.resolved=false FOREVER (causes infinite 204 polling).
-    //    Instead: resolve with SYNC_DELAYED — frontend sees success, POS will auto-pull within 3 min.
     const upstreamSafe = Boolean(stateEntry.upstreamSavedQueuedAt && stateEntry.upstreamSavedQueuedAt > 0);
     if (upstreamSafe) {
       try {
@@ -1240,22 +1240,28 @@ const processQueueJob = async (jobData) => {
   try {
     const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId, queueMetaExtra);
 
-    // Selalu append branch-level long-poll (fallback kalau socket mati)
-    const branchKey = `__branch:${branchId}`;
-    const branchBucket = getLongPollBucket(branchKey);
-    branchBucket.push({ ...envelope, queuedAt: Date.now() });
-    if (branchBucket.length > 200) branchBucket.splice(0, branchBucket.length - 200);
-    notifyLongPollWaiters(branchKey);
-
-    // 🔴 CRITICAL FIX - SELALU emit dengan targetDeviceUuid='' agar BROADCAST BRANCH ROOM DULU.
-    //    Jangan pernah finalize reject "device offline" karena kita sudah BLAST ke seluruh room.
-    const emitResult = emitIncomingWebOrder('', branchId, envelope);
-
-    // Jika emit sukses atau fallback ke longpoll, release slot cepat:
-    // Tunggu sebentar (6 detik) supaya POS bisa kirim POS_ACKNOWLEDGED atau socket
-    // ack, lalu lepas slot agar order nextnya bisa jalan.
-    await new Promise((r) => setTimeout(r, 6000));
-    return emitResult;
+    const upstreamSafe = Boolean(stateEntry && stateEntry.upstreamSavedQueuedAt && stateEntry.upstreamSavedQueuedAt > 0);
+    if (upstreamSafe) {
+      const branchKey = `__branch:${branchId}`;
+      const branchBucket = getLongPollBucket(branchKey);
+      branchBucket.push({ ...envelope, queuedAt: Date.now() });
+      if (branchBucket.length > 200) branchBucket.splice(0, branchBucket.length - 200);
+      notifyLongPollWaiters(branchKey);
+      const emitResult = emitIncomingWebOrder('', branchId, envelope);
+      await new Promise((r) => setTimeout(r, 6000));
+      return emitResult;
+    }
+    // 🔴 SAFETY: upstream NOT confirmed safe → JANGAN emit socket ghost ke POS.
+    //    Biarkan client polling / retry mechanism handle re-emit NANTI setelah upstream confirmed.
+    try {
+      const branchKey = `__branch:${branchId}`;
+      const branchBucket = getLongPollBucket(branchKey);
+      branchBucket.push({ ...envelope, queuedAt: Date.now(), _pendingUpstream: true });
+      if (branchBucket.length > 200) branchBucket.splice(0, branchBucket.length - 200);
+      notifyLongPollWaiters(branchKey);
+    } catch (_) {}
+    await new Promise((r) => setTimeout(r, 3000));
+    return null;
   } finally {
     killAutoRelease();
     releaseOnce();
