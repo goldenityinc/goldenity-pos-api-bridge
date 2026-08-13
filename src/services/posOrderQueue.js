@@ -633,6 +633,7 @@ const enqueueWebOrderForPrinting = async ({
     // (Line 373-378 resolveDefaultPrinterDevice DIBYPASS SEMUA)
     stateEntry.resolvedTargetDeviceUuid = resolvedTargetDeviceUuid;
 
+    let upstreamSaved = false;
     try {
       await updateOrderSyncStatus(cleanSubmissionId, tenantId, 'QUEUED_FOR_POS', {
         resolvedTargetDeviceUuid,
@@ -640,8 +641,21 @@ const enqueueWebOrderForPrinting = async ({
         salesRecordId,
       });
       stateEntry.upstreamSavedQueuedAt = Date.now();
-    } catch (_) {
+      upstreamSaved = true;
+    } catch (err) {
       stateEntry.upstreamSavedQueuedAt = 0;
+      upstreamSaved = false;
+      console.error(`[posOrderQueue:enqueue] ❌ UPSTREAM DB FAIL for submission=${cleanSubmissionId}. Will NOT broadcast socket to avoid GHOST ORDER. err=`, err?.message || err);
+      try { if (stateEntry.watchdogTimer) clearTimeout(stateEntry.watchdogTimer); } catch (_) {}
+      stateEntry.watchdogTimer = null;
+      try { finalizeReject(stateEntry, cleanSubmissionId, 'UPSTREAM_DB_SAVE_FAILED', 502, 'Gagal menyimpan pesanan ke pusat. Silakan coba lagi.', { retryAvailable: true, _dbFailed: true }); } catch (_) {}
+      submissionStates.delete(cleanSubmissionId);
+      throw Object.assign(new Error('UPSTREAM_DB_SAVE_FAILED: order tidak dapat disimpan ke pusat'), { code: 'UPSTREAM_DB_SAVE_FAILED', statusCode: 502, retryAvailable: true });
+    }
+
+    if (!upstreamSaved) {
+      submissionStates.delete(cleanSubmissionId);
+      throw Object.assign(new Error('UPSTREAM_DB_SAVE_FAILED'), { code: 'UPSTREAM_DB_SAVE_FAILED', statusCode: 502, retryAvailable: true });
     }
 
     const jobData = {
