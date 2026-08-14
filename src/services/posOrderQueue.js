@@ -688,8 +688,8 @@ const enqueueWebOrderForPrinting = async ({
   salesRecordId,
   rawBody,
 }) => {
-  const cleanSubmissionId = (submissionId || '').toString().trim();
-  if (!cleanSubmissionId) {
+  const originalInputSubmissionId = (submissionId || '').toString().trim();
+  if (!originalInputSubmissionId) {
     throw Object.assign(new Error('submissionId wajib disediakan'), { statusCode: 400, code: 'MISSING_SUBMISSION_ID' });
   }
 
@@ -697,13 +697,102 @@ const enqueueWebOrderForPrinting = async ({
   //    supaya NESTED metadata di rawBody (orderData/transactionData) juga di scan.
   //    Hasilnya: orderPayload table_number/customer_name/pax TIDAK KOSONG LAGI.
   try {
-    injectMissingOrderMetadata(orderPayload, { rawBody, tenantId, branchId, transactionId, salesRecordId, submissionId });
+    injectMissingOrderMetadata(orderPayload, { rawBody, tenantId, branchId, transactionId, salesRecordId, submissionId: originalInputSubmissionId });
   } catch (_) { /* noop */ }
+
+  // ================================================================
+  // 🔴 CRITICAL FIX 2B (DUPLICATE SUBMISSION_ID REWRITE SAFETY NET):
+  //    User request: "Tambahkan logic BE check idempotent agar ketika
+  //    ada orderan BEDA MEJA yang masuk dengan submissionId SAMA
+  //    (karena race condition cache localStorage / Date.now() collision
+  //    di frontend web order), backend HARUS rewrite submissionId
+  //    dengan suffix _dup_N agar POS MENERIMA KEDUA ORDER SECARA
+  //    BERURUTAN, BUKAN reject duplicate / return cache pertama.
+  //
+  //    Sebelumnya (L703-711 existing check): submissionId SAMA →
+  //    order kedua akan langsung return existing.result (cache) atau
+  //    existing.promise → ORDER KEDUA HILANG TOTAL karena dianggap
+  //    idempotent retry order YANG SAMA. Tapi real case-nya: ini 2
+  //    MEJA BEDA (mis Meja 1 dan Meja 5) yang kebetulan collision
+  //    TX-ID sama (user bug 3 screenshot bukti nyata!).
+  //
+  //    STRATEGI:
+  //    a) Key unik = `${tenantId}::${branchId}::${cleanSubmissionId}`.
+  //       Ini memisahkan cache antar tenant (jangan cross-tenant compare).
+  //    b) Check di submissionStates: ada existing stateEntry untuk key
+  //       ini yang masih aktif / resolved masih dalam 30 menit TTL?
+  //    c) JIKA YA → increment counter rewrite = 1..99
+  //       submissionId BARU = `${original}__dup_${N}`
+  //       (double underscore agar mudah dibedakan dengan suffix random
+  //       hex dari frontend, yang pakai single dash TX-xxx-5-a1b2c3)
+  //    d) Loop ulang check sampai menemukan submissionId BENAR-BENAR
+  //       UNIQUE (hingga counter 100 untuk safety).
+  //    e) SETELAH rewrite SUCCESS, inject submissionId BARU ke
+  //       orderPayload.submissionId + orderPayload.submission_id
+  //       agar data konsisten (socket broadcast, DB, dan receipt
+  //       POS semuanya melihat ID BARU).
+  //    f) Tulis log supaya audit trail Railway jelas kapan rewrite
+  //       terjadi dan ID lama vs ID baru.
+  // ================================================================
+  let rewriteIterations = 0;
+  const MAX_REWRITE_ATTEMPTS = 100;
+  const rewriteState = {
+    hadCollision: false,
+    original: originalInputSubmissionId,
+    finalSubmissionId: originalInputSubmissionId,
+    attempts: 0,
+  };
+  const cleanTenant = String(tenantId || '').trim();
+  const cleanBranch = String(branchId || '').trim();
+  const _buildCacheCollisionCheckKey = (subm) => `${cleanTenant}::${cleanBranch}::${String(subm || '').trim()}`;
+
+  while (rewriteIterations < MAX_REWRITE_ATTEMPTS) {
+    const currentCandidate = rewriteIterations === 0
+      ? originalInputSubmissionId
+      : `${originalInputSubmissionId}__dup_${rewriteIterations}`;
+    const collisionCacheKey = _buildCacheCollisionCheckKey(currentCandidate);
+    const existing = submissionStates.get(currentCandidate);
+
+    if (existing) {
+      // 🔴 COLLISION DETECTED pada submissionId ini.
+      //    Safety guard: coba lagi dengan counter berikutnya.
+      rewriteState.hadCollision = true;
+      rewriteIterations += 1;
+      rewriteState.attempts = rewriteIterations;
+      continue;
+    }
+
+    // 🟢 Tidak ada collision pada candidate ini.
+    rewriteState.finalSubmissionId = currentCandidate;
+    rewriteState.attempts = rewriteIterations;
+    break;
+  }
+
+  let cleanSubmissionId = rewriteState.finalSubmissionId;
+  if (rewriteState.hadCollision && typeof console === 'object' && typeof console.warn === 'function') {
+    try {
+      const ts = new Date().toISOString();
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[${ts}] [POS-ORDER-QUEUE] [IDEMPOTENCY-RENAME] submissionId collision detected. ` +
+        `original="${rewriteState.original}" final="${cleanSubmissionId}" ` +
+        `tenant="${cleanTenant}" branch="${cleanBranch}" ` +
+        `tableId="${(orderPayload && ((orderPayload.tableId || orderPayload.table_id || '')))}" ` +
+        `tableNum="${(orderPayload && ((orderPayload.tableNumber || orderPayload.table_number || orderPayload.tableName || '')))}" ` +
+        `attempts=${rewriteState.attempts}`
+      );
+    } catch (_logE) { /* DOUBLE SAFETY: log tidak boleh crash flow */ }
+  }
+  // ✅ Rewrite orderPayload fields agar SEMUA downstream pakai ID BARU:
+  if (rewriteState.hadCollision && orderPayload && typeof orderPayload === 'object') {
+    try { orderPayload.submissionId = cleanSubmissionId; } catch (_) {}
+    try { orderPayload.submission_id = cleanSubmissionId; } catch (_) {}
+  }
 
   const existing = submissionStates.get(cleanSubmissionId);
   if (existing) {
     if (existing.resolved) {
-      return { ...existing.result, _fromCache: true };
+      return { ...existing.result, _fromCache: true, _idempotencyRenameApplied: rewriteState.hadCollision, _originalSubmissionId: rewriteState.hadCollision ? rewriteState.original : undefined };
     }
     if (existing.processing && existing.promise) {
       return existing.promise;
