@@ -819,6 +819,19 @@ const enqueueWebOrderForPrinting = async ({
 
   submissionStates.set(cleanSubmissionId, stateEntry);
 
+  // 🔴 CRITICAL HOTFIX ACK POLL DESYNC (PROBLEM 2):
+  //    Jika terjadi collision rewrite → finalSubmissionId = ORIG__dup_N.
+  //    Frontend Web Order polling menggunakan ORIGINAL ID (TANPA suffix dup),
+  //    jadi submissionStates.get(ORIGINAL) = NULL → polling tidak pernah
+  //    menemukan state resolved → TIMEOUT 35 DETIK meskipun POS sukses print.
+  //    SOLUSI: Mirror stateEntry ke 2 KEY SEKALIGUS (share object reference yang sama).
+  //    Sehingga BOTH (ORIGINAL key dan rewrite key) → menemukan state resolved YANG SAMA.
+  if (rewriteState.hadCollision) {
+    submissionStates.set(rewriteState.original, stateEntry);
+    stateEntry._originalSubmissionId = rewriteState.original;
+    stateEntry._rewriteAttempts = rewriteState.attempts;
+  }
+
   try {
     // 🔴 CRITICAL FIX - BROADCAST TO ENTIRE BRANCH ROOM, NOT ONE DEVICE:
     //    User melaporkan TABLET Android pake fallback UUID TIDAK PERNAH dapat notif,
@@ -908,6 +921,12 @@ const enqueueWebOrderForPrinting = async ({
       stateEntry.retryAvailable = err.retryAvailable !== false;
     } else {
       submissionStates.delete(cleanSubmissionId);
+      // 🔴 Mirror cleanup: Jika state ini hasil dari collision rewrite,
+      //    pastikan ORIGINAL key juga dihapus agar tidak ada stale entry.
+      const origId = stateEntry._originalSubmissionId;
+      if (origId && origId !== cleanSubmissionId && submissionStates.get(origId) === stateEntry) {
+        submissionStates.delete(origId);
+      }
     }
     throw err;
   }
@@ -1404,8 +1423,13 @@ const finalizeResolve = (stateEntry, submissionId, result) => {
   if (stateEntry.resolvePromise) {
     try { stateEntry.resolvePromise(result); } catch (_) {}
   }
+  // 🔴 Mirror TTL cleanup: Hapus BOTH key (rewrite key + original key) bersama-sama setelah 300s.
+  const origId = stateEntry._originalSubmissionId;
   setTimeout(() => {
     submissionStates.delete(submissionId);
+    if (origId && origId !== submissionId && submissionStates.get(origId) === stateEntry) {
+      submissionStates.delete(origId);
+    }
   }, 300000);
 };
 
@@ -1422,8 +1446,13 @@ const finalizeReject = (stateEntry, submissionId, errorObj) => {
     const err = Object.assign(new Error(errorObj.message || 'Queue error'), errorObj);
     try { stateEntry.rejectPromise(err); } catch (_) {}
   }
+  // 🔴 Mirror TTL cleanup: Hapus BOTH key (rewrite key + original key) bersama-sama setelah 300s.
+  const origId = stateEntry._originalSubmissionId;
   setTimeout(() => {
     submissionStates.delete(submissionId);
+    if (origId && origId !== submissionId && submissionStates.get(origId) === stateEntry) {
+      submissionStates.delete(origId);
+    }
   }, 300000);
 };
 
@@ -1499,6 +1528,11 @@ const resolveOrderAcknowledgement = async ({
     submissionStates.set(cleanSubmissionId, stateEntry);
     setTimeout(() => {
       if (submissionStates.get(cleanSubmissionId) === stateEntry) submissionStates.delete(cleanSubmissionId);
+      // 🔴 Mirror cleanup: Jika manual state ini punya _originalSubmissionId, hapus juga original key.
+      const origId = stateEntry._originalSubmissionId;
+      if (origId && origId !== cleanSubmissionId && submissionStates.get(origId) === stateEntry) {
+        submissionStates.delete(origId);
+      }
     }, 300000);
   } else if (stateEntry && stateEntry.resolved && stateEntry.result && !stateEntry.result.ok) {
     stateEntry.result = {
@@ -1512,6 +1546,28 @@ const resolveOrderAcknowledgement = async ({
     };
     stateEntry.status = resolvedAckStatus;
     stateEntry.resolvedAt = resolvedPrintedAt;
+  }
+
+  // 🔴 Mirror resolve untuk POS ACK dengan submissionId suffix __dup_N:
+  //    POS mengirim ACK pakai ID YANG DI-REWRITE (ORIG__dup_1). Tapi frontend
+  //    Web Order polling tetap pakai ORIGINAL key → jika tidak ada mirror di
+  //    resolveOrderAcknowledgement (edge case: stateEntry dibuat ulang manual)
+  //    maka akan tetap timeout.
+  //    SOLUSI: extract originalId dari suffix __dup_ dan mirror set ke key original.
+  if (cleanSubmissionId.includes('__dup_')) {
+    try {
+      const splitParts = cleanSubmissionId.split('__dup_');
+      const extractedOriginal = splitParts.length > 0 ? splitParts[0] : '';
+      if (extractedOriginal && extractedOriginal !== cleanSubmissionId && stateEntry) {
+        const existingOrig = submissionStates.get(extractedOriginal);
+        if (existingOrig !== stateEntry) {
+          submissionStates.set(extractedOriginal, stateEntry);
+          if (!stateEntry._originalSubmissionId) {
+            stateEntry._originalSubmissionId = extractedOriginal;
+          }
+        }
+      }
+    } catch (_mirrorErr) { /* double safety: mirror failure tidak boleh break ACK flow */ }
   }
 
   const finalTenantId = (tenantId || ackPayload?.tenantId || ackPayload?.tenant_id || stateEntry?.tenantId || stateEntry?.result?.tenantId || '').toString();
