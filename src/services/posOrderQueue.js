@@ -881,6 +881,29 @@ const enqueueWebOrderForPrinting = async ({
       attempt: 0,
     };
 
+    // 🔥🔥🔥 FIX BUG 2 QRIS GRAND TOTAL RP 0:
+    //    PASTIKAN `stateEntry.orderPayload` DAN IDENTITY LAINNYA
+    //    DISIMPAN KE stateEntry SEBELUM startWatchdog!
+    //    DULU: orderPayload hanya di-pass sebagai closure param ke startWatchdog
+    //    → TIDAK tersimpan ke stateEntry → downstream (route ack-status) TIDAK BISA
+    //    baca grandTotal/items → Web Order QRIS page tampilkan Rp 0!
+    //    SEKARANG: Tulis SEMUA identity ke stateEntry agar PERSISTENT di submissionStates map.
+    try {
+      if (orderPayload && typeof orderPayload === 'object' && !stateEntry.orderPayload) {
+        stateEntry.orderPayload = orderPayload;
+      }
+      if (transactionId && !stateEntry.transactionId) stateEntry.transactionId = transactionId;
+      if (salesRecordId && !stateEntry.salesRecordId) stateEntry.salesRecordId = salesRecordId;
+      if (tenantId && !stateEntry.tenantId) stateEntry.tenantId = tenantId;
+      if (branchId && !stateEntry.branchId) stateEntry.branchId = branchId;
+      if (!stateEntry.submissionId) stateEntry.submissionId = cleanSubmissionId;
+    } catch (_persistErr) {
+      try {
+        const ts = new Date().toISOString();
+        console.error(`[${ts}] [DEBUG-WEB-ORDER] [FIX-BUG2-PERSIST-STATE] silent error persist stateEntry identity: ${_persistErr?.message || String(_persistErr)}`);
+      } catch (_) { /* noop */ }
+    }
+
     startWatchdog(stateEntry, cleanSubmissionId, tenantId, branchId, resolvedTargetDeviceUuid, orderPayload, transactionId, salesRecordId);
 
     if (useBullMq && posOrderQueueInstance) {
@@ -1419,9 +1442,98 @@ const finalizeResolve = (stateEntry, submissionId, result) => {
     clearTimeout(stateEntry.watchdogTimer);
     stateEntry.watchdogTimer = null;
   }
-  stateEntry.result = result;
+
+  // 🔥🔥🔥 FIX BUG 2 QRIS GRAND TOTAL RP 0:
+  //    SELALU COMPUTE DAN ATTACH `orderSummary` (top-level) ke result,
+  //    agar Web Order Payment Page (QRIS Step 1) BISA BACA grandTotal / items
+  //    / tableName TANPA harus parse nested stateEntry.orderPayload.
+  //    Ini juga menjamin: jika stateEntry.orderPayload BARU di-set SEBELUM
+  //    startWatchdog (fix di atas), finalizeResolve tetap menyertakannya.
+  let orderSummary = null;
+  let grandTotalInt = 0;
+  try {
+    const payloadRaw = stateEntry.orderPayload
+      || (result && result.orderPayload)
+      || (stateEntry.result && stateEntry.result.orderPayload)
+      || null;
+    if (payloadRaw && typeof payloadRaw === 'object') {
+      const p = payloadRaw;
+      const priceCandidates = [
+        p.grand_total, p.grandTotal,
+        p.total_price, p.totalPrice,
+        p.total_amount, p.totalAmount,
+        p.total, p.amount, p.amount_paid, p.amountPaid,
+        p.payable_amount, p.payableAmount,
+      ];
+      for (const v of priceCandidates) {
+        if (v == null) continue;
+        const n = typeof v === 'number' ? v : Number(String(v).replace(/[^0-9.-]/g, ''));
+        if (!Number.isNaN(n) && n > 0) { grandTotalInt = Math.round(n); break; }
+      }
+      const itemsRaw = [
+        p.items, p.items_json, p.itemsJson,
+        p.transaction_items, p.line_items,
+        p.sales_items, p.cart_items,
+      ].find(x => Array.isArray(x) && x.length > 0);
+      const itemsCount = itemsRaw ? itemsRaw.length : 0;
+      const itemsPreview = (itemsRaw || []).slice(0, 10).map((it, idx) => {
+        if (!it || typeof it !== 'object') return { index: idx, name: String(it || '') };
+        const name = it.product_name || it.productName || it.item_name || it.itemName || it.name || it.title || '';
+        const qty = it.quantity || it.qty || it.count || 1;
+        const price = it.unit_price || it.unitPrice || it.price || it.sell_price || it.sellPrice || 0;
+        const subtotal = it.subtotal || it.line_total || it.lineTotal || (Number(price) * Number(qty)) || 0;
+        return { index: idx, name: String(name), qty: Number(qty) || 0, unitPrice: Number(price) || 0, subtotal: Number(subtotal) || 0 };
+      });
+      const tableName = p.table_number || p.tableNumber || p.table_name || p.tableName || p.table || '';
+      const tableId = p.table_id || p.tableId || p.id_table || p.idTable || '';
+      const pax = p.pax || p.customer_count || p.customerCount || p.guest_count || p.guestCount || 0;
+      const transactionId = stateEntry.transactionId
+        || p.transaction_id || p.transactionId || p.tx_id || p.txId || p.id_transaksi || '';
+      orderSummary = {
+        submissionId: stateEntry.submissionId || submissionId || '',
+        transactionId: String(transactionId || ''),
+        salesRecordId: String(stateEntry.salesRecordId || p.sales_record_id || p.salesRecordId || ''),
+        tableName: String(tableName || ''),
+        tableId: String(tableId || ''),
+        pax: Number(pax) || 0,
+        grandTotalInt,
+        itemsCount,
+        items: itemsPreview,
+        currency: p.currency || p.mata_uang || 'IDR',
+        createdAt: p.created_at || p.createdAt || p.order_date || p.orderDate || stateEntry.createdAt || new Date().toISOString(),
+      };
+      // Also write grandTotal top-level alias agar Web Order mudah baca:
+      if (result && typeof result === 'object') {
+        result.grandTotal = grandTotalInt;
+        result.totalAmount = grandTotalInt;
+      }
+    }
+  } catch (_sumErr) {
+    try {
+      const ts = new Date().toISOString();
+      console.error(`[${ts}] [DEBUG-WEB-ORDER] [FIX-BUG2-ORDERSUMMARY] silent error compute: ${_sumErr?.message || String(_sumErr)}`);
+    } catch (_) { /* noop */ }
+    orderSummary = null;
+  }
+
+  // Build final result object:
+  const finalResult = (result && typeof result === 'object')
+    ? Object.assign({}, result, orderSummary ? { orderSummary } : {})
+    : result;
+
+  stateEntry.result = finalResult;
+  // Also mirror orderSummary directly to stateEntry so route layer can read
+  // even if result is cached elsewhere:
+  if (orderSummary && !stateEntry.orderSummary) {
+    try { stateEntry.orderSummary = orderSummary; } catch (_) { /* noop */ }
+  }
+  // Mirror grandTotal ke stateEntry top-level (cheap alias):
+  if (grandTotalInt > 0 && !stateEntry.grandTotal) {
+    try { stateEntry.grandTotal = grandTotalInt; } catch (_) { /* noop */ }
+  }
+
   if (stateEntry.resolvePromise) {
-    try { stateEntry.resolvePromise(result); } catch (_) {}
+    try { stateEntry.resolvePromise(finalResult); } catch (_) {}
   }
   // 🔴 Mirror TTL cleanup: Hapus BOTH key (rewrite key + original key) bersama-sama setelah 300s.
   const origId = stateEntry._originalSubmissionId;

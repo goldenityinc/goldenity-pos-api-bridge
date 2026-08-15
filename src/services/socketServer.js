@@ -9,6 +9,61 @@ const buildBranchRoom = (branchId) => `branch:${branchId}`;
 
 const connectedDevices = new Map();
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔥🔥🔥 FIX BRIDGE SOCKET DOUBLE ACK (Railway Logs BANJIR resolved_before=true):
+//    MASALAH: 2 namespace BERBEDA (default `/` dan `/pos-relay`) BEDA listener
+//    handler (legacy 4 event loop + pos-relay order-acknowledged) KEDUANYA
+//    memanggil `resolveOrderAcknowledgement`. Ditambah lagi POS Flutter EMIT
+//    event BISA ke KEDUA namespace → resolver terpanggil 2x-4x dalam 100ms
+//    → LOG BANJIR `[ACK x4] ... resolved_before=true TRUE TRUE TRUE` user!
+//    SOLUSI:
+//      (1) RAM Map `_recentSocketAckDedup` identityKey = submissionId + ackStatus
+//          → TTL 10 DETIK (lebih besar dari watchdog retry 30s interval tapi
+//          cukup untuk mencegah burst double calls dari 2 namespace).
+//      (2) Helper _tryPassSocketAckDedup: return TRUE JIKA BOLEH lewat,
+//          FALSE JIKA sudah di-proses dalam 10 detik TERAKHIR.
+//      (3) KEDUA handler (legacy ackResolver default ns + pos-relay ns)
+//          WAJIB memanggil helper ini SEBELUM call resolveOrderAcknowledgement!
+// ═══════════════════════════════════════════════════════════════════════════
+const _recentSocketAckDedup = new Map();
+const _recentSocketAckDedupTtlMs = 10 * 1000; // 10 DETIK
+function _socketNormalizeDupSuffix(raw) {
+  if (raw == null) return '';
+  let s = String(raw).trim();
+  if (!s) return '';
+  const re = /__dup_\d+$/;
+  while (re.test(s)) s = s.replace(re, '');
+  return s;
+}
+function _tryPassSocketAckDedup({ submissionId, ackStatus, deviceUuid, printedAt }) {
+  try {
+    const now = Date.now();
+    _recentSocketAckDedup.forEach((ts, key) => { if ((now - ts) > _recentSocketAckDedupTtlMs) _recentSocketAckDedup.delete(key); });
+    const subIdNorm = _socketNormalizeDupSuffix(submissionId);
+    if (!subIdNorm) return true; // tanpa identity = kita izinkan (bisa payload lain)
+    const ackStatNorm = String(ackStatus || 'POS_PRINTED').trim().toUpperCase() || 'POS_PRINTED';
+    const devNorm = String(deviceUuid || '').trim();
+    const patNorm = String(printedAt || '').trim();
+    const key = `${subIdNorm}|${ackStatNorm}|${devNorm}|${patNorm}`;
+    const lastTs = _recentSocketAckDedup.get(key);
+    if (lastTs && ((now - lastTs) <= _recentSocketAckDedupTtlMs)) {
+      try {
+        const ts = new Date().toISOString();
+        console.warn(`[${ts}] [DEBUG-WEB-ORDER] [SOCKET-ACK-DEDUP-SKIP] identityKey=${key} lastProcessed=${new Date(lastTs).toISOString().substring(11,19)} ageMs=${now-lastTs} → SKIP (dicegah double call resolveOrderAcknowledgement dari 2 namespace).`);
+      } catch (_) { /* noop */ }
+      return false;
+    }
+    _recentSocketAckDedup.set(key, now);
+    return true;
+  } catch (_e) {
+    try {
+      const ts = new Date().toISOString();
+      console.error(`[${ts}] [DEBUG-WEB-ORDER] [SOCKET-ACK-DEDUP-ERR] silent error: ${(_e && _e.message) ? _e.message : String(_e)} → fallback ALLOW`);
+    } catch (_) { /* noop */ }
+    return true;
+  }
+}
+
 const getConnectedDevices = () => connectedDevices;
 
 const isDeviceOnline = (deviceUuid) => {
@@ -455,6 +510,9 @@ const initializeSocketServer = (server) => {
         ackPayload.printedAt ?? ackPayload.printed_at ?? ackPayload.processedAt ?? ackPayload.acknowledgedAt ?? ''
       ).trim() || new Date().toISOString();
       if (!submissionId) return;
+      // 🔥🔥🔥 FIX BRIDGE SOCKET DOUBLE ACK: PASS DEDUP DULU!
+      const bolehLanjut = _tryPassSocketAckDedup({ submissionId, ackStatus, deviceUuid, printedAt });
+      if (!bolehLanjut) return;
       resolveOrderAcknowledgement({
         submissionId,
         ackStatus,
@@ -674,12 +732,18 @@ const initializeSocketServer = (server) => {
 
     socket.on('order-acknowledged', (ackPayload = {}) => {
       const { resolveOrderAcknowledgement } = require('./posOrderQueue');
+      const subId = (ackPayload.submissionId ?? '').toString().trim();
+      const ackSt = String(ackPayload.ackStatus || 'POS_PRINTED').trim();
+      const prAt = String(ackPayload.printedAt || new Date().toISOString()).trim();
+      // 🔥🔥🔥 FIX BRIDGE SOCKET DOUBLE ACK: PASS DEDUP DULU (mirror legacy default ns)!
+      const bolehLanjut = _tryPassSocketAckDedup({ submissionId: subId, ackStatus: ackSt, deviceUuid, printedAt: prAt });
+      if (!bolehLanjut) return;
       resolveOrderAcknowledgement({
-        submissionId: ackPayload.submissionId,
-        ackStatus: ackPayload.ackStatus || 'POS_PRINTED',
+        submissionId: subId,
+        ackStatus: ackSt || 'POS_PRINTED',
         ackPayload: ackPayload.ackPayload || ackPayload,
         deviceUuid,
-        printedAt: ackPayload.printedAt || new Date().toISOString(),
+        printedAt: prAt,
       }).catch(() => {});
     });
 

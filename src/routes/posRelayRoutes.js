@@ -107,16 +107,99 @@ function applyAckPollCap(submissionId, curAckStatusRaw, builtResponse) {
 
 const buildAckStatusResponseFromState = (submissionId, resolvedStyle) => {
   const s = getOrderSubmissionState(submissionId);
+
+  // 🔥🔥🔥 FIX BUG 2 QRIS GRAND TOTAL RP 0:
+  //    COMPUTE `orderSummary` dan `grandTotal` FALLBACK LAYERED:
+  //    Priority 1: stateEntry.orderSummary (dari finalizeResolve Bridge Queue)
+  //    Priority 2: stateEntry.result?.orderSummary (cached result)
+  //    Priority 3: compute ON THE FLY dari stateEntry.orderPayload (jika
+  //    finalizeResolve BELUM dijalankan = POS masih processing ACK event)
+  //    → HASILNYA: orderSummary DAN grandTotal SELALU ADA di TOP LEVEL response
+  //    agar Web Order QRIS Page TIDAK PERNAH tampilkan Rp 0 lagi!
+  let orderSummary = null;
+  let grandTotalInt = 0;
+  try {
+    const st = s || submissionStates.get(submissionId);
+    if (st) {
+      orderSummary = st.orderSummary
+        || (st.result && st.result.orderSummary)
+        || null;
+      grandTotalInt = Number(orderSummary?.grandTotalInt || st.grandTotal || (st.result && (st.result.grandTotal || st.result.totalAmount)) || 0) || 0;
+
+      // Jika orderSummary BELUM ADA (finalizeResolve belum jalan = POS ack PENDING):
+      // Compute ON THE FLY dari stateEntry.orderPayload!
+      if ((!orderSummary || grandTotalInt <= 0) && st.orderPayload && typeof st.orderPayload === 'object') {
+        const p = st.orderPayload;
+        const priceCandidates = [
+          p.grand_total, p.grandTotal,
+          p.total_price, p.totalPrice,
+          p.total_amount, p.totalAmount,
+          p.total, p.amount, p.amount_paid, p.amountPaid,
+          p.payable_amount, p.payableAmount,
+        ];
+        for (const v of priceCandidates) {
+          if (v == null) continue;
+          const n = typeof v === 'number' ? v : Number(String(v).replace(/[^0-9.-]/g, ''));
+          if (!Number.isNaN(n) && n > 0) { grandTotalInt = Math.round(n); break; }
+        }
+        const itemsRaw = [
+          p.items, p.items_json, p.itemsJson,
+          p.transaction_items, p.line_items,
+          p.sales_items, p.cart_items,
+        ].find(x => Array.isArray(x) && x.length > 0);
+        const itemsCount = itemsRaw ? itemsRaw.length : 0;
+        const itemsPreview = (itemsRaw || []).slice(0, 10).map((it, idx) => {
+          if (!it || typeof it !== 'object') return { index: idx, name: String(it || '') };
+          return {
+            index: idx,
+            name: String(it.product_name || it.productName || it.item_name || it.itemName || it.name || it.title || ''),
+            qty: Number(it.quantity || it.qty || it.count || 1) || 0,
+            unitPrice: Number(it.unit_price || it.unitPrice || it.price || it.sell_price || it.sellPrice || 0) || 0,
+            subtotal: Number(it.subtotal || it.line_total || it.lineTotal || 0) || 0,
+          };
+        });
+        orderSummary = {
+          submissionId: String(submissionId || st.submissionId || ''),
+          transactionId: String(st.transactionId || p.transaction_id || p.transactionId || p.tx_id || p.txId || ''),
+          salesRecordId: String(st.salesRecordId || p.sales_record_id || p.salesRecordId || ''),
+          tableName: String(p.table_number || p.tableNumber || p.table_name || p.tableName || p.table || ''),
+          tableId: String(p.table_id || p.tableId || p.id_table || p.idTable || ''),
+          pax: Number(p.pax || p.customer_count || p.customerCount || p.guest_count || p.guestCount || 0) || 0,
+          grandTotalInt,
+          itemsCount,
+          items: itemsPreview,
+          currency: p.currency || p.mata_uang || 'IDR',
+          createdAt: p.created_at || p.createdAt || p.order_date || p.orderDate || st.createdAt || new Date().toISOString(),
+        };
+      }
+    }
+  } catch (_osErr) {
+    try {
+      const ts = new Date().toISOString();
+      console.error(`[${ts}] [DEBUG-WEB-ORDER] [FIX-BUG2-ACK-RESPONSE] silent error compute orderSummary: ${_osErr?.message || String(_osErr)}`);
+    } catch (_) { /* noop */ }
+    orderSummary = null;
+    grandTotalInt = 0;
+  }
+
   if (!s) {
     const st = submissionStates.get(submissionId);
     if (!st) return applyAckPollCap(submissionId, '', { found: false, resolvedStyle, statusCode: 404, payload: { ok:false, message:`submissionId ${submissionId} tidak ada di Bridge queue (belum di-proses / sudah dihapus). Jika order baru submit: tunggu 2-3 detik lalu coba lagi.`, submissionId } });
     const status = String(st.status || st.ackStatus || st.state || 'PENDING_ACK').toUpperCase();
-    const resp = { found: true, resolvedStyle, statusCode: 200, payload: { ok:true, submissionId, ackStatus: status, resolvedDeviceUuid: st.resolvedDeviceUuid || st.targetDeviceUuid || null, resolvedAt: st.resolvedAt || st.ackedAt || null, posPrintedAt: st.printedAt || null, failedDeliveryAt: st.failedAt || null, detail: st } };
+    // 🔥🔥 FIX BUG 2: SELALU attach orderSummary + grandTotal TOP LEVEL
+    const basePayload = { ok:true, submissionId, ackStatus: status, resolvedDeviceUuid: st.resolvedDeviceUuid || st.targetDeviceUuid || null, resolvedAt: st.resolvedAt || st.ackedAt || null, posPrintedAt: st.printedAt || null, failedDeliveryAt: st.failedAt || null, detail: st };
+    if (orderSummary) basePayload.orderSummary = orderSummary;
+    if (grandTotalInt > 0) { basePayload.grandTotal = grandTotalInt; basePayload.totalAmount = grandTotalInt; }
+    const resp = { found: true, resolvedStyle, statusCode: 200, payload: basePayload };
     return applyAckPollCap(submissionId, status, resp);
   }
   const status = String(s.status || s.ackStatus || 'PENDING_ACK').toUpperCase();
-  const resp = { found: true, resolvedStyle, statusCode: 200, payload: { ok:true, submissionId, ackStatus: status, resolvedDeviceUuid: s.resolvedDeviceUuid || s.targetDeviceUuid || null, resolvedAt: s.resolvedAt || s.ackedAt || null, posPrintedAt: s.printedAt || null, failedDeliveryAt: s.failedAt || null, detail: s } };
-  return applyAckPollCap(submissionId, status, resp);
+  // 🔥🔥 FIX BUG 2: SAMA — attach orderSummary + grandTotal TOP LEVEL (branch found getOrderSubmissionState)
+  const basePayload2 = { ok:true, submissionId, ackStatus: status, resolvedDeviceUuid: s.resolvedDeviceUuid || s.targetDeviceUuid || null, resolvedAt: s.resolvedAt || s.ackedAt || null, posPrintedAt: s.printedAt || null, failedDeliveryAt: s.failedAt || null, detail: s };
+  if (orderSummary) basePayload2.orderSummary = orderSummary;
+  if (grandTotalInt > 0) { basePayload2.grandTotal = grandTotalInt; basePayload2.totalAmount = grandTotalInt; }
+  const resp2 = { found: true, resolvedStyle, statusCode: 200, payload: basePayload2 };
+  return applyAckPollCap(submissionId, status, resp2);
 };
 
 // GC ackPollTracker tiap 30 detik supaya Map tidak membesar tanpa batas
