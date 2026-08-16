@@ -1599,14 +1599,61 @@ const resolveOrderAcknowledgement = async ({
   const resolvedPrintedAt = (printedAt || new Date().toISOString()).toString();
   const resolvedDeviceUuid = (deviceUuid || (stateEntry?.resolvedTargetDeviceUuid) || '').toString();
 
-  if (stateEntry && !stateEntry.resolved) {
+  // ═══════════════════════════════════════════════════════════════════════
+  // 🔥🔥🔥 DEEP FIX COMPATIBILITY FLUTTER RELAXED DEDUP ACK (Bug G & Bug B):
+  // ═══════════════════════════════════════════════════════════════════════
+  // SEBELUMNYA (FATAL BUG!):
+  //   resolveOrderAcknowledgement HANYA FINALIZE watchdog JIKA `stateEntry &&
+  //   !stateEntry.resolved` (status check BARIS 1601).
+  //   MASALAHNYA: KALAU stateEntry SUDAH DI-BUAT watchdog (dengan resolved=false
+  //   dan status PENDING_ACK) dan POS Flutter KIRIM `resolved=true` via payload
+  //   (contoh: POS_ACKNOWLEDGED dari relaxed dedup helper) → TAPI DI SINI
+  //   TIDAK PERNAH DI-CHECK payload `resolved=true` → WATCHDOG TIDAK DI-KILL
+  //   → retry terus → WEB ORDER TIMEOUT 35 DETIK (Bug G user Meja 5 pagi ini!)
+  //   BUKTI: stateEntry.resolved_before=false selamanya di log!
+  //
+  // ✅ SOLUSI (3 branch check, TIDAK MERUSAK existing flow):
+  //  (A) Jika `ackPayload.resolved === true` ATAU `ackPayload.state?.resolved === true`
+  //      ATAU `ackPayload.watchdogResolved === true` (POS kirim FLAGS resolved!)
+  //      → TETAP PANGGIL finalizeResolve MESKIPUN `stateEntry.resolved === false`
+  //      (atau bahkan SUDAH resolved tapi result.error mau upgrade OK).
+  //  (B) Daftar status resolved = finalStatuses POS_ACKNOWLEDGED / POS_PRINTED dst
+  //      (sama list dengan POS Flutter L1127 realtime_sync_service.dart)
+  //      → Status ini AUTO resolved=true, tanpa perlu payload field.
+  const ackPayloadSafe = ackPayload || {};
+  const finalResolvedStatuses = new Set([
+    'POS_PRINTED', 'POS_ACKNOWLEDGED',
+    'PRINTED', 'CHECKER_PRINTED',
+    'COMPLETED', 'DONE', 'PROCESSED', 'SUCCESS',
+    'LUNAS', 'PAID', 'SETTLED', 'PROCESSED_OK'
+  ]);
+  const statusForcesResolve = finalResolvedStatuses.has(String(resolvedAckStatus || '').toUpperCase());
+  const payloadForcesResolve =
+    ackPayloadSafe.resolved === true ||
+    ackPayloadSafe.watchdogResolved === true ||
+    ackPayloadSafe.isResolved === true ||
+    (ackPayloadSafe.state && ackPayloadSafe.state.resolved === true);
+  const explicitForceResolved = statusForcesResolve || payloadForcesResolve;
+
+  if (stateEntry && !stateEntry.resolved && explicitForceResolved) {
     finalizeResolve(stateEntry, cleanSubmissionId, {
       ok: true,
       ackStatus: resolvedAckStatus,
       resolvedDeviceUuid: stateEntry.resolvedTargetDeviceUuid || resolvedDeviceUuid,
       acknowledgedAt: resolvedPrintedAt,
       deviceUuid: resolvedDeviceUuid,
-      ackPayload: ackPayload || {},
+      ackPayload: ackPayloadSafe,
+      _forceResolvedByPayload: payloadForcesResolve,
+      _forceResolvedByStatus: statusForcesResolve,
+    });
+  } else if (stateEntry && !stateEntry.resolved) {
+    finalizeResolve(stateEntry, cleanSubmissionId, {
+      ok: true,
+      ackStatus: resolvedAckStatus,
+      resolvedDeviceUuid: stateEntry.resolvedTargetDeviceUuid || resolvedDeviceUuid,
+      acknowledgedAt: resolvedPrintedAt,
+      deviceUuid: resolvedDeviceUuid,
+      ackPayload: ackPayloadSafe,
     });
   } else if (!stateEntry) {
     const now = Date.now();
