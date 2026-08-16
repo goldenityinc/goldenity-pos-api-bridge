@@ -245,54 +245,41 @@ const injectMissingOrderMetadata = (payloadRaw, ctx = {}) => {
 
 const submissionStates = new Map();
 
-const __activeTableOrderLocks = new Map();
-const __ACTIVE_TABLE_LOCK_TTL_MS = 300;
-function _resolveTableIdentityForCollision({ tenantId, branchId, orderPayload }) {
+// ═══════════════════════════════════════════════════════════════════════
+// 🧹🧹🧹 PHASE 1 HELPERS: LOOKUP STATE BY ORIGINAL SUBMISSION ID
+// ═══════════════════════════════════════════════════════════════════════
+// Internal submissionStates keys sekarang = COMPOSITE (tenant::branch::original::ts::rand)
+// Lookup PAYLOAD submissionId (ORIGINAL) to find matching ACTIVE state entries:
+function _findStateEntriesByPayloadSubmissionId(submissionId, { tenantId, branchId, statusWanted = 'any' } = {}) {
+  const target = String(submissionId || '').trim();
+  if (!target) return [];
   const t = String(tenantId || '').trim();
   const b = String(branchId || '').trim();
-  const o = (orderPayload && typeof orderPayload === 'object') ? orderPayload : {};
-  const ti = String(o.tableId || o.table_id || '').trim();
-  const tn = String(o.tableNumber || o.table_number || o.tableName || o.table_name || o.tableLabel || o.table_label || o.nomorMeja || o.noMeja || '').trim().toLowerCase();
-  const nestedTable = (o.table && typeof o.table === 'object') ? o.table : null;
-  const nti = nestedTable ? String(nestedTable.id || nestedTable.tableId || nestedTable.table_id || '').trim() : '';
-  const ntn = nestedTable ? String(nestedTable.number || nestedTable.tableNumber || nestedTable.table_number || nestedTable.name || nestedTable.label || '').trim().toLowerCase() : '';
-  const finalTi = ti || nti || '';
-  const finalTn = tn || ntn || '';
-  return {
-    byId: finalTi ? `${t}::${b}::id::${finalTi}` : '',
-    byNum: finalTn ? `${t}::${b}::no::${finalTn}` : '',
-  };
-}
-function _checkAndMarkTableOrderCollision({ tenantId, branchId, orderPayload, incomingSubmissionId }) {
-  try {
-    const now = Date.now();
-    for (const [k, v] of __activeTableOrderLocks.entries()) {
-      if ((now - (v.ts || 0)) > __ACTIVE_TABLE_LOCK_TTL_MS) __activeTableOrderLocks.delete(k);
-    }
-    const { byId, byNum } = _resolveTableIdentityForCollision({ tenantId, branchId, orderPayload });
-    const candidates = [];
-    if (byId) candidates.push(byId);
-    if (byNum) candidates.push(byNum);
-    if (candidates.length === 0) return { hadCollision: false, suffix: '', conflictingSubmissions: [] };
-    const conflicts = [];
-    for (const c of candidates) {
-      const v = __activeTableOrderLocks.get(c);
-      if (v && v.submissionId && v.submissionId !== incomingSubmissionId) {
-        conflicts.push(v.submissionId);
-      }
-    }
-    const hadCollision = conflicts.length > 0;
-    for (const c of candidates) {
-      __activeTableOrderLocks.set(c, { ts: now, submissionId: incomingSubmissionId });
-    }
-    return { hadCollision, suffix: hadCollision ? `__tblorder_${now}` : '', conflictingSubmissions: conflicts };
-  } catch (_e) {
-    try {
-      const ts = new Date().toISOString();
-      console.warn(`[${ts}] [DEBUG-WEB-ORDER] [TABLE-COLLISION-CHECK-ERR] silent error: ${(_e && _e.message) ? _e.message : String(_e)} → ALLOW`);
-    } catch (_) {}
-    return { hadCollision: false, suffix: '', conflictingSubmissions: [] };
+  const results = [];
+  for (const [k, s] of submissionStates.entries()) {
+    if (!s) continue;
+    const stateOrigId = String((s && s.originalSubmissionId) || (s && s.result && s.result.originalSubmissionId) || (s && s.orderPayload && (s.orderPayload.submissionId || s.orderPayload.submission_id)) || '').trim();
+    if (!stateOrigId || stateOrigId !== target) continue;
+    if (t && s.tenantId && String(s.tenantId).trim() !== t) continue;
+    if (b && s.branchId && String(s.branchId).trim() !== b) continue;
+    if (statusWanted === 'unresolved' && s.resolved === true) continue;
+    if (statusWanted === 'resolved' && s.resolved !== true) continue;
+    results.push({ key: k, state: s });
   }
+  return results;
+}
+function _getBestStateEntryForAck(submissionId, { tenantId, branchId } = {}) {
+  const unresolved = _findStateEntriesByPayloadSubmissionId(submissionId, { tenantId, branchId, statusWanted: 'unresolved' });
+  if (unresolved && unresolved.length > 0) {
+    unresolved.sort((a, b) => Number((b.state && b.state.enqueuedAt) || 0) - Number((a.state && a.state.enqueuedAt) || 0));
+    return unresolved[0];
+  }
+  const any = _findStateEntriesByPayloadSubmissionId(submissionId, { tenantId, branchId, statusWanted: 'any' });
+  if (any && any.length > 0) {
+    any.sort((a, b) => Number((b.state && b.state.enqueuedAt) || 0) - Number((a.state && a.state.enqueuedAt) || 0));
+    return any[0];
+  }
+  return null;
 }
 
 const getUnprocessedPendingOrdersByBranch = (branchId, sinceTsMs) => {
@@ -750,136 +737,60 @@ const enqueueWebOrderForPrinting = async ({
     injectMissingOrderMetadata(orderPayload, { rawBody, tenantId, branchId, transactionId, salesRecordId, submissionId: originalInputSubmissionId });
   } catch (_) { /* noop */ }
 
-  // ================================================================
-  // 🔴 CRITICAL FIX 2B (DUPLICATE SUBMISSION_ID REWRITE SAFETY NET):
-  //    User request: "Tambahkan logic BE check idempotent agar ketika
-  //    ada orderan BEDA MEJA yang masuk dengan submissionId SAMA
-  //    (karena race condition cache localStorage / Date.now() collision
-  //    di frontend web order), backend HARUS rewrite submissionId
-  //    dengan suffix _dup_N agar POS MENERIMA KEDUA ORDER SECARA
-  //    BERURUTAN, BUKAN reject duplicate / return cache pertama.
+  // ═══════════════════════════════════════════════════════════════════════
+  // 🧹🧹🧹 PHASE 1: DUMB RELAY (No __dup_, No __tblorder_, No same-table lock)
+  // ═══════════════════════════════════════════════════════════════════════
+  // BRIDGE = BODOH (dumb relay). Tugasnya HANYA:
+  //   1) PASS PAYLOAD ASLI (submissionId TIDAK DIUBAH SAMA SEKALI) ke POS socket.
+  //   2) Jika ACK timeout → RETRY payload YANG SAMA PERSIS (TIDAK rewrite).
   //
-  //    Sebelumnya (L703-711 existing check): submissionId SAMA →
-  //    order kedua akan langsung return existing.result (cache) atau
-  //    existing.promise → ORDER KEDUA HILANG TOTAL karena dianggap
-  //    idempotent retry order YANG SAMA. Tapi real case-nya: ini 2
-  //    MEJA BEDA (mis Meja 1 dan Meja 5) yang kebetulan collision
-  //    TX-ID sama (user bug 3 screenshot bukti nyata!).
+  // KENAPA TIDAK perlu suffix? Karena collision dedup diselesaikan DI DOWNSREAM:
+  //   - POS Flutter: pakai Hive + __processing_status flag (processed = skip).
+  //   - BE Core:    pakai Prisma upsert (submissionId + transactionId = composite unique).
+  //   - Web Order:  UI `isSubmitting` state + isSubmissionActive guard cukup untuk
+  //                 anti double-click.
   //
-  //    STRATEGI:
-  //    a) Key unik = `${tenantId}::${branchId}::${cleanSubmissionId}`.
-  //       Ini memisahkan cache antar tenant (jangan cross-tenant compare).
-  //    b) Check di submissionStates: ada existing stateEntry untuk key
-  //       ini yang masih aktif / resolved masih dalam 30 menit TTL?
-  //    c) JIKA YA → increment counter rewrite = 1..99
-  //       submissionId BARU = `${original}__dup_${N}`
-  //       (double underscore agar mudah dibedakan dengan suffix random
-  //       hex dari frontend, yang pakai single dash TX-xxx-5-a1b2c3)
-  //    d) Loop ulang check sampai menemukan submissionId BENAR-BENAR
-  //       UNIQUE (hingga counter 100 untuk safety).
-  //    e) SETELAH rewrite SUCCESS, inject submissionId BARU ke
-  //       orderPayload.submissionId + orderPayload.submission_id
-  //       agar data konsisten (socket broadcast, DB, dan receipt
-  //       POS semuanya melihat ID BARU).
-  //    f) Tulis log supaya audit trail Railway jelas kapan rewrite
-  //       terjadi dan ID lama vs ID baru.
-  // ================================================================
-  let rewriteIterations = 0;
-  const MAX_REWRITE_ATTEMPTS = 100;
-  const rewriteState = {
-    hadCollision: false,
-    original: originalInputSubmissionId,
-    finalSubmissionId: originalInputSubmissionId,
-    attempts: 0,
-  };
+  // UNTUK MENCEGAH internal state collision (RAM map key bentrok jika 2 order
+  // submissionId kebetulan sama di WAKTU YANG SAMA), kita pakai INTERNAL COMPOSITE KEY
+  // (hanya untuk submissionStates map di RAM ini, PAYLOAD & user-facing ID TETAP ASLI):
+  //   internalStateKey = `${tenant}::${branch}::${originalSubmissionId}::${tsMs}::${rand}`
+  //   User-facing `originalInputSubmissionId` TETAP ASLI untuk Web polling + POS Hive.
+  // ═══════════════════════════════════════════════════════════════════════
   const cleanTenant = String(tenantId || '').trim();
   const cleanBranch = String(branchId || '').trim();
-  const _buildCacheCollisionCheckKey = (subm) => `${cleanTenant}::${cleanBranch}::${String(subm || '').trim()}`;
+  const cleanSubmissionId = originalInputSubmissionId;  // ← IMMUTABLE user-facing ID, NEVER rewrite
+  const internalTsMs = Date.now();
+  const internalRand = Math.floor(Math.random() * 1_000_000_000);
+  const internalStateKey = `${cleanTenant}::${cleanBranch}::${cleanSubmissionId}::${internalTsMs}::${internalRand}`;
 
-  while (rewriteIterations < MAX_REWRITE_ATTEMPTS) {
-    const currentCandidate = rewriteIterations === 0
-      ? originalInputSubmissionId
-      : `${originalInputSubmissionId}__dup_${rewriteIterations}`;
-    const collisionCacheKey = _buildCacheCollisionCheckKey(currentCandidate);
-    const existing = submissionStates.get(currentCandidate);
-
-    if (existing) {
-      // 🔴 COLLISION DETECTED pada submissionId ini.
-      //    Safety guard: coba lagi dengan counter berikutnya.
-      rewriteState.hadCollision = true;
-      rewriteIterations += 1;
-      rewriteState.attempts = rewriteIterations;
-      continue;
-    }
-
-    // 🟢 Tidak ada collision pada candidate ini.
-    rewriteState.finalSubmissionId = currentCandidate;
-    rewriteState.attempts = rewriteIterations;
-    break;
-  }
-
-  let cleanSubmissionId = rewriteState.finalSubmissionId;
-  if (rewriteState.hadCollision && typeof console === 'object' && typeof console.warn === 'function') {
-    try {
-      const ts = new Date().toISOString();
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[${ts}] [POS-ORDER-QUEUE] [IDEMPOTENCY-RENAME] submissionId collision detected. ` +
-        `original="${rewriteState.original}" final="${cleanSubmissionId}" ` +
-        `tenant="${cleanTenant}" branch="${cleanBranch}" ` +
-        `tableId="${(orderPayload && ((orderPayload.tableId || orderPayload.table_id || '')))}" ` +
-        `tableNum="${(orderPayload && ((orderPayload.tableNumber || orderPayload.table_number || orderPayload.tableName || '')))}" ` +
-        `attempts=${rewriteState.attempts}`
-      );
-    } catch (_logE) { /* DOUBLE SAFETY: log tidak boleh crash flow */ }
-  }
-  // ✅ Rewrite orderPayload fields agar SEMUA downstream pakai ID BARU:
-  if (rewriteState.hadCollision && orderPayload && typeof orderPayload === 'object') {
+  // ✅ Inject PAYLOAD dengan ORIGINAL user-facing ID (1x inject saja, no rewrite).
+  if (orderPayload && typeof orderPayload === 'object') {
     try { orderPayload.submissionId = cleanSubmissionId; } catch (_) {}
     try { orderPayload.submission_id = cleanSubmissionId; } catch (_) {}
   }
 
-  // 🔴🔴 SAME-TABLE CONCURRENT COLLISION GUARD (User bug 3 & 5):
-  //    2 order MEJA YANG SAMA submit SIMULTAN dalam <300ms → suffix __tblorder_
-  //    ditambahkan ke submissionId agar POS TIDAK overwrite row Hive pertama.
-  //    Ini mencegah "2 order masuk 1 meja, 1 gagal total".
-  const tableCol = _checkAndMarkTableOrderCollision({
-    tenantId: cleanTenant,
-    branchId: cleanBranch,
-    orderPayload,
-    incomingSubmissionId: cleanSubmissionId,
-  });
-  if (tableCol.hadCollision) {
-    const newIdAfterTable = cleanSubmissionId + tableCol.suffix;
-    try {
-      const ts = new Date().toISOString();
-      console.warn(
-        `[${ts}] [DEBUG-WEB-ORDER] [TABLE-CONCURRENT-LOCK] same-table burst order detected. ` +
-        `prevSubmissionIds=${JSON.stringify(tableCol.conflictingSubmissions)} ` +
-        `before="${cleanSubmissionId}" after="${newIdAfterTable}" ` +
-        `tenant="${cleanTenant}" branch="${cleanBranch}" ` +
-        `tableId="${(orderPayload && ((orderPayload.tableId || orderPayload.table_id || '')))}" ` +
-        `tableNum="${(orderPayload && ((orderPayload.tableNumber || orderPayload.table_number || orderPayload.tableName || '')))}"`
-      );
-    } catch (_) {}
-    cleanSubmissionId = newIdAfterTable;
-    if (orderPayload && typeof orderPayload === 'object') {
-      try { orderPayload.submissionId = cleanSubmissionId; } catch (_) {}
-      try { orderPayload.submission_id = cleanSubmissionId; } catch (_) {}
-    }
-    rewriteState.hadCollision = true;
-  }
-
-  const existing = submissionStates.get(cleanSubmissionId);
+  // ═══════════════════════════════════════════════════════════════════════
+  // 💡 IDEMPOTENCY: Jika state dengan ORIGINAL ID SUDAH ADA & RESOLVED (masih dalam 30m TTL),
+  //    return cache result. Jika PENDING (promise in-flight), return promise SAMA
+  //    agar 2 concurrent request menunggu hasil YANG SAMA (good dedup for valid retry).
+  //    Check menggunakan ORIGINAL ID (bukan internal composite key) via helper,
+  //    karena valid idempotency adalah "user submit ulang request YANG SAMA".
+  // ═══════════════════════════════════════════════════════════════════════
+  const existingFound = _getBestStateEntryForAck(cleanSubmissionId, { tenantId, branchId });
+  const existing = existingFound ? existingFound.state : null;
   if (existing) {
     if (existing.resolved) {
-      return { ...existing.result, _fromCache: true, _idempotencyRenameApplied: rewriteState.hadCollision, _originalSubmissionId: rewriteState.hadCollision ? rewriteState.original : undefined };
+      return { ...existing.result, _fromCache: true, _originalSubmissionId: cleanSubmissionId };
     }
     if (existing.processing && existing.promise) {
       return existing.promise;
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // 🆕 Create NEW stateEntry. Simpan `originalSubmissionId` field explicitly
+  //    (cleanSubmissionId = user-facing original, NEVER rewritten).
+  // ═══════════════════════════════════════════════════════════════════════
   const stateEntry = {
     processing: true,
     resolved: false,
@@ -890,7 +801,16 @@ const enqueueWebOrderForPrinting = async ({
     watchdogTimer: null,
     resolvedTargetDeviceUuid: '',
     promise: null,
-    enqueuedAt: Date.now(),
+    enqueuedAt: internalTsMs,
+    createdAt: internalTsMs,
+    submissionId: cleanSubmissionId,            // ← user-facing ID (original, always).
+    originalSubmissionId: cleanSubmissionId,    // ← explicit field untuk helper lookup.
+    tenantId: cleanTenant || null,
+    branchId: cleanBranch || null,
+    targetDeviceUuid: targetDeviceUuid || '',
+    orderPayload: orderPayload || null,
+    transactionId: transactionId || '',
+    salesRecordId: salesRecordId || '',
   };
 
   stateEntry.promise = new Promise((resolve, reject) => {
@@ -898,20 +818,7 @@ const enqueueWebOrderForPrinting = async ({
     stateEntry.rejectPromise = reject;
   });
 
-  submissionStates.set(cleanSubmissionId, stateEntry);
-
-  // 🔴 CRITICAL HOTFIX ACK POLL DESYNC (PROBLEM 2):
-  //    Jika terjadi collision rewrite → finalSubmissionId = ORIG__dup_N.
-  //    Frontend Web Order polling menggunakan ORIGINAL ID (TANPA suffix dup),
-  //    jadi submissionStates.get(ORIGINAL) = NULL → polling tidak pernah
-  //    menemukan state resolved → TIMEOUT 35 DETIK meskipun POS sukses print.
-  //    SOLUSI: Mirror stateEntry ke 2 KEY SEKALIGUS (share object reference yang sama).
-  //    Sehingga BOTH (ORIGINAL key dan rewrite key) → menemukan state resolved YANG SAMA.
-  if (rewriteState.hadCollision) {
-    submissionStates.set(rewriteState.original, stateEntry);
-    stateEntry._originalSubmissionId = rewriteState.original;
-    stateEntry._rewriteAttempts = rewriteState.attempts;
-  }
+  submissionStates.set(internalStateKey, stateEntry);
 
   try {
     // 🔴 CRITICAL FIX - BROADCAST TO ENTIRE BRANCH ROOM, NOT ONE DEVICE:
@@ -940,13 +847,13 @@ const enqueueWebOrderForPrinting = async ({
       console.error(`[posOrderQueue:enqueue] ❌ UPSTREAM DB FAIL for submission=${cleanSubmissionId}. Will NOT broadcast socket to avoid GHOST ORDER. err=`, err?.message || err);
       try { if (stateEntry.watchdogTimer) clearTimeout(stateEntry.watchdogTimer); } catch (_) {}
       stateEntry.watchdogTimer = null;
-      try { finalizeReject(stateEntry, cleanSubmissionId, 'UPSTREAM_DB_SAVE_FAILED', 502, 'Gagal menyimpan pesanan ke pusat. Silakan coba lagi.', { retryAvailable: true, _dbFailed: true }); } catch (_) {}
-      submissionStates.delete(cleanSubmissionId);
+      try { finalizeReject(stateEntry, internalStateKey, 'UPSTREAM_DB_SAVE_FAILED', 502, 'Gagal menyimpan pesanan ke pusat. Silakan coba lagi.', { retryAvailable: true, _dbFailed: true }); } catch (_) {}
+      submissionStates.delete(internalStateKey);
       throw Object.assign(new Error('UPSTREAM_DB_SAVE_FAILED: order tidak dapat disimpan ke pusat'), { code: 'UPSTREAM_DB_SAVE_FAILED', statusCode: 502, retryAvailable: true });
     }
 
     if (!upstreamSaved) {
-      submissionStates.delete(cleanSubmissionId);
+      submissionStates.delete(internalStateKey);
       throw Object.assign(new Error('UPSTREAM_DB_SAVE_FAILED'), { code: 'UPSTREAM_DB_SAVE_FAILED', statusCode: 502, retryAvailable: true });
     }
 
@@ -955,7 +862,8 @@ const enqueueWebOrderForPrinting = async ({
       branchId,
       targetDeviceUuid: resolvedTargetDeviceUuid,
       orderPayload,
-      submissionId: cleanSubmissionId,
+      submissionId: internalStateKey,    // 🧹 PHASE1: BullMQ/In-Memory queue worker uses internal composite key for submissionStates lookup.
+      payloadSubmissionId: cleanSubmissionId,  // keep original user-facing ID for any direct references in job handlers.
       transactionId: transactionId || null,
       salesRecordId: salesRecordId || null,
       resolvedTargetDeviceUuid,
@@ -985,18 +893,18 @@ const enqueueWebOrderForPrinting = async ({
       } catch (_) { /* noop */ }
     }
 
-    startWatchdog(stateEntry, cleanSubmissionId, tenantId, branchId, resolvedTargetDeviceUuid, orderPayload, transactionId, salesRecordId);
+    startWatchdog(stateEntry, internalStateKey, tenantId, branchId, resolvedTargetDeviceUuid, orderPayload, transactionId, salesRecordId);
 
     if (useBullMq && posOrderQueueInstance) {
       try {
-        await posOrderQueueInstance.add(`pos-order-${cleanSubmissionId}`, jobData, {
-          jobId: `pos-order-${cleanSubmissionId}`,
+        await posOrderQueueInstance.add(`pos-order-${internalStateKey}`, jobData, {
+          jobId: `pos-order-${internalStateKey}`,
           removeOnComplete: true,
           removeOnFail: true,
           attempts: 2,
           backoff: { type: 'exponential', delay: 2000 },
         });
-        queueJobMeta.set(cleanSubmissionId, { enqueuedAt: Date.now(), retries: 0 });
+        queueJobMeta.set(internalStateKey, { enqueuedAt: Date.now(), retries: 0 });
       } catch (_) {
         await enqueueInMemory(jobData);
       }
@@ -1017,20 +925,14 @@ const enqueueWebOrderForPrinting = async ({
       errCode === 'POS_ACK_TIMEOUT' ||
       errCode === 'QUEUE_RESOLVE_UNKNOWN' ||
       errStatus === 503 || errStatus === 504 || errStatus === 202 || errStatus === 502;
-    if (shouldKeepInQueue && submissionStates.has(cleanSubmissionId)) {
+    if (shouldKeepInQueue && submissionStates.has(internalStateKey)) {
       stateEntry.status = (errCode === 'POS_ACK_TIMEOUT' ? 'TIMEOUT' : (errCode === 'POS_DEVICE_OFFLINE' ? 'POS_DEVICE_OFFLINE' : 'PENDING_ACK'));
       stateEntry.resolved = false;
       stateEntry.processing = false;
       stateEntry.result = stateEntry.result || { error: err, _keepInQueue: true };
       stateEntry.retryAvailable = err.retryAvailable !== false;
     } else {
-      submissionStates.delete(cleanSubmissionId);
-      // 🔴 Mirror cleanup: Jika state ini hasil dari collision rewrite,
-      //    pastikan ORIGINAL key juga dihapus agar tidak ada stale entry.
-      const origId = stateEntry._originalSubmissionId;
-      if (origId && origId !== cleanSubmissionId && submissionStates.get(origId) === stateEntry) {
-        submissionStates.delete(origId);
-      }
+      submissionStates.delete(internalStateKey);
     }
     throw err;
   }
@@ -1069,6 +971,19 @@ const onWatchdogTimeout = async (stateEntry, submissionId, tenantId, branchId, d
   try {
     if (stateEntry.resolved) return;
     stateEntry.watchdogTimer = null;
+
+    // 🧹 PHASE 1: RESOLVE PAYLOAD-FACING (ORIGINAL user-facing) submissionId.
+    // * Upstream DB calls (updateOrderSyncStatus) dan socket envelope HARUS pakai
+    //   ORIGINAL ID. `submissionId` param disini = internal composite key
+    //   (untuk submissionStates map lookup).
+    const _payloadFromOrder = (orderPayload && typeof orderPayload === 'object')
+      ? String(orderPayload.submissionId || orderPayload.submission_id || '').trim()
+      : '';
+    const payloadSubmissionId = (stateEntry && stateEntry.originalSubmissionId)
+      || (stateEntry && stateEntry.submissionId)
+      || _payloadFromOrder
+      || submissionId;
+
     const MAX_WATCHDOG_RETRIES = 2;
     const retriesSoFar = Number(stateEntry.retries || 0);
 
@@ -1080,14 +995,14 @@ const onWatchdogTimeout = async (stateEntry, submissionId, tenantId, branchId, d
         const ts = new Date().toISOString();
         // eslint-disable-next-line no-console
         console.error(
-          `[${ts}] [DEBUG-WEB-ORDER] [WATCHDOG-RETRY] submissionId=${submissionId} retriesCount=${stateEntry.retries} max=${MAX_WATCHDOG_RETRIES} tenant=${tenantId} branch=${branchId} beforeBroadcastDevice=${String(deviceUuid || '(empty=broadcast)')} upstreamSavedQueuedAt=${String(stateEntry.upstreamSavedQueuedAt || 0)} upstreamSafe=${upstreamSafe} resolved=${!!stateEntry.resolved} processing=${!!stateEntry.processing}`,
+          `[${ts}] [DEBUG-WEB-ORDER] [WATCHDOG-RETRY] payloadSubmissionId=${payloadSubmissionId} (internalKey=${submissionId}) retriesCount=${stateEntry.retries} max=${MAX_WATCHDOG_RETRIES} tenant=${tenantId} branch=${branchId} beforeBroadcastDevice=${String(deviceUuid || '(empty=broadcast)')} upstreamSavedQueuedAt=${String(stateEntry.upstreamSavedQueuedAt || 0)} upstreamSafe=${upstreamSafe} resolved=${!!stateEntry.resolved} processing=${!!stateEntry.processing}`,
         );
       } catch (_dbg) { /* noop */ }
       //#endregion
       // 🔴 CRITICAL FIX GHOST NOTIF: HANYA emit socket JIKA upstream DB SUDAH confirmed
       //    (upstreamSavedQueuedAt > 0). Kalau upstream belum confirmed → jangan spam POS.
       if (upstreamSafe) {
-        const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
+        const envelope = buildOrderEnvelope(payloadSubmissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId);
         try {
           const emitResult = emitIncomingWebOrder('', branchId, envelope);
         } catch (_) { /* emit failure must NEVER kill watchdog */ }
@@ -1106,7 +1021,7 @@ const onWatchdogTimeout = async (stateEntry, submissionId, tenantId, branchId, d
     const upstreamSafe = Boolean(stateEntry.upstreamSavedQueuedAt && stateEntry.upstreamSavedQueuedAt > 0);
     if (upstreamSafe) {
       try {
-        await updateOrderSyncStatus(submissionId, tenantId, 'SYNC_DELAYED', {
+        await updateOrderSyncStatus(payloadSubmissionId, tenantId, 'SYNC_DELAYED', {
           resolvedTargetDeviceUuid: deviceUuid,
           warning: 'POS_ACK_FALLBACK: Order disimpan di DB & akan di-pull POS otomatis dalam 1-3 menit.',
           transactionId,
@@ -1120,7 +1035,7 @@ const onWatchdogTimeout = async (stateEntry, submissionId, tenantId, branchId, d
         ackStatus: 'SYNC_DELAYED',
         retryAvailable: false,
         warning: 'POS tidak merespon dalam batas waktu. Pesanan TETAP AMAN di database & POS akan mengambil otomatis (Auto-Pull 3 menit).',
-        submissionId,
+        submissionId: payloadSubmissionId,
         transactionId: transactionId || null,
         orderId: salesRecordId || null,
         resolvedAt: Date.now(),
@@ -1130,7 +1045,7 @@ const onWatchdogTimeout = async (stateEntry, submissionId, tenantId, branchId, d
     }
 
     try {
-      await updateOrderSyncStatus(submissionId, tenantId, 'FAILED_DELIVERY', {
+      await updateOrderSyncStatus(payloadSubmissionId, tenantId, 'FAILED_DELIVERY', {
         resolvedTargetDeviceUuid: deviceUuid,
         failureReason: 'POS_ACK_TIMEOUT',
         transactionId,
@@ -1454,6 +1369,7 @@ const buildOrderEnvelope = (submissionId, tenantId, branchId, deviceUuid, orderP
 const processQueueJob = async (jobData) => {
   const {
     submissionId,
+    payloadSubmissionId,
     tenantId,
     branchId,
     targetDeviceUuid,
@@ -1464,6 +1380,18 @@ const processQueueJob = async (jobData) => {
 
   const stateEntry = submissionStates.get(submissionId);
   if (stateEntry && stateEntry.resolved) return;
+
+  // 🧹 PHASE 1: RESOLVE PAYLOAD-FACING submissionId (ORIGINAL user-facing).
+  // Envelope SUBMISSION ID untuk socket emit ke POS HARUS = ORIGINAL payload ID
+  // (BUKAN internal composite key). Jangan pernah kirim `tenant::branch::id::ts::rand` ke POS!
+  const _payloadFromOrder = (orderPayload && typeof orderPayload === 'object')
+    ? String(orderPayload.submissionId || orderPayload.submission_id || '').trim()
+    : '';
+  const exposedPayloadSubmissionId = (stateEntry && stateEntry.originalSubmissionId)
+    || (stateEntry && stateEntry.submissionId)
+    || String(payloadSubmissionId || '').trim()
+    || _payloadFromOrder
+    || submissionId;
 
   // P4 BULLETPROOF: Acquire concurrency slot per-branch supaya printer buffer
   // tidak kebanjiran. Kalau 10 order bersamaan → 3 jalan, 7 nunggu.
@@ -1485,7 +1413,7 @@ const processQueueJob = async (jobData) => {
   const autoReleaseTimer = setTimeout(() => releaseOnce(), 30000);
   const killAutoRelease = () => { try { clearTimeout(autoReleaseTimer); } catch (_) {} };
   try {
-    const envelope = buildOrderEnvelope(submissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId, queueMetaExtra);
+    const envelope = buildOrderEnvelope(exposedPayloadSubmissionId, tenantId, branchId, '', orderPayload, transactionId, salesRecordId, queueMetaExtra);
 
     const upstreamSafe = Boolean(stateEntry && stateEntry.upstreamSavedQueuedAt && stateEntry.upstreamSavedQueuedAt > 0);
     if (upstreamSafe) {
@@ -1663,7 +1591,14 @@ const resolveOrderAcknowledgement = async ({
     return { ok: false, reason: 'MISSING_SUBMISSION_ID' };
   }
 
-  let stateEntry = submissionStates.get(cleanSubmissionId);
+  // ═══════════════════════════════════════════════════════════════════════
+  // 🧹 PHASE 1 FIX: Use _getBestStateEntryForAck (lookup via ORIGINAL payload submissionId)
+  // Old logic looked up by raw cleanSubmissionId (which was internal composite key after suffix renames).
+  // Now POS/Web ALWAYS pass original ID.
+  // ═══════════════════════════════════════════════════════════════════════
+  let foundEntry = _getBestStateEntryForAck(cleanSubmissionId, { tenantId, branchId });
+  let internalKey = foundEntry ? foundEntry.key : cleanSubmissionId;
+  let stateEntry = foundEntry ? foundEntry.state : submissionStates.get(cleanSubmissionId);
   //#region debug-point web-order-bugs-ack
   try {
     const ts = new Date().toISOString();
@@ -1672,7 +1607,7 @@ const resolveOrderAcknowledgement = async ({
     const curRetries = stateEntry ? (stateEntry.retries || 0) : -1;
     // eslint-disable-next-line no-console
     console.error(
-      `[${ts}] [DEBUG-WEB-ORDER] [ACK] submissionId=${cleanSubmissionId} ackStatus=${String(ackStatus || 'POS_PRINTED')} state.resolved_before=${curResolved} state.status_before=${curStatus} retries=${curRetries} deviceUuid=${String(deviceUuid || '')} tenant=${String(tenantId || '')} branch=${String(branchId || '')}`,
+      `[${ts}] [DEBUG-WEB-ORDER] [ACK] submissionId=${cleanSubmissionId} (lookup via original) internalKey=${internalKey} ackStatus=${String(ackStatus || 'POS_PRINTED')} state.resolved_before=${curResolved} state.status_before=${curStatus} retries=${curRetries} deviceUuid=${String(deviceUuid || '')} tenant=${String(tenantId || '')} branch=${String(branchId || '')}`,
     );
   } catch (_dbgA) { /* noop */ }
   //#endregion
@@ -1717,7 +1652,7 @@ const resolveOrderAcknowledgement = async ({
   const explicitForceResolved = statusForcesResolve || payloadForcesResolve;
 
   if (stateEntry && !stateEntry.resolved && explicitForceResolved) {
-    finalizeResolve(stateEntry, cleanSubmissionId, {
+    finalizeResolve(stateEntry, internalKey, {
       ok: true,
       ackStatus: resolvedAckStatus,
       resolvedDeviceUuid: stateEntry.resolvedTargetDeviceUuid || resolvedDeviceUuid,
@@ -1728,7 +1663,7 @@ const resolveOrderAcknowledgement = async ({
       _forceResolvedByStatus: statusForcesResolve,
     });
   } else if (stateEntry && !stateEntry.resolved) {
-    finalizeResolve(stateEntry, cleanSubmissionId, {
+    finalizeResolve(stateEntry, internalKey, {
       ok: true,
       ackStatus: resolvedAckStatus,
       resolvedDeviceUuid: stateEntry.resolvedTargetDeviceUuid || resolvedDeviceUuid,
@@ -1740,6 +1675,7 @@ const resolveOrderAcknowledgement = async ({
     const now = Date.now();
     stateEntry = {
       submissionId: cleanSubmissionId,
+      originalSubmissionId: cleanSubmissionId,
       tenantId: tenantId || (ackPayload?.tenantId || ackPayload?.tenant_id || '').toString() || null,
       branchId: branchId || (ackPayload?.branchId || ackPayload?.branch_id || '').toString() || null,
       targetDeviceUuid: resolvedDeviceUuid || null,
@@ -1765,14 +1701,9 @@ const resolveOrderAcknowledgement = async ({
       resolvePromise: null,
       rejectPromise: null,
     };
-    submissionStates.set(cleanSubmissionId, stateEntry);
+    submissionStates.set(internalKey, stateEntry);
     setTimeout(() => {
-      if (submissionStates.get(cleanSubmissionId) === stateEntry) submissionStates.delete(cleanSubmissionId);
-      // 🔴 Mirror cleanup: Jika manual state ini punya _originalSubmissionId, hapus juga original key.
-      const origId = stateEntry._originalSubmissionId;
-      if (origId && origId !== cleanSubmissionId && submissionStates.get(origId) === stateEntry) {
-        submissionStates.delete(origId);
-      }
+      if (submissionStates.get(internalKey) === stateEntry) submissionStates.delete(internalKey);
     }, 300000);
   } else if (stateEntry && stateEntry.resolved && stateEntry.result && !stateEntry.result.ok) {
     stateEntry.result = {
@@ -1786,28 +1717,6 @@ const resolveOrderAcknowledgement = async ({
     };
     stateEntry.status = resolvedAckStatus;
     stateEntry.resolvedAt = resolvedPrintedAt;
-  }
-
-  // 🔴 Mirror resolve untuk POS ACK dengan submissionId suffix __dup_N:
-  //    POS mengirim ACK pakai ID YANG DI-REWRITE (ORIG__dup_1). Tapi frontend
-  //    Web Order polling tetap pakai ORIGINAL key → jika tidak ada mirror di
-  //    resolveOrderAcknowledgement (edge case: stateEntry dibuat ulang manual)
-  //    maka akan tetap timeout.
-  //    SOLUSI: extract originalId dari suffix __dup_ dan mirror set ke key original.
-  if (cleanSubmissionId.includes('__dup_')) {
-    try {
-      const splitParts = cleanSubmissionId.split('__dup_');
-      const extractedOriginal = splitParts.length > 0 ? splitParts[0] : '';
-      if (extractedOriginal && extractedOriginal !== cleanSubmissionId && stateEntry) {
-        const existingOrig = submissionStates.get(extractedOriginal);
-        if (existingOrig !== stateEntry) {
-          submissionStates.set(extractedOriginal, stateEntry);
-          if (!stateEntry._originalSubmissionId) {
-            stateEntry._originalSubmissionId = extractedOriginal;
-          }
-        }
-      }
-    } catch (_mirrorErr) { /* double safety: mirror failure tidak boleh break ACK flow */ }
   }
 
   const finalTenantId = (tenantId || ackPayload?.tenantId || ackPayload?.tenant_id || stateEntry?.tenantId || stateEntry?.result?.tenantId || '').toString();
@@ -1984,7 +1893,16 @@ const initBullMqOrFallback = () => {
     posOrderWorker.on('failed', (job, err) => {
       const submissionId = job?.data?.submissionId || '';
       console.warn('[posOrderQueue] BullMQ job failed:', submissionId, err?.message || err);
-      const stateEntry = submissionStates.get(submissionId);
+      // 🧹 PHASE1: job submissionId = internal composite key, use direct map.get for speed,
+      // fallback to original payload id lookup for safety (edge case: migration in-flight).
+      let stateEntry = submissionStates.get(submissionId);
+      if (!stateEntry) {
+        const fallback = _getBestStateEntryForAck(submissionId, {
+          tenantId: job?.data?.tenantId,
+          branchId: job?.data?.branchId,
+        });
+        stateEntry = fallback ? fallback.state : null;
+      }
       if (stateEntry && !stateEntry.resolved) {
         finalizeReject(stateEntry, submissionId, {
           statusCode: 500,
@@ -2010,11 +1928,18 @@ const initBullMqOrFallback = () => {
   }
 };
 
-const getOrderSubmissionState = (submissionId) => {
+const getOrderSubmissionState = (submissionId, { tenantId, branchId } = {}) => {
   const key = String(submissionId || "").trim();
   if (!key) return null;
-  const s = submissionStates.get(key);
+  // 🧹 PHASE 1: Use payload-submissionId-aware lookup (Web Order ALWAYS uses ORIGINAL user-facing ID).
+  let s = null;
+  const found = _getBestStateEntryForAck(key, { tenantId, branchId });
+  if (found && found.state) s = found.state;
+  // Direct get fallback (edge case: in-flight old keys).
+  if (!s) s = submissionStates.get(key);
   if (!s) return null;
+  // Always expose ORIGINAL user-facing ID (not internal composite key).
+  const exposedSubmissionId = String((s && s.originalSubmissionId) || key);
   const finalAckStatus =
     (s.result && s.result.ackStatus) ||
     (s.result && s.result.status) ||
@@ -2030,7 +1955,7 @@ const getOrderSubmissionState = (submissionId) => {
     s.resolvedAt ||
     null;
   return {
-    submissionId: key,
+    submissionId: exposedSubmissionId,
     status: finalAckStatus,
     ackStatus: finalAckStatus,
     resolvedDeviceUuid: finalDeviceUuid,
