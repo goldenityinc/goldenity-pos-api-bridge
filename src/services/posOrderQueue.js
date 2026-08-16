@@ -245,6 +245,56 @@ const injectMissingOrderMetadata = (payloadRaw, ctx = {}) => {
 
 const submissionStates = new Map();
 
+const __activeTableOrderLocks = new Map();
+const __ACTIVE_TABLE_LOCK_TTL_MS = 300;
+function _resolveTableIdentityForCollision({ tenantId, branchId, orderPayload }) {
+  const t = String(tenantId || '').trim();
+  const b = String(branchId || '').trim();
+  const o = (orderPayload && typeof orderPayload === 'object') ? orderPayload : {};
+  const ti = String(o.tableId || o.table_id || '').trim();
+  const tn = String(o.tableNumber || o.table_number || o.tableName || o.table_name || o.tableLabel || o.table_label || o.nomorMeja || o.noMeja || '').trim().toLowerCase();
+  const nestedTable = (o.table && typeof o.table === 'object') ? o.table : null;
+  const nti = nestedTable ? String(nestedTable.id || nestedTable.tableId || nestedTable.table_id || '').trim() : '';
+  const ntn = nestedTable ? String(nestedTable.number || nestedTable.tableNumber || nestedTable.table_number || nestedTable.name || nestedTable.label || '').trim().toLowerCase() : '';
+  const finalTi = ti || nti || '';
+  const finalTn = tn || ntn || '';
+  return {
+    byId: finalTi ? `${t}::${b}::id::${finalTi}` : '',
+    byNum: finalTn ? `${t}::${b}::no::${finalTn}` : '',
+  };
+}
+function _checkAndMarkTableOrderCollision({ tenantId, branchId, orderPayload, incomingSubmissionId }) {
+  try {
+    const now = Date.now();
+    for (const [k, v] of __activeTableOrderLocks.entries()) {
+      if ((now - (v.ts || 0)) > __ACTIVE_TABLE_LOCK_TTL_MS) __activeTableOrderLocks.delete(k);
+    }
+    const { byId, byNum } = _resolveTableIdentityForCollision({ tenantId, branchId, orderPayload });
+    const candidates = [];
+    if (byId) candidates.push(byId);
+    if (byNum) candidates.push(byNum);
+    if (candidates.length === 0) return { hadCollision: false, suffix: '', conflictingSubmissions: [] };
+    const conflicts = [];
+    for (const c of candidates) {
+      const v = __activeTableOrderLocks.get(c);
+      if (v && v.submissionId && v.submissionId !== incomingSubmissionId) {
+        conflicts.push(v.submissionId);
+      }
+    }
+    const hadCollision = conflicts.length > 0;
+    for (const c of candidates) {
+      __activeTableOrderLocks.set(c, { ts: now, submissionId: incomingSubmissionId });
+    }
+    return { hadCollision, suffix: hadCollision ? `__tblorder_${now}` : '', conflictingSubmissions: conflicts };
+  } catch (_e) {
+    try {
+      const ts = new Date().toISOString();
+      console.warn(`[${ts}] [DEBUG-WEB-ORDER] [TABLE-COLLISION-CHECK-ERR] silent error: ${(_e && _e.message) ? _e.message : String(_e)} → ALLOW`);
+    } catch (_) {}
+    return { hadCollision: false, suffix: '', conflictingSubmissions: [] };
+  }
+}
+
 const getUnprocessedPendingOrdersByBranch = (branchId, sinceTsMs) => {
   const results = [];
   const branch = (branchId || '').toString().trim();
@@ -787,6 +837,37 @@ const enqueueWebOrderForPrinting = async ({
   if (rewriteState.hadCollision && orderPayload && typeof orderPayload === 'object') {
     try { orderPayload.submissionId = cleanSubmissionId; } catch (_) {}
     try { orderPayload.submission_id = cleanSubmissionId; } catch (_) {}
+  }
+
+  // 🔴🔴 SAME-TABLE CONCURRENT COLLISION GUARD (User bug 3 & 5):
+  //    2 order MEJA YANG SAMA submit SIMULTAN dalam <300ms → suffix __tblorder_
+  //    ditambahkan ke submissionId agar POS TIDAK overwrite row Hive pertama.
+  //    Ini mencegah "2 order masuk 1 meja, 1 gagal total".
+  const tableCol = _checkAndMarkTableOrderCollision({
+    tenantId: cleanTenant,
+    branchId: cleanBranch,
+    orderPayload,
+    incomingSubmissionId: cleanSubmissionId,
+  });
+  if (tableCol.hadCollision) {
+    const newIdAfterTable = cleanSubmissionId + tableCol.suffix;
+    try {
+      const ts = new Date().toISOString();
+      console.warn(
+        `[${ts}] [DEBUG-WEB-ORDER] [TABLE-CONCURRENT-LOCK] same-table burst order detected. ` +
+        `prevSubmissionIds=${JSON.stringify(tableCol.conflictingSubmissions)} ` +
+        `before="${cleanSubmissionId}" after="${newIdAfterTable}" ` +
+        `tenant="${cleanTenant}" branch="${cleanBranch}" ` +
+        `tableId="${(orderPayload && ((orderPayload.tableId || orderPayload.table_id || '')))}" ` +
+        `tableNum="${(orderPayload && ((orderPayload.tableNumber || orderPayload.table_number || orderPayload.tableName || '')))}"`
+      );
+    } catch (_) {}
+    cleanSubmissionId = newIdAfterTable;
+    if (orderPayload && typeof orderPayload === 'object') {
+      try { orderPayload.submissionId = cleanSubmissionId; } catch (_) {}
+      try { orderPayload.submission_id = cleanSubmissionId; } catch (_) {}
+    }
+    rewriteState.hadCollision = true;
   }
 
   const existing = submissionStates.get(cleanSubmissionId);

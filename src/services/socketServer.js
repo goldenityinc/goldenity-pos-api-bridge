@@ -357,17 +357,30 @@ const emitIncomingWebOrder = (targetDeviceUuid, branchId, orderPayload) => {
 };
 
 const extractHandshakeToken = (socket) => {
-  const authToken = socket.handshake.auth?.token;
-  if (typeof authToken === 'string' && authToken.trim().length > 0) {
-    return authToken.trim().replace(/^Bearer\s+/i, '');
-  }
+  const _safeToken = (raw) => {
+    try {
+      if (raw == null) return '';
+      if (typeof raw !== 'string') return '';
+      let s = raw.trim();
+      if (!s) return '';
+      s = s.replace(/^Bearer\s+/i, '');
+      if (!s) return '';
+      const lower = s.toLowerCase();
+      if (lower === 'null' || lower === 'undefined' || lower === 'bearer' || lower === 'bearer null' || lower === 'bearer undefined') return '';
+      return s;
+    } catch (_) { return ''; }
+  };
 
-  const headerToken = socket.handshake.headers?.authorization;
-  if (typeof headerToken === 'string' && headerToken.startsWith('Bearer ')) {
-    return headerToken.slice(7).trim();
-  }
+  const authToken = socket?.handshake?.auth?.token;
+  const safeAuth = _safeToken(authToken);
+  if (safeAuth) return safeAuth;
 
-  return '';
+  const headerToken = socket?.handshake?.headers?.authorization;
+  const safeHeader = _safeToken(headerToken);
+  if (safeHeader) return safeHeader;
+
+  const queryToken = socket?.handshake?.query?.token;
+  return _safeToken(queryToken);
 };
 
 const resolveSocketTenantId = (payload = {}) => {
